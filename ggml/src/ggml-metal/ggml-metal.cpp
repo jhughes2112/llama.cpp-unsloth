@@ -6,6 +6,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-context.h"
+#include "ggml-metal-common.h"
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
 
@@ -651,6 +652,8 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
     ggml_metal_graph_optimize(ctx, cgraph);
+
+    ggml_graph_optimize_alloc_deps(cgraph, params->user_data, params->add_alloc_dep);
 }
 
 static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {

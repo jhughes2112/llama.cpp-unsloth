@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <unordered_set>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -581,7 +582,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
 // barriers the dependencies allow; the lookahead of ggml_metal_graph_optimize_reorder stops short of it on graphs made
 // of long chains of small ops. accesses are tracked per root tensor as byte ranges, so in-place ops and the writes to
 // pre-allocated state (KV and recurrent caches) are ordered like any other
-static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_info> & nodes, bool (*is_safe)(ggml_op)) {
+static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_info> & nodes, bool (*is_safe)(ggml_op), std::vector<int> & level) {
     struct access {
         size_t beg;
         size_t end;
@@ -591,7 +592,7 @@ static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_
 
     const int n = (int) nodes.size();
 
-    std::vector<int> level(n, 0);
+    level.assign(n, 0);
 
     std::unordered_map<const ggml_tensor *, std::vector<access>> accesses; // by root tensor
     std::unordered_map<const ggml_tensor *, int>                 node_level; // by graph node
@@ -713,6 +714,55 @@ static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_
     return res;
 }
 
+// the level of each node of the graph ordered last on this thread, for ggml_graph_optimize_alloc_deps
+static thread_local std::vector<int>           g_level_of_node;
+static thread_local std::vector<ggml_tensor *> g_level_nodes;
+
+// in the order by depth the kernels of a level run without a barrier between them. the allocator, which walks the
+// nodes in order, would give a later node of a level the memory an earlier node of it has just finished reading, and
+// the encoder would have to put a barrier between the two. so every input of a level stays allocated until its end
+void ggml_graph_optimize_alloc_deps(
+        struct ggml_cgraph * gf,
+        void * user_data,
+        void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *)) {
+    const int n = gf->n_nodes;
+
+    if ((int) g_level_nodes.size() != n || !std::equal(g_level_nodes.begin(), g_level_nodes.end(), gf->nodes)) {
+        return;
+    }
+
+    std::unordered_set<const ggml_tensor *> in_level;
+
+    for (int i = 0; i < n; ) {
+        int j = i;
+        while (j + 1 < n && g_level_of_node[j + 1] == g_level_of_node[i]) {
+            j++;
+        }
+
+        if (j > i) {
+            in_level.clear();
+            for (int k = i; k <= j; ++k) {
+                in_level.insert(gf->nodes[k]);
+            }
+
+            ggml_tensor * until = gf->nodes[j];
+
+            for (int k = i; k <= j; ++k) {
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    ggml_tensor * src = gf->nodes[k]->src[s];
+                    // inputs computed by the graph before this level; what a kernel of the level makes for itself
+                    // (the intermediates of a fused group) is its own
+                    if (src && src->op != GGML_OP_NONE && in_level.find(src) == in_level.end()) {
+                        add_alloc_dep(user_data, src, until);
+                    }
+                }
+            }
+        }
+
+        i = j + 1;
+    }
+}
+
 void ggml_graph_optimize(ggml_cgraph * gf) {
     const int n = gf->n_nodes;
 
@@ -750,8 +800,10 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
     // GGML_METAL_REORDER=lookahead for the greedy lookahead instead of the levels
     static const bool use_levels = getenv("GGML_METAL_REORDER") == nullptr || strcmp(getenv("GGML_METAL_REORDER"), "lookahead") != 0;
 
+    std::vector<int> level;
+
     const auto order = use_levels ?
-        ggml_metal_graph_optimize_levels(nodes, ggml_metal_graph_optimize_is_safe) :
+        ggml_metal_graph_optimize_levels(nodes, ggml_metal_graph_optimize_is_safe, level) :
         ggml_metal_graph_optimize_reorder(nodes);
 #else
     std::vector<int> order(nodes.size());
@@ -772,5 +824,17 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
                 gf->nodes[j++] = fused;
             }
         }
+    }
+
+    // remember the levels for ggml_graph_optimize_alloc_deps
+    g_level_of_node.clear();
+    g_level_nodes.clear();
+    if (use_levels) {
+        for (const auto i : order) {
+            for (size_t k = 0; k < 1 + nodes[i].fused.size(); ++k) {
+                g_level_of_node.push_back(level[i]);
+            }
+        }
+        g_level_nodes.assign(gf->nodes, gf->nodes + gf->n_nodes);
     }
 }
