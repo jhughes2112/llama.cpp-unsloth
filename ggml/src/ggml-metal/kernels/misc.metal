@@ -771,6 +771,39 @@ kernel void kernel_gated_mix_f32(
 
     dst[gid] = (args.s*precise::tanh(f[gid]) + args.b)*x[gid] + precise::tanh(g[gid])*m[gid];
 }
+// the per-head attention mask with the relative-position bias, one thread per mask element:
+//   m[kv, t, h] = sum_r bias[r, pos[kv, t]]*R[r, h, t] - sink[h, t] + mask[kv, t], no bias at pos == nc
+kernel void kernel_rel_bias_f32_f16(
+        constant ggml_metal_kargs_rel_bias & args,
+        device const float * bias,
+        device const float * R,
+        device const float * sink,
+        device const int   * pos,
+        device const float * mask,
+        device       half  * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int kv = gid.x;
+    const int it = gid.y;
+    const int ih = gid.z;
+    if (kv >= args.n_kv) {
+        return;
+    }
+
+    const int p = pos[it*args.n_kv + kv];
+
+    float sumf = 0.0f;
+
+    if (p < args.nc) {
+        device const float * b = bias + (ulong) p*args.nr;
+        device const float * r = R + ((ulong) it*args.n_head + ih)*args.nr;
+
+        for (int i = 0; i < args.nr; ++i) {
+            sumf += b[i]*r[i];
+        }
+    }
+
+    dst[((ulong) ih*args.n_tokens + it)*args.n_kv + kv] = half(sumf - sink[it*args.n_head + ih] + mask[it*args.n_kv + kv]);
+}
 template [[host_name("kernel_snake_f32")]]  kernel void kernel_snake<float>(constant ggml_metal_kargs_snake &, device const float *, device const float *, device const float *, device float *, uint, uint, uint);
 template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(constant ggml_metal_kargs_snake &, device const half *, device const float *, device const float *, device half *, uint, uint, uint);
 #if defined(GGML_METAL_HAS_BF16)

@@ -5804,6 +5804,47 @@ int ggml_metal_op_gated_mix(ggml_metal_op_t ctx, int idx, int n) {
 
     return n;
 }
+// Dispatch the fused relative-position bias mask from the matched pad mul_mat sub cont get_rows cont add cpy run.
+int ggml_metal_op_rel_bias(ggml_metal_op_t ctx, int idx, int n) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * pad  = ctx->node(idx + 0);
+    const ggml_tensor * mm   = ctx->node(idx + 1);
+    const ggml_tensor * sub  = ctx->node(idx + 2);
+    const ggml_tensor * rows = ctx->node(idx + 4);
+    const ggml_tensor * add  = ctx->node(idx + 6);
+    ggml_tensor *       dst  = ctx->node(idx + n - 1);
+
+    const ggml_tensor * bias = pad->src[0];
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n);
+
+    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_rel_bias_f32_f16");
+
+    ggml_metal_kargs_rel_bias args = {
+        /*.nr       =*/ (int32_t) bias->ne[0],
+        /*.nc       =*/ (int32_t) bias->ne[1],
+        /*.n_kv     =*/ (int32_t) dst->ne[0],
+        /*.n_tokens =*/ (int32_t) dst->ne[1],
+        /*.n_head   =*/ (int32_t) dst->ne[2],
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias),         1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm->src[1]),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sub->src[1]),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rows->src[1]), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(add->src[1]),  5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),          6);
+
+    const int nth = 64;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_kv + nth - 1)/nth, args.n_tokens, args.n_head, nth, 1, 1);
+
+    return n;
+}
 int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -5980,6 +6021,14 @@ int ggml_metal_op_roll(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_REL_BIAS) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_rel_bias(ctx, idx, n);
+        }
+    }
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

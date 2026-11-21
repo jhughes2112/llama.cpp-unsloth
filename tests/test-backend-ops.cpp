@@ -5024,6 +5024,85 @@ struct test_inkling2_gated_mix : public test_case {
         return out;
     }
 };
+// the per-head attention mask of Inkling 2 with its relative-position bias: project r on the padded bias table, take
+// the sink logit off, gather by distance, add the causal mask and cast to F16 for flash attention.
+// the Metal backend runs the whole run of nodes as one kernel
+struct test_inkling2_rel_bias : public test_case {
+    const int64_t n_relative;
+    const int64_t n_extent;
+    const int64_t n_head;
+    const int64_t n_kv;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_REL_BIAS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 1e-6; } // F16 output
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_relative, n_extent, n_head, n_kv, n_tokens);
+    }
+
+    test_inkling2_rel_bias(int64_t n_relative = 16, int64_t n_extent = 1024, int64_t n_head = 24, int64_t n_kv = 256, int64_t n_tokens = 1)
+        : n_relative(n_relative), n_extent(n_extent), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_relative, n_extent);
+        ggml_set_name(bias, "bias");
+
+        ggml_tensor * Rcur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_relative, n_head, n_tokens);
+        ggml_set_name(Rcur, "Rcur");
+
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+        ggml_set_name(sinks, "sinks");
+
+        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
+        ggml_set_name(rel_pos, "rel_pos");
+
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
+        ggml_set_name(mask, "mask");
+
+        // the inputs first, as in the model
+        Rcur  = ggml_scale(ctx, Rcur, 1.5f);
+        sinks = ggml_scale(ctx, sinks, 0.5f);
+        mask  = ggml_scale(ctx, mask, 2.0f);
+        ggml_build_forward_expand(gf, Rcur);
+        ggml_build_forward_expand(gf, sinks);
+        ggml_build_forward_expand(gf, mask);
+
+        ggml_tensor * table = ggml_mul_mat(ctx, ggml_pad(ctx, bias, 0, 1, 0, 0), Rcur);
+        table = ggml_sub(ctx, table, ggml_reshape_3d(ctx, sinks, 1, n_head, n_tokens));
+        table = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));
+
+        ggml_tensor * kq_b = ggml_get_rows(ctx, table, rel_pos);
+        kq_b = ggml_reshape_4d(ctx, kq_b, n_head, n_kv, n_tokens, 1);
+        kq_b = ggml_cont(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3));
+
+        ggml_tensor * out = ggml_cast(ctx, ggml_add(ctx, kq_b, mask), GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // distances over the whole table, the padded column included
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (int32_t) ((i*7 + 3) % (n_extent + 1));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -11298,6 +11377,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2_gated_mix(2304,  33));
     test_cases.emplace_back(new test_inkling2_gated_mix( 300, 512));
     test_cases.emplace_back(new test_inkling2_gated_mix(   7,   3));
+    // Inkling 2 relative-position bias mask
+    test_cases.emplace_back(new test_inkling2_rel_bias(16, 1024, 24, 256,  1));
+    test_cases.emplace_back(new test_inkling2_rel_bias(16, 1024, 24, 256,  4));
+    test_cases.emplace_back(new test_inkling2_rel_bias(16,   64, 24, 100, 31));
+    test_cases.emplace_back(new test_inkling2_rel_bias( 5,    9,  3,   7,  2));
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block

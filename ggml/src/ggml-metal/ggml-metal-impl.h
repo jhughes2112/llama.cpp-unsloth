@@ -778,6 +778,14 @@ typedef struct {
 } ggml_metal_kargs_gated_mix;
 
 typedef struct {
+    int32_t nr;   // rows of the bias table (the relative features)
+    int32_t nc;   // its columns, without the zero one
+    int32_t n_kv;
+    int32_t n_tokens;
+    int32_t n_head;
+} ggml_metal_kargs_rel_bias;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

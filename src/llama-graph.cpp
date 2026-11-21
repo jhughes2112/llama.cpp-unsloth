@@ -4592,12 +4592,20 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_mask = ggml_view_4d(ctx0, dev, dev->ne[0], kq_b->ne[1], dev->ne[2], dev->ne[3],
                 dev->nb[1], dev->nb[2], dev->nb[3], i_row*dev->nb[1]);
     } else if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        // one copy for all the layers, placed before the first that reads it
+        ggml_tensor *& dev = inp->self_kq_mask_dev[is_swa];
+        if (!dev) {
+            dev = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+            ggml_build_forward_order(gf, dev);
+        }
+        kq_mask = dev;
     }
     kq_mask = ggml_add(ctx0, kq_b, kq_mask);
     if (cparams.flash_attn) {
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
     }
+    // right after the bias (order only), so that the bias and its mask are one run of nodes that backends can fuse
+    ggml_build_forward_order(gf, kq_mask);
     cb(kq_mask, "kq_mask_rel_pos", il);
 
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);

@@ -1282,6 +1282,102 @@ static bool ggml_metal_fusion_check_gated_mix(
 
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
 }
+// PAD MUL_MAT [RESHAPE] SUB [PERMUTE] CONT GET_ROWS [RESHAPE PERMUTE] CONT ADD CPY: the per-head attention mask of
+// Inkling 2 with its relative-position bias,
+//   m[kv, t, h] = f16(sum_r bias[r, pos[kv, t]]*R[r, h, t] - sink[h, t] + mask[kv, t])
+// where the padded column of the bias table (pos == its width) is zero. views in the run: unsafe = true
+static bool ggml_metal_fusion_check_rel_bias(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * pad   = nodes[0];
+    const ggml_tensor * mm    = nodes[1];
+    const ggml_tensor * sub   = nodes[2];
+    const ggml_tensor * cont1 = nodes[3];
+    const ggml_tensor * rows  = nodes[4];
+    const ggml_tensor * cont2 = nodes[5];
+    const ggml_tensor * add   = nodes[6];
+    const ggml_tensor * cpy   = nodes[7];
+
+    const ggml_tensor * sink_r = gf->nodes[raw0 + 2]; // sinks as [1, H, T]
+    const ggml_tensor * perm1  = gf->nodes[raw0 + 4];
+    const ggml_tensor * perm2  = gf->nodes[raw0 + 8];
+
+    const ggml_tensor * bias = pad->src[0];
+    const ggml_tensor * R    = mm->src[1];
+    const ggml_tensor * pos  = rows->src[1];
+    const ggml_tensor * mask = add->src[1];
+
+    if (mm->src[0] != pad || sub->src[0] != mm || sub->src[1] != sink_r || cont1->src[0] != perm1 || perm1->view_src != sub ||
+        rows->src[0] != cont1 || cont2->src[0] != perm2 || perm2->view_src != rows || add->src[0] != cont2 || cpy->src[0] != add) {
+        return false;
+    }
+
+    for (const ggml_tensor * t : { pad, mm, sub, cont1, rows, cont2, add, bias, R, sink_r, mask }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
+    for (const ggml_tensor * t : { pad, mm, sub, cont1, rows, cont2, add, cpy }) {
+        if (t->view_src != nullptr) {
+            return false;
+        }
+    }
+
+    const int64_t nr   = bias->ne[0];
+    const int64_t nc   = bias->ne[1];
+    const int64_t n_kv = cont2->ne[0];
+    const int64_t T    = cont2->ne[1];
+    const int64_t H    = cont2->ne[2];
+
+    // no padding on the left, one zero column on the right
+    for (int i = 0; i < 8; i += 2) {
+        if (ggml_get_op_params_i32(pad, i) != 0) {
+            return false;
+        }
+    }
+
+    if (!ggml_is_contiguous(bias) || bias->ne[2] != 1 || bias->ne[3] != 1 ||
+        pad->ne[0] != nr || pad->ne[1] != nc + 1 || pad->ne[2] != 1 || pad->ne[3] != 1 ||
+        !ggml_is_contiguous(R) || R->ne[0] != nr || R->ne[1] != H || R->ne[2] != T || R->ne[3] != 1 ||
+        mm->ne[0] != nc + 1 || mm->ne[1] != H || mm->ne[2] != T || mm->ne[3] != 1 ||
+        !ggml_is_contiguous(sink_r) || sink_r->ne[0] != 1 || sink_r->ne[1] != H || sink_r->ne[2] != T || sink_r->ne[3] != 1 ||
+        cont1->ne[0] != H || cont1->ne[1] != nc + 1 || cont1->ne[2] != T || cont1->ne[3] != 1 ||
+        pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(pos) || pos->ne[0] != n_kv || pos->ne[1] != T || pos->ne[2] != 1 || pos->ne[3] != 1 ||
+        rows->ne[0] != H || rows->ne[1] != n_kv || rows->ne[2] != T || rows->ne[3] != 1 || cont2->ne[3] != 1 ||
+        !ggml_is_contiguous(mask) || mask->ne[0] != n_kv || mask->ne[1] != T || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+        !ggml_are_same_shape(add, cont2) || !ggml_are_same_shape(cpy, cont2) ||
+        cpy->type != GGML_TYPE_F16 || !ggml_is_contiguous(cpy)) {
+        return false;
+    }
+
+    // outputs: the mask; the reshape of the sinks is a view of an input
+    const int outputs[2] = { raw0 + n_raw - 1, raw0 + 2 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 2);
+}
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -1343,6 +1439,10 @@ static const std::vector<ggml_op> ops_short_conv = {
 };
 static const std::vector<ggml_op> ops_gated_mix = {
     GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_rel_bias = {
+    GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
+    GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY
 };
 static const std::vector<ggml_op> ops_l2_clip = {
     GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
@@ -1408,6 +1508,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_EXPERT_SCALE, ops_expert_scale, {}, true, ggml_metal_fusion_check_expert_scale },
     { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv,   {1}, true, ggml_metal_fusion_check_short_conv },
     { GGML_METAL_FUSION_GATED_MIX,    ops_gated_mix,    {}, true, ggml_metal_fusion_check_gated_mix },
+    { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
 
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(0), {}, true, ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(1), {}, true, ggml_metal_fusion_check_depth_mix },
