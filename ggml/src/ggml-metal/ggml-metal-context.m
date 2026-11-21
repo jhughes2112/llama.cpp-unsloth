@@ -245,6 +245,9 @@ void ggml_metal_free(ggml_metal_t ctx) {
     }
 
     if (g_profile > 0) {
+        int64_t barriers, depth, kernels;
+        ggml_metal_op_profile_get(&barriers, &depth, &kernels);
+        fprintf(stderr, "ggml_metal_free: profile: %lld kernels, %lld barriers, depth %lld (summed over encoders)" "\n", (long long) kernels, (long long) barriers, (long long) depth);
         fprintf(stderr, "ggml_metal_free: profile: %lld graphs, %lld command buffers, GPU time %.1f ms, kernel-to-GPU wait %.1f ms\n",
                 (long long) g_profile_n_graphs, (long long) g_profile_n_cb, g_profile_gpu_ns/1e6, g_profile_sched_ns/1e6);
     }

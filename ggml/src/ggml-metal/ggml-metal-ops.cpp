@@ -10,6 +10,8 @@
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-tuning.h"
 
+#include <unordered_map>
+#include <atomic>
 #include <cassert>
 #include <algorithm>
 #include <limits>
@@ -114,6 +116,10 @@ struct ggml_metal_op {
 
     int debug_graph;
 
+    // profiling: the depth of each tensor (by its root) in this encoder
+    std::unordered_map<const ggml_tensor *, int> prof_level;
+    int prof_depth = 0;
+
 private:
     ggml_cgraph * gf;
 
@@ -123,6 +129,18 @@ private:
     // non-empty node indices
     std::vector<int> idxs;
 };
+
+// GGML_METAL_PROFILE: barriers encoded, and the depth of the graph as encoded (the longest chain of kernels that
+// read one another): the number of serial steps the GPU cannot avoid
+static std::atomic<int64_t> g_prof_barriers{0};
+static std::atomic<int64_t> g_prof_depth{0};
+static std::atomic<int64_t> g_prof_kernels{0};
+
+void ggml_metal_op_profile_get(int64_t * barriers, int64_t * depth, int64_t * kernels) {
+    *barriers = g_prof_barriers;
+    *depth    = g_prof_depth;
+    *kernels  = g_prof_kernels;
+}
 
 ggml_metal_op_t ggml_metal_op_init(
         ggml_metal_device_t dev,
@@ -149,6 +167,7 @@ ggml_metal_op_t ggml_metal_op_init(
 }
 
 void ggml_metal_op_free(ggml_metal_op_t ctx) {
+    g_prof_depth += ctx->prof_depth;
     delete ctx;
 }
 
@@ -162,6 +181,7 @@ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
     }
 
     ggml_metal_encoder_memory_barrier(ctx->enc);
+    g_prof_barriers++;
 
     ggml_mem_ranges_reset(ctx->mem_ranges);
 
@@ -530,6 +550,33 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     if (ctx->debug_graph > 0) {
         if (n_fuse > 1) {
             GGML_LOG_DEBUG("%s:               fuse %d ops\n", __func__, n_fuse);
+        }
+    }
+
+    {
+        static const bool profile = getenv("GGML_METAL_PROFILE") != nullptr;
+        if (profile) {
+            auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+
+            int lvl = 0;
+            for (int i = 0; i < n_fuse; ++i) {
+                const ggml_tensor * t = ctx->node(idx + i);
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (t->src[j]) {
+                        auto it = ctx->prof_level.find(root(t->src[j]));
+                        if (it != ctx->prof_level.end()) {
+                            lvl = std::max(lvl, it->second);
+                        }
+                    }
+                }
+            }
+            lvl++;
+            for (int i = 0; i < n_fuse; ++i) {
+                int & l = ctx->prof_level[root(ctx->node(idx + i))];
+                l = std::max(l, lvl);
+            }
+            ctx->prof_depth = std::max(ctx->prof_depth, lvl);
+            g_prof_kernels++;
         }
     }
 

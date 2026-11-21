@@ -25,6 +25,9 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
+// GGML_METAL_PROFILE totals over all encoders so far
+void ggml_metal_op_profile_get(int64_t * barriers, int64_t * depth, int64_t * kernels);
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
 //
