@@ -4854,6 +4854,69 @@ struct test_inkling2_situ : public test_case {
         }
     }
 };
+// the short causal convolution of Inkling 2 with its recurrent state:
+//   x = concat(past, cur^T), state <- the last columns of x, y = (cur + ssm_conv(x, w))/sqrt(n_conv + 1)
+// the Metal backend runs the whole run of nodes as one kernel that also writes the state
+struct test_inkling2_short_conv : public test_case {
+    const int64_t n_conv;
+    const int64_t n_channels;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    ggml_tensor * cpy_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_SHORT_CONV";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_conv, n_channels, n_seq_tokens, n_seqs);
+    }
+
+    test_inkling2_short_conv(int64_t n_conv = 4, int64_t n_channels = 2304, int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+        : n_conv(n_conv), n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tokens = n_seq_tokens*n_seqs;
+
+        ggml_tensor * past = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_conv - 1, n_channels, n_seqs);
+        ggml_set_name(past, "past");
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_tokens);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv, n_channels);
+        ggml_set_name(weight, "weight");
+
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (n_conv - 1)*n_channels, n_seqs);
+        ggml_set_name(state, "state");
+
+        // some op first, as the projection in the model, so that the output can be allocated in place
+        cur = ggml_scale(ctx, cur, 1.5f);
+
+        ggml_tensor * x = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_channels, n_seq_tokens, n_seqs));
+        x = ggml_concat(ctx, past, x, 0);
+
+        ggml_tensor * last = ggml_view_3d(ctx, x, n_conv - 1, n_channels, n_seqs, x->nb[1], x->nb[2], ggml_row_size(x->type, n_seq_tokens));
+        ggml_tensor * cell = ggml_view_2d(ctx, state, (n_conv - 1)*n_channels, n_seqs, state->nb[1], 0);
+
+        cpy_node = ggml_cpy(ctx, last, cell);
+        ggml_set_name(cpy_node, "state_cpy");
+        ggml_build_forward_expand(gf, cpy_node);
+
+        ggml_tensor * out = ggml_ssm_conv(ctx, x, weight);
+        out = ggml_reshape_2d(ctx, out, n_channels, n_tokens);
+        out = ggml_scale(ctx, ggml_add(ctx, cur, out), 1.0f/sqrtf(n_conv + 1));
+        ggml_set_name(out, "out");
+        ggml_build_forward_expand(gf, out);
+
+        return out;
+    }
+};
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -11109,6 +11172,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2_situ(1152, 128, 8,  33));
     test_cases.emplace_back(new test_inkling2_situ(  96,  16, 4, 512));
     test_cases.emplace_back(new test_inkling2_situ(   7,   5, 3,   2));
+    // Inkling 2 short convolution with its state store; fewer, as many and more tokens than the stored window
+    for (int64_t n_seq_tokens : {1, 2, 3, 4, 33, 512}) {
+        test_cases.emplace_back(new test_inkling2_short_conv(4, 2304, n_seq_tokens, 1));
+        test_cases.emplace_back(new test_inkling2_short_conv(4,   96, n_seq_tokens, 3));
+    }
+    test_cases.emplace_back(new test_inkling2_short_conv(2, 7, 5, 2));
+    test_cases.emplace_back(new test_inkling2_short_conv(8, 5, 3, 1));
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block

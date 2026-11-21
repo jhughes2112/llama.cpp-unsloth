@@ -985,6 +985,113 @@ static bool ggml_metal_fusion_check_expert_scale(
 
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
 }
+// CONCAT [VIEW VIEW] CPY SSM_CONV [RESHAPE] ADD SCALE: a short causal convolution with its recurrent state,
+//   x = concat(past, cur^T), cell <- the last columns of x, y = s*(cur + ssm_conv(x, w)) + b
+// the kernel keeps the window in registers, so x is never written. two outputs and views in the run: unsafe = true
+#define GGML_METAL_SHORT_CONV_MAX 8
+
+static bool ggml_metal_fusion_check_short_conv(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    // the raw run, views included, is consecutive in the graph
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * cat   = nodes[0];
+    const ggml_tensor * cpy   = nodes[1];
+    const ggml_tensor * conv  = nodes[2];
+    const ggml_tensor * add   = nodes[3];
+    const ggml_tensor * scale = nodes[4];
+
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * x0   = cat->src[1]; // cur as [n_t, C, n_s]
+    const ggml_tensor * last = cpy->src[0];
+    const ggml_tensor * cell = cpy->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * cur  = add->src[0];
+    const ggml_tensor * out  = add->src[1]; // the conv output as [C, n_tokens]
+
+    if (ggml_get_op_params_i32(cat, 0) != 0 || conv->src[0] != cat || scale->src[0] != add ||
+        last != gf->nodes[raw0 + 1] || cell != gf->nodes[raw0 + 2] || out != gf->nodes[raw0 + 5] ||
+        last->view_src != cat || out->view_src != conv || cat->view_src != nullptr || conv->view_src != nullptr ||
+        add->view_src != nullptr || scale->view_src != nullptr) {
+        return false;
+    }
+
+    for (const ggml_tensor * t : { cat, conv, add, scale, past, x0, last, cell, w, cur }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
+    const int64_t nc  = w->ne[0];
+    const int64_t C   = w->ne[1];
+    const int64_t n_t = conv->ne[1];
+    const int64_t n_s = conv->ne[2];
+
+    if (nc < 2 || nc > GGML_METAL_SHORT_CONV_MAX || !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+
+    // past: [nc - 1, C, n_s], dense in each sequence
+    if (past->ne[0] != nc - 1 || past->ne[1] != C || past->ne[2] != n_s || past->ne[3] != 1 ||
+        past->nb[0] != sizeof(float) || past->nb[1] != (nc - 1)*sizeof(float)) {
+        return false;
+    }
+
+    // cur: [C, n_t*n_s] contiguous, x0 is its transposed view
+    const ggml_tensor * cur_root = cur->view_src ? cur->view_src : cur;
+    if (!ggml_is_contiguous(cur) || cur->ne[0] != C || cur->ne[1] != n_t*n_s || cur->ne[2] != 1 || cur->ne[3] != 1 ||
+        (x0->view_src ? x0->view_src : x0) != cur_root || x0->view_offs != cur->view_offs ||
+        x0->ne[0] != n_t || x0->ne[1] != C || x0->ne[2] != n_s || x0->ne[3] != 1 ||
+        x0->nb[0] != cur->nb[1] || x0->nb[1] != cur->nb[0]) {
+        return false;
+    }
+
+    // last: the trailing nc - 1 columns of x, cell: [(nc - 1)*C, n_s], dense in each sequence
+    if (last->ne[0] != nc - 1 || last->ne[1] != C || last->ne[2] != n_s || last->ne[3] != 1 ||
+        last->view_offs != (size_t) n_t*sizeof(float) || last->nb[1] != cat->nb[1] || last->nb[2] != cat->nb[2] ||
+        cell->ne[0] != (nc - 1)*C || cell->ne[1] != n_s || cell->ne[2] != 1 || cell->ne[3] != 1 ||
+        cell->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    if (!ggml_are_same_shape(add, cur) || !ggml_are_same_shape(scale, cur) || !ggml_are_same_shape(out, cur) ||
+        !ggml_is_contiguous(scale)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        // the kernel writes straight to the state
+        // each thread walks the tokens of a channel in order, which pays for decoding and loses to the separate
+        // kernels on a long prompt
+        if (cell->data == nullptr || n_t < 1 || n_t > 16) {
+            return false;
+        }
+    }
+
+    // outputs: the result, the state store and its cell view
+    const int outputs[3] = { raw0 + n_raw - 1, raw0 + 3, raw0 + 2 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 3);
+}
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -1041,6 +1148,9 @@ static const std::vector<ggml_op> ops_situ = {
     GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL
 };
 static const std::vector<ggml_op> ops_expert_scale = { GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_short_conv = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
+};
 static const std::vector<ggml_op> ops_l2_clip = {
     GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
 };
@@ -1103,6 +1213,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_SITU,         ops_situ,         {}, true, ggml_metal_fusion_check_situ },
     { GGML_METAL_FUSION_EXPERT_SCALE, ops_expert_scale, {}, true, ggml_metal_fusion_check_expert_scale },
+    { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv,   {1}, true, ggml_metal_fusion_check_short_conv },
 };
 
 // ---- alloc deps -----------------------------------------------------------

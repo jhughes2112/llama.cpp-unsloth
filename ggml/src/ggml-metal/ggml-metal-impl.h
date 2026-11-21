@@ -751,6 +751,17 @@ typedef struct {
 } ggml_metal_kargs_expert_scale;
 
 typedef struct {
+    int32_t  nc;       // taps
+    int32_t  C;        // channels
+    int32_t  n_t;      // tokens per sequence
+    int32_t  n_s;      // sequences
+    uint64_t nb_past2; // sequence strides of the stored window and of the state cell
+    uint64_t nb_cell1;
+    float    s;        // output scale and bias
+    float    b;
+} ggml_metal_kargs_short_conv;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;
