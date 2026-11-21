@@ -5010,6 +5010,7 @@ struct test_inkling2_gated_mix : public test_case {
             ggml_set_name(in[i], "in");
             // some op first, as the projections in the model, so that the output can be allocated in place
             in[i] = ggml_scale(ctx, in[i], 1.0f + i);
+            ggml_build_forward_expand(gf, in[i]);
         }
 
         ggml_tensor * forget = ggml_tanh(ctx, in[0]);
