@@ -762,6 +762,16 @@ typedef struct {
 } ggml_metal_kargs_short_conv;
 
 typedef struct {
+    int32_t  n_embd;
+    int32_t  n_states;
+    int32_t  nq;
+    int32_t  n_tokens;
+    float    eps;     // of the rms norm
+    float    scale;   // of the softmax
+    uint64_t offs[8]; // of each state in the source buffer
+} ggml_metal_kargs_depth_mix;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

@@ -4917,6 +4917,72 @@ struct test_inkling2_short_conv : public test_case {
         return out;
     }
 };
+// attention over depth of Inkling 2: the earlier block outputs and cur, normalized, mixed by learned queries:
+//   states = rms_norm(concat(blocks..., cur)), y = states^T * softmax(states * queries / sqrt(n_embd))
+// the Metal backend runs the whole run of nodes as one kernel that reads the states in place
+struct test_inkling2_depth_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_blocks;
+    const int64_t n_queries;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_DEPTH_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_blocks, n_queries, n_tokens);
+    }
+
+    test_inkling2_depth_mix(int64_t n_embd = 2304, int64_t n_blocks = 2, int64_t n_queries = 1, int64_t n_tokens = 1)
+        : n_embd(n_embd), n_blocks(n_blocks), n_queries(n_queries), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_queries);
+        ggml_set_name(query, "query");
+
+        // the states are outputs of earlier ops, as in the model
+        std::vector<ggml_tensor *> blocks;
+        for (int64_t i = 0; i < n_blocks + 1; ++i) {
+            ggml_tensor * block = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(block, "block");
+            blocks.push_back(ggml_scale(ctx, block, 1.0f + i));
+        }
+
+        ggml_tensor * cur = blocks.back();
+        blocks.pop_back();
+
+        ggml_tensor * states = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+        for (ggml_tensor * block : blocks) {
+            states = ggml_concat(ctx, ggml_reshape_3d(ctx, block, n_embd, 1, n_tokens), states, 1);
+        }
+        states = ggml_rms_norm(ctx, states, 1e-6f);
+
+        ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_queries, n_tokens));
+
+        ggml_tensor * scores = ggml_mul_mat(ctx, states, queries);
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // queries large enough to spread the softmax weights
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(ggml_get_name(t)) == "query") {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -11179,6 +11245,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_inkling2_short_conv(2, 7, 5, 2));
     test_cases.emplace_back(new test_inkling2_short_conv(8, 5, 3, 1));
+    // Inkling 2 attention over depth
+    for (int64_t n_blocks : {0, 1, 2, 4, 7}) {
+        test_cases.emplace_back(new test_inkling2_depth_mix(2304, n_blocks, 1,  1));
+        test_cases.emplace_back(new test_inkling2_depth_mix(2304, n_blocks, 3,  1));
+        test_cases.emplace_back(new test_inkling2_depth_mix( 200, n_blocks, 3, 33));
+        test_cases.emplace_back(new test_inkling2_depth_mix(  17, n_blocks, 2,  5));
+    }
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block

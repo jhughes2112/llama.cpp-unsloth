@@ -422,8 +422,15 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         ggml_tensor * inputs[3] = {cur, cur, cur};
         if (layer.attn_res_query) {
             ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
-            for (int j = 0; j < 3; ++j) {
-                inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            if (mixed->ne[1] == 1) {
+                // one mixed input: it is [n_embd, n_tokens] in memory as it is, no copy needed
+                inputs[0] = inputs[1] = inputs[2] = ggml_reshape_2d(ctx0, mixed, n_embd, n_tokens);
+            } else {
+                for (int j = 0; j < 3; ++j) {
+                    // a SWA layer reads the same column three times: copy it once
+                    inputs[j] = is_swa && j > 0 ? inputs[0] :
+                        ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+                }
             }
         }
 

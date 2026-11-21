@@ -47,6 +47,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SITU,         // SCALE + TANH + SCALE + SIGMOID + MUL + SCALE + TANH + SCALE + MUL (SiTU of gate and up)
     GGML_METAL_FUSION_EXPERT_SCALE, // REPEAT + GET_ROWS + MUL (scale each selected expert's output by its scalar)
     GGML_METAL_FUSION_SHORT_CONV,   // CONCAT + CPY + SSM_CONV + ADD + SCALE (short conv over a stored window, residual, state store)
+    GGML_METAL_FUSION_DEPTH_MIX,    // CONCAT x k + RMS_NORM + CONT + REPEAT + MUL_MAT + SOFT_MAX + MUL_MAT (attention over depth)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

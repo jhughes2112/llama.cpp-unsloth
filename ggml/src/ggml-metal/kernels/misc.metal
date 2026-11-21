@@ -533,59 +533,45 @@ kernel void kernel_snake(
     dst[idx] = T(xi + si * si * inv_b[c]);
 }
 
-// row L2 clip: y = x*clamp(c/(s*sqrt(sum_row(x^2)) + b), lo, hi), x = in*w with the leading MUL. one thread per row;
-// a row is read in full before it is written, so dst may be the input in place
+// row L2 clip: y = x*clamp(c/(s*sqrt(sum_row(x^2)) + b), lo, hi), x = in*w with the leading MUL. one simdgroup per row,
+// wide and shallow; the row is read in full before the sum is known, so dst may be the input in place
 kernel void kernel_l2_clip_f32(
         constant ggml_metal_kargs_l2_clip & args,
         device const float * src,
         device const float * w,
         device       float * dst,
-        uint gid [[thread_position_in_grid]]) {
-    const int nrows = args.ne1*args.ne2*args.ne3;
-    if ((int) gid >= nrows) {
-        return;
-    }
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint row = tgpig.x;
 
-    const int i1 = gid%args.ne1;
-    const int i2 = (gid/args.ne1)%args.ne2;
-    const int i3 = gid/(args.ne1*args.ne2);
+    const int i1 = row%args.ne1;
+    const int i2 = (row/args.ne1)%args.ne2;
+    const int i3 = row/(args.ne1*args.ne2);
 
-    device const float * x = src + (ulong) gid*args.ne0;
-    device       float * y = dst + (ulong) gid*args.ne0;
+    device const float * x = src + (ulong) row*args.ne0;
+    device       float * y = dst + (ulong) row*args.ne0;
 
     device const float * wr = w + (ulong) args.nw0*((i1%args.nw1) + args.nw1*((i2%args.nw2) + args.nw2*(i3%args.nw3)));
 
+    // w is one value a row, or one an element
+    const bool w_row = args.has_w && args.nw0 == 1;
+    const bool w_elt = args.has_w && args.nw0 != 1;
+
+    const float w0 = w_row ? wr[0] : 1.0f;
+
     float sum = 0.0f;
 
-    if (args.has_w) {
-        if (args.nw0 == 1) {
-            const float w0 = wr[0];
-            for (int i = 0; i < args.ne0; ++i) {
-                const float v = x[i]*w0;
-                sum += v*v;
-            }
-            const float f = clamp(args.c/(args.s*sqrt(sum) + args.b), args.lo, args.hi);
-            for (int i = 0; i < args.ne0; ++i) {
-                y[i] = (x[i]*w0)*f;
-            }
-        } else {
-            for (int i = 0; i < args.ne0; ++i) {
-                const float v = x[i]*wr[i];
-                sum += v*v;
-            }
-            const float f = clamp(args.c/(args.s*sqrt(sum) + args.b), args.lo, args.hi);
-            for (int i = 0; i < args.ne0; ++i) {
-                y[i] = (x[i]*wr[i])*f;
-            }
-        }
-    } else {
-        for (int i = 0; i < args.ne0; ++i) {
-            sum += x[i]*x[i];
-        }
-        const float f = clamp(args.c/(args.s*sqrt(sum) + args.b), args.lo, args.hi);
-        for (int i = 0; i < args.ne0; ++i) {
-            y[i] = x[i]*f;
-        }
+    for (int i = tiisg; i < args.ne0; i += N_SIMDWIDTH) {
+        const float v = x[i]*(w_elt ? wr[i] : w0);
+        sum += v*v;
+    }
+
+    sum = simd_sum(sum);
+
+    const float f = clamp(args.c/(args.s*sqrt(sum) + args.b), args.lo, args.hi);
+
+    for (int i = tiisg; i < args.ne0; i += N_SIMDWIDTH) {
+        y[i] = (x[i]*(w_elt ? wr[i] : w0))*f;
     }
 }
 // situ(gate, up) = gb*tanh(ga*gate)*sigmoid(gate) * ub*tanh(ua*up); gate and up are strided views, dst is contiguous
@@ -681,6 +667,93 @@ kernel void kernel_short_conv_f32(
     device float * q = (device float *) (cell + is*args.nb_cell1) + c*nh;
     for (int j = 0; j < nh; ++j) {
         q[j] = h[j];
+    }
+}
+// attention over depth, one simdgroup per query and token:
+//   y = sum_s p[s]*x[s]/rms(x[s]), p = softmax_s(scale * q.x[s]/rms(x[s]))
+// the states x[s] are [n_embd, n_tokens] tensors of one buffer, at args.offs
+kernel void kernel_depth_mix_f32(
+        constant ggml_metal_kargs_depth_mix & args,
+        device const char  * src,
+        device const float * query,
+        device       float * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const int iq = tgpig.x;
+    const int it = tgpig.y;
+
+    device const float * q = query + (ulong) iq*args.n_embd;
+
+    // per state: the sum of squares and the dot product with the query, reduced over the simdgroups through shmem
+    if (sgitg == 0) {
+        for (int s = 0; s < 2*args.n_states; ++s) {
+            shmem[s*N_SIMDWIDTH + tiisg] = 0.0f;
+        }
+    }
+
+    float coef[8];
+    float norm[8];
+
+    for (int s = 0; s < args.n_states; ++s) {
+        device const float * x = (device const float *) (src + args.offs[s]) + (ulong) it*args.n_embd;
+
+        float sumf = 0.0f;
+        float dotf = 0.0f;
+
+        for (int i = tpitg.x; i < args.n_embd; i += ntg.x) {
+            sumf += x[i]*x[i];
+            dotf += x[i]*q[i];
+        }
+
+        norm[s] = simd_sum(sumf);
+        coef[s] = simd_sum(dotf);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        for (int s = 0; s < args.n_states; ++s) {
+            shmem[(2*s + 0)*N_SIMDWIDTH + sgitg] = norm[s];
+            shmem[(2*s + 1)*N_SIMDWIDTH + sgitg] = coef[s];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float smax = -INFINITY;
+
+    for (int s = 0; s < args.n_states; ++s) {
+        const float sumf = simd_sum(shmem[(2*s + 0)*N_SIMDWIDTH + tiisg]);
+        const float dotf = simd_sum(shmem[(2*s + 1)*N_SIMDWIDTH + tiisg]);
+
+        norm[s] = 1.0f/sqrt(sumf/args.n_embd + args.eps);
+        coef[s] = dotf*norm[s]*args.scale;
+
+        smax = max(smax, coef[s]);
+    }
+
+    float sum = 0.0f;
+    for (int s = 0; s < args.n_states; ++s) {
+        coef[s] = exp(coef[s] - smax);
+        sum += coef[s];
+    }
+    for (int s = 0; s < args.n_states; ++s) {
+        coef[s] = coef[s]/sum*norm[s];
+    }
+
+    device float * y = dst + ((ulong) it*args.nq + iq)*args.n_embd;
+
+    for (int i = tpitg.x; i < args.n_embd; i += ntg.x) {
+        float v = 0.0f;
+        for (int s = 0; s < args.n_states; ++s) {
+            device const float * x = (device const float *) (src + args.offs[s]) + (ulong) it*args.n_embd;
+            v += coef[s]*x[i];
+        }
+        y[i] = v;
     }
 }
 template [[host_name("kernel_snake_f32")]]  kernel void kernel_snake<float>(constant ggml_metal_kargs_snake &, device const float *, device const float *, device const float *, device float *, uint, uint, uint);
