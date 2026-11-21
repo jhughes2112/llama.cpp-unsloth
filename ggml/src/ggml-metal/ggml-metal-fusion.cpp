@@ -813,6 +813,67 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+// [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: clip the L2 norm of each row,
+//   y = x*clamp(c/(s*sqrt(sum_row(x^2)) + b), lo, hi), with x = in*w when the leading MUL is part of the pattern.
+// not an elision chain (the row sum changes shape and x is read twice), so the structural checks live here (unsafe = true)
+static bool ggml_metal_fusion_check_l2_clip(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n = (int) fusion->ops.size();
+    const int o = n - 8; // 1 when the leading MUL is part of the pattern
+
+    const ggml_tensor * sqr   = nodes[o + 0];
+    const ggml_tensor * sum   = nodes[o + 1];
+    const ggml_tensor * sqrt  = nodes[o + 2];
+    const ggml_tensor * scale = nodes[o + 3];
+    const ggml_tensor * fill  = nodes[o + 4];
+    const ggml_tensor * div   = nodes[o + 5];
+    const ggml_tensor * clamp = nodes[o + 6];
+    const ggml_tensor * mul   = nodes[o + 7];
+
+    const ggml_tensor * x = sqr->src[0];
+
+    if (sum->src[0] != sqr || sqrt->src[0] != sum || scale->src[0] != sqrt || fill->src[0] != scale ||
+        div->src[0] != fill || div->src[1] != scale || clamp->src[0] != div ||
+        mul->src[0] != x || mul->src[1] != clamp) {
+        return false;
+    }
+
+    for (int j = 0; j < n; ++j) {
+        if (nodes[j]->type != GGML_TYPE_F32 || nodes[j]->view_src != nullptr) {
+            return false;
+        }
+    }
+
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(mul) ||
+        !ggml_are_same_shape(x, sqr) || !ggml_are_same_shape(x, mul) ||
+        !ggml_are_same_shape(sum, div) || !ggml_are_same_shape(sum, clamp)) {
+        return false;
+    }
+
+    if (o) {
+        const ggml_tensor * mul0 = nodes[0];
+        const ggml_tensor * in   = mul0->src[0];
+        const ggml_tensor * w    = mul0->src[1];
+
+        if (x != mul0 || in->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(in, mul0) || !ggml_can_repeat(w, in) ||
+            !ggml_is_contiguous(in) || !ggml_is_contiguous(w)) {
+            return false;
+        }
+    }
+
+    // every intermediate is read only inside the chain
+    const int outputs[1] = { node_idxs[idx + n - 1] };
+
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
+}
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -864,6 +925,13 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
+static const std::vector<ggml_op> ops_l2_clip = {
+    GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
+};
+static const std::vector<ggml_op> ops_l2_clip_mul = {
+    GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
+};
+
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,     ops_norm_mul,         {}, false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD, ops_norm_mul_add,     {}, false, ggml_metal_fusion_check_norm },
@@ -913,6 +981,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SSM_CONV_SILU, ops_ssm_conv_silu, {}, false, ggml_metal_fusion_check_ssm_conv_silu },
 
     { GGML_METAL_FUSION_MUL_MAT_ADD, ops_mul_mat_add, {}, false, ggml_metal_fusion_check_mul_mat_add },
+
+    { GGML_METAL_FUSION_L2_CLIP, ops_l2_clip,     {}, true, ggml_metal_fusion_check_l2_clip },
+    { GGML_METAL_FUSION_L2_CLIP, ops_l2_clip_mul, {}, true, ggml_metal_fusion_check_l2_clip },
 };
 
 // ---- alloc deps -----------------------------------------------------------

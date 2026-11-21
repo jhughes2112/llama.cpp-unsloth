@@ -533,6 +533,61 @@ kernel void kernel_snake(
     dst[idx] = T(xi + si * si * inv_b[c]);
 }
 
+// row L2 clip: y = x*clamp(c/(s*sqrt(sum_row(x^2)) + b), lo, hi), x = in*w with the leading MUL. one thread per row;
+// a row is read in full before it is written, so dst may be the input in place
+kernel void kernel_l2_clip_f32(
+        constant ggml_metal_kargs_l2_clip & args,
+        device const float * src,
+        device const float * w,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const int nrows = args.ne1*args.ne2*args.ne3;
+    if ((int) gid >= nrows) {
+        return;
+    }
+
+    const int i1 = gid%args.ne1;
+    const int i2 = (gid/args.ne1)%args.ne2;
+    const int i3 = gid/(args.ne1*args.ne2);
+
+    device const float * x = src + (ulong) gid*args.ne0;
+    device       float * y = dst + (ulong) gid*args.ne0;
+
+    device const float * wr = w + (ulong) args.nw0*((i1%args.nw1) + args.nw1*((i2%args.nw2) + args.nw2*(i3%args.nw3)));
+
+    float sum = 0.0f;
+
+    if (args.has_w) {
+        if (args.nw0 == 1) {
+            const float w0 = wr[0];
+            for (int i = 0; i < args.ne0; ++i) {
+                const float v = x[i]*w0;
+                sum += v*v;
+            }
+            const float f = clamp(args.c/(args.s*sqrt(sum) + args.b), args.lo, args.hi);
+            for (int i = 0; i < args.ne0; ++i) {
+                y[i] = (x[i]*w0)*f;
+            }
+        } else {
+            for (int i = 0; i < args.ne0; ++i) {
+                const float v = x[i]*wr[i];
+                sum += v*v;
+            }
+            const float f = clamp(args.c/(args.s*sqrt(sum) + args.b), args.lo, args.hi);
+            for (int i = 0; i < args.ne0; ++i) {
+                y[i] = (x[i]*wr[i])*f;
+            }
+        }
+    } else {
+        for (int i = 0; i < args.ne0; ++i) {
+            sum += x[i]*x[i];
+        }
+        const float f = clamp(args.c/(args.s*sqrt(sum) + args.b), args.lo, args.hi);
+        for (int i = 0; i < args.ne0; ++i) {
+            y[i] = x[i]*f;
+        }
+    }
+}
 template [[host_name("kernel_snake_f32")]]  kernel void kernel_snake<float>(constant ggml_metal_kargs_snake &, device const float *, device const float *, device const float *, device float *, uint, uint, uint);
 template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(constant ggml_metal_kargs_snake &, device const half *, device const float *, device const float *, device half *, uint, uint, uint);
 #if defined(GGML_METAL_HAS_BF16)

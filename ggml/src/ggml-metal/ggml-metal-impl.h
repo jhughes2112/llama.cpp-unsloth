@@ -716,6 +716,23 @@ typedef struct {
 } ggml_metal_kargs_snake;
 
 typedef struct {
+    int32_t ne0;  // row length
+    int32_t ne1;
+    int32_t ne2;
+    int32_t ne3;
+    int32_t nw0;  // shape of the leading MUL operand, broadcast over x (all 1 without it)
+    int32_t nw1;
+    int32_t nw2;
+    int32_t nw3;
+    int32_t has_w;
+    float   s;    // norm scale and bias
+    float   b;
+    float   c;    // threshold
+    float   lo;   // clamp
+    float   hi;
+} ggml_metal_kargs_l2_clip;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;
