@@ -4781,6 +4781,79 @@ struct test_inkling2_clip : public test_case {
         return out;
     }
 };
+// the expert activation of Inkling 2: the merged gate_up output of the selected experts, scaled per expert,
+// split into its gate and up halves and run through situ(gate, up) = b*tanh(gate/b)*sigmoid(gate) * lb*tanh(up/lb).
+// the Metal backend fuses the scale lookup (repeat get_rows mul) and the SiTU chain into one kernel each
+struct test_inkling2_situ : public test_case {
+    const int64_t n_ff;
+    const int64_t n_expert;
+    const int64_t n_used;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_SITU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_ff, n_expert, n_used, n_tokens);
+    }
+
+    test_inkling2_situ(int64_t n_ff = 1152, int64_t n_expert = 128, int64_t n_used = 8, int64_t n_tokens = 1)
+        : n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_used, n_tokens);
+        ggml_set_name(gate_up, "gate_up");
+
+        ggml_tensor * w_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_set_name(w_s, "w_s");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_name(ids, "ids");
+
+        // some op first, as the mul_mat_id in the model, so that the scaled output can be allocated in place
+        gate_up = ggml_scale(ctx, gate_up, 2.0f);
+
+        ggml_tensor * s = ggml_reshape_3d(ctx, w_s, 1, n_expert, 1);
+        s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
+        s = ggml_get_rows(ctx, s, ids);
+        gate_up = ggml_mul(ctx, gate_up, s);
+
+        ggml_tensor * cur = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * up  = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], n_ff*gate_up->nb[0]);
+
+        const float beta = 3.0f;
+        const float lb   = 2.5f;
+
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, cur, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, cur));
+        up  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
+
+        ggml_tensor * out = ggml_mul(ctx, act, up);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (int32_t) ((i*37 + 11) % n_expert);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (std::string(ggml_get_name(t)) == "gate_up") {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            }
+        }
+    }
+};
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -11031,6 +11104,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_inkling2_clip({  7,  3,   5, 2}, w_mode, computed, 1.0f));
         }
     }
+    // Inkling 2 expert scale lookup and SiTU activation
+    test_cases.emplace_back(new test_inkling2_situ(1152, 128, 8,   1));
+    test_cases.emplace_back(new test_inkling2_situ(1152, 128, 8,  33));
+    test_cases.emplace_back(new test_inkling2_situ(  96,  16, 4, 512));
+    test_cases.emplace_back(new test_inkling2_situ(   7,   5, 3,   2));
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block

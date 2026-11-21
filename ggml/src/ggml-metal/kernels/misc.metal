@@ -588,6 +588,48 @@ kernel void kernel_l2_clip_f32(
         }
     }
 }
+// situ(gate, up) = gb*tanh(ga*gate)*sigmoid(gate) * ub*tanh(ua*up); gate and up are strided views, dst is contiguous
+kernel void kernel_situ_f32(
+        constant ggml_metal_kargs_situ & args,
+        device const char  * gate,
+        device const char  * up,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = (uint) args.ne0*args.ne1*args.ne2;
+    if (gid >= n) {
+        return;
+    }
+
+    const uint i0 = gid%args.ne0;
+    const uint r  = gid/args.ne0;
+    const uint i1 = r%args.ne1;
+    const uint i2 = r/args.ne1;
+
+    const ulong offs = i2*args.nb2 + i1*args.nb1 + i0*sizeof(float);
+
+    const float g = *((device const float *) (gate + offs));
+    const float u = *((device const float *) (up   + offs));
+
+    const float act = (args.gb*precise::tanh(args.ga*g))*(1/(1 + exp(-g)));
+
+    dst[gid] = act*(args.ub*precise::tanh(args.ua*u));
+}
+
+// y[i, e, t] = x[i, e, t]*s[ids[e, t]]; dst may be x in place
+kernel void kernel_expert_scale_f32(
+        constant ggml_metal_kargs_expert_scale & args,
+        device const float * x,
+        device const float * s,
+        device const int   * ids,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = (uint) args.ne0*args.ne1*args.ne2;
+    if (gid >= n) {
+        return;
+    }
+
+    dst[gid] = x[gid]*s[ids[gid/args.ne0]];
+}
 template [[host_name("kernel_snake_f32")]]  kernel void kernel_snake<float>(constant ggml_metal_kargs_snake &, device const float *, device const float *, device const float *, device float *, uint, uint, uint);
 template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(constant ggml_metal_kargs_snake &, device const half *, device const float *, device const float *, device half *, uint, uint, uint);
 #if defined(GGML_METAL_HAS_BF16)

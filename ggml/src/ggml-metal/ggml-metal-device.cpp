@@ -2517,6 +2517,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_clip(ggml_met
 
     return res;
 }
+// the fused glue kernels that take no variants: one pipeline per kernel name
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_named(ggml_metal_library_t lib, const char * name) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2d(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_CONV_TRANSPOSE_2D);
 

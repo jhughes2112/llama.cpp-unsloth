@@ -874,6 +874,117 @@ static bool ggml_metal_fusion_check_l2_clip(
 
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
 }
+// SCALE TANH SCALE SIGMOID MUL SCALE TANH SCALE MUL: situ(gate, up) = b*tanh(gate/b)*sigmoid(gate) * lb*tanh(up/lb),
+// with gate and up two same-shape views. the gate is read twice, so the structural checks live here (unsafe = true)
+static bool ggml_metal_fusion_check_situ(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n = (int) fusion->ops.size();
+
+    const ggml_tensor * g_in  = nodes[0]; // gate/b
+    const ggml_tensor * g_th  = nodes[1];
+    const ggml_tensor * g_out = nodes[2]; // b*tanh
+    const ggml_tensor * g_sig = nodes[3];
+    const ggml_tensor * act   = nodes[4];
+    const ggml_tensor * u_in  = nodes[5];
+    const ggml_tensor * u_th  = nodes[6];
+    const ggml_tensor * u_out = nodes[7];
+    const ggml_tensor * dst   = nodes[8];
+
+    const ggml_tensor * gate = g_in->src[0];
+    const ggml_tensor * up   = u_in->src[0];
+
+    if (g_th->src[0] != g_in || g_out->src[0] != g_th || g_sig->src[0] != gate ||
+        act->src[0] != g_out || act->src[1] != g_sig ||
+        u_th->src[0] != u_in || u_out->src[0] != u_th ||
+        dst->src[0] != act || dst->src[1] != u_out) {
+        return false;
+    }
+
+    if (ggml_get_unary_op(g_th) != GGML_UNARY_OP_TANH || ggml_get_unary_op(u_th) != GGML_UNARY_OP_TANH ||
+        ggml_get_unary_op(g_sig) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+
+    // plain scales, no bias
+    for (const ggml_tensor * s : { g_in, g_out, u_in, u_out }) {
+        if (ggml_get_op_params_f32(s, 1) != 0.0f) {
+            return false;
+        }
+    }
+
+    for (int j = 0; j < n; ++j) {
+        if (nodes[j]->type != GGML_TYPE_F32 || nodes[j]->view_src != nullptr || !ggml_are_same_shape(nodes[j], dst)) {
+            return false;
+        }
+    }
+
+    // gate and up may be strided views (the two halves of a merged gate_up row); the kernel reads them with their strides
+    if (gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(gate, dst) || !ggml_are_same_shape(up, dst) ||
+        gate->nb[0] != sizeof(float) || up->nb[0] != sizeof(float) ||
+        gate->nb[1] != up->nb[1] || gate->nb[2] != up->nb[2] || dst->ne[3] != 1 || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int outputs[1] = { node_idxs[idx + n - 1] };
+
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
+}
+
+// REPEAT GET_ROWS MUL: y[i, e, t] = x[i, e, t]*s[ids[e, t]], the per-expert scalar of each selected expert.
+// the table is a [1, n_expert, 1] tensor repeated over the tokens, so the rows of the repeat are all the same
+static bool ggml_metal_fusion_check_expert_scale(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n = (int) fusion->ops.size();
+
+    const ggml_tensor * rep  = nodes[0];
+    const ggml_tensor * rows = nodes[1];
+    const ggml_tensor * mul  = nodes[2];
+
+    const ggml_tensor * s   = rep->src[0];
+    const ggml_tensor * ids = rows->src[1];
+    const ggml_tensor * x   = mul->src[0];
+
+    if (rows->src[0] != rep || mul->src[1] != rows || x == rows) {
+        return false;
+    }
+
+    if (s->type != GGML_TYPE_F32 || rep->type != GGML_TYPE_F32 || rows->type != GGML_TYPE_F32 ||
+        x->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    // s: [1, n_expert, 1], rep: [1, n_expert, n_tokens], ids: [n_used, n_tokens], rows: [1, n_used, n_tokens]
+    if (s->ne[0] != 1 || s->ne[2] != 1 || s->ne[3] != 1 || rep->ne[0] != 1 || rep->ne[1] != s->ne[1] || rep->ne[3] != 1 ||
+        ids->ne[1] != rep->ne[2] || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        rows->ne[0] != 1 || rows->ne[1] != ids->ne[0] || rows->ne[2] != ids->ne[1] || rows->ne[3] != 1 ||
+        x->ne[1] != rows->ne[1] || x->ne[2] != rows->ne[2] || x->ne[3] != 1 || !ggml_are_same_shape(x, mul)) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(s) || !ggml_is_contiguous(ids) || !ggml_is_contiguous(x) || !ggml_is_contiguous(mul) ||
+        rep->view_src != nullptr || rows->view_src != nullptr || mul->view_src != nullptr) {
+        return false;
+    }
+
+    const int outputs[1] = { node_idxs[idx + n - 1] };
+
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
+}
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -925,6 +1036,11 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
+static const std::vector<ggml_op> ops_situ = {
+    GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL
+};
+static const std::vector<ggml_op> ops_expert_scale = { GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_l2_clip = {
     GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
 };
@@ -984,6 +1100,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_L2_CLIP, ops_l2_clip,     {}, true, ggml_metal_fusion_check_l2_clip },
     { GGML_METAL_FUSION_L2_CLIP, ops_l2_clip_mul, {}, true, ggml_metal_fusion_check_l2_clip },
+
+    { GGML_METAL_FUSION_SITU,         ops_situ,         {}, true, ggml_metal_fusion_check_situ },
+    { GGML_METAL_FUSION_EXPERT_SCALE, ops_expert_scale, {}, true, ggml_metal_fusion_check_expert_scale },
 };
 
 // ---- alloc deps -----------------------------------------------------------

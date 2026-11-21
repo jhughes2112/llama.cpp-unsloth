@@ -733,6 +733,24 @@ typedef struct {
 } ggml_metal_kargs_l2_clip;
 
 typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nb1; // row strides of the gate and up views
+    uint64_t nb2;
+    float    ga;  // gate: gb*tanh(ga*x)*sigmoid(x)
+    float    gb;
+    float    ua;  // up: ub*tanh(ua*x)
+    float    ub;
+} ggml_metal_kargs_situ;
+
+typedef struct {
+    int32_t ne0;
+    int32_t ne1; // experts used
+    int32_t ne2; // tokens
+} ggml_metal_kargs_expert_scale;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;
