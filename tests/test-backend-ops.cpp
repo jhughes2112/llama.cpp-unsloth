@@ -4732,6 +4732,55 @@ struct test_snake_fuse : public test_case {
 };
 
 
+// row L2 clip of Inkling 2 (Q, K and the relative-position projection, per head):
+//   y = x*clamp(c/(sqrt(sum_row(x^2)) + 1e-6), 0, 1), with x = in*w when scaled
+// the Metal backend matches the [mul] sqr sum_rows sqrt scale fill div clamp mul chain and runs one fused kernel
+struct test_inkling2_clip : public test_case {
+    const std::array<int64_t, 4> ne;   // [n_embd_head, n_head, n_tokens, 1]
+    const int   w_mode;                // 0: no leading mul, 1: w is [1, n_head], 2: w is [n_embd_head, n_head]
+    const bool  computed;              // x comes from another op, so the output may be allocated in place
+    const float threshold;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_CLIP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, w_mode, computed, threshold);
+    }
+
+    test_inkling2_clip(std::array<int64_t, 4> ne = {128, 24, 1, 1}, int w_mode = 0, bool computed = false, float threshold = 4.0f)
+        : ne(ne), w_mode(w_mode), computed(computed), threshold(threshold) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(cur, "x");
+
+        if (computed) {
+            cur = ggml_scale(ctx, cur, 1.5f);
+        }
+
+        if (w_mode) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w_mode == 1 ? 1 : ne[0], ne[1]);
+            ggml_set_name(w, "w");
+
+            cur = ggml_mul(ctx, cur, w);
+        }
+
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+
+        ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, threshold), norm);
+
+        ggml_tensor * out = ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -10972,6 +11021,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
 
+    // Inkling 2 row L2 clip; thresholds on both sides of the row norms (rows of 128 uniform values have norm ~6.5)
+    for (int w_mode : {0, 1, 2}) {
+        for (bool computed : {false, true}) {
+            test_cases.emplace_back(new test_inkling2_clip({128, 24,   1, 1}, w_mode, computed, 4.0f));
+            test_cases.emplace_back(new test_inkling2_clip({128, 24,   1, 1}, w_mode, computed, 100.0f));
+            test_cases.emplace_back(new test_inkling2_clip({128, 24,  33, 1}, w_mode, computed, 4.0f));
+            test_cases.emplace_back(new test_inkling2_clip({ 32, 24, 512, 1}, w_mode, computed, 2.0f));
+            test_cases.emplace_back(new test_inkling2_clip({  7,  3,   5, 2}, w_mode, computed, 1.0f));
+        }
+    }
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block
