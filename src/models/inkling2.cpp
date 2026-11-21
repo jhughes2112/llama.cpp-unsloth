@@ -239,11 +239,11 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     h = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, 1e-6f), 2*n_embd, n_tokens);
     h = build_lora_mm(layer.loop_down[module], h);
 
-    // both projections first, so that the elementwise tail is one run of nodes that backends can fuse
+    // both projections first (order only), so that the elementwise tail is one run of nodes that backends can fuse
     ggml_tensor * gain   = build_lora_mm(layer.loop_gain[module],   h);
     ggml_tensor * forget = build_lora_mm(layer.loop_forget[module], h);
-    ggml_build_forward_expand(gf, forget);
-    ggml_build_forward_expand(gf, gain);
+    ggml_build_forward_order(gf, forget);
+    ggml_build_forward_order(gf, gain);
 
     gain   = ggml_tanh(ctx0, gain);
     forget = ggml_tanh(ctx0, forget);
@@ -296,8 +296,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     out = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
 
-    // right after the state store, so that the window, the store and the convolution are one run of nodes that backends can fuse
-    ggml_build_forward_expand(gf, out);
+    // right after the state store, so that the window, the store and the convolution are one run of nodes that backends can fuse.
+    // order only: whether a node is computed stays with the outputs that need it
+    ggml_build_forward_order(gf, out);
 
     return out;
 }
