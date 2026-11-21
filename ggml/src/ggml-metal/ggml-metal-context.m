@@ -771,6 +771,11 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         n_cb = 0;
     }
 
+    // GGML_METAL_N_CB: the number of command buffers, each encoded by a thread of its own, after the first
+    if (n_cb > 0 && getenv("GGML_METAL_N_CB") != NULL) {
+        n_cb = atoi(getenv("GGML_METAL_N_CB"));
+    }
+
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 

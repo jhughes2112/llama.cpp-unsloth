@@ -5,6 +5,11 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -371,6 +376,51 @@ struct node_info {
     }
 };
 
+// the ops whose reads and writes are their sources and their output: only these are reordered
+static bool ggml_metal_graph_optimize_is_safe(ggml_op op) {
+    switch (op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_ROPE:
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_GROUP_NORM:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_CLAMP:
+        case GGML_OP_TRI:
+        case GGML_OP_DIAG:
+        case GGML_OP_MUL:
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_DIV:
+        case GGML_OP_GLU:
+        case GGML_OP_SCALE:
+        case GGML_OP_UNARY:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_SET:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_REPEAT:
+        // what these read and write is their sources and their output, as for the ops above
+        case GGML_OP_CONCAT:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_PAD:
+        case GGML_OP_FILL:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_FLASH_ATTN_EXT:
+            return true;
+        default:
+            return ggml_op_is_empty(op);
+    }
+}
+
 static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
     // helper to add node src and dst ranges
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
@@ -442,41 +492,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
         return true;
     };
 
-    // perform reorders only across these types of ops
-    // can be expanded when needed
-    const auto & h_safe = [](ggml_op op) {
-        switch (op) {
-            case GGML_OP_MUL_MAT:
-            case GGML_OP_MUL_MAT_ID:
-            case GGML_OP_ROPE:
-            case GGML_OP_NORM:
-            case GGML_OP_RMS_NORM:
-            case GGML_OP_GROUP_NORM:
-            case GGML_OP_L2_NORM:
-            case GGML_OP_SUM_ROWS:
-            case GGML_OP_SSM_CONV:
-            case GGML_OP_SSM_SCAN:
-            case GGML_OP_CLAMP:
-            case GGML_OP_TRI:
-            case GGML_OP_DIAG:
-            case GGML_OP_MUL:
-            case GGML_OP_ADD:
-            case GGML_OP_SUB:
-            case GGML_OP_DIV:
-            case GGML_OP_GLU:
-            case GGML_OP_SCALE:
-            case GGML_OP_UNARY:
-            case GGML_OP_GET_ROWS:
-            case GGML_OP_SET_ROWS:
-            case GGML_OP_SET:
-            case GGML_OP_CPY:
-            case GGML_OP_CONT:
-            case GGML_OP_REPEAT:
-                return true;
-            default:
-                return ggml_op_is_empty(op);
-        }
-    };
+    const auto & h_safe = ggml_metal_graph_optimize_is_safe;
 
     const int n = nodes.size();
 
@@ -511,7 +527,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             h_add(mrs1, node0);
 
             // that many nodes forward to search for a concurrent node
-            constexpr int N_FORWARD = 64;
+            static const int N_FORWARD = getenv("GGML_METAL_N_FORWARD") ? atoi(getenv("GGML_METAL_N_FORWARD")) : 64;
 
             for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < n; i1++) {
                 if (used[i1]) {
@@ -560,8 +576,146 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
+// order the groups by depth: a group goes one level after the last group whose memory it reads or overwrites, and the
+// groups of a level, which cannot conflict, run without a barrier between them. this is the order with the fewest
+// barriers the dependencies allow; the lookahead of ggml_metal_graph_optimize_reorder stops short of it on graphs made
+// of long chains of small ops. accesses are tracked per root tensor as byte ranges, so in-place ops and the writes to
+// pre-allocated state (KV and recurrent caches) are ordered like any other
+static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_info> & nodes, bool (*is_safe)(ggml_op)) {
+    struct access {
+        size_t beg;
+        size_t end;
+        int    level;
+        bool   write;
+    };
+
+    const int n = (int) nodes.size();
+
+    std::vector<int> level(n, 0);
+
+    std::unordered_map<const ggml_tensor *, std::vector<access>> accesses; // by root tensor
+    std::unordered_map<const ggml_tensor *, int>                 node_level; // by graph node
+
+    accesses.reserve(2*n);
+    node_level.reserve(2*n);
+
+    const auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+
+    // the level a read (write = false) or a write of t has to come after
+    const auto after = [&](const ggml_tensor * t, bool write) {
+        int res = 0;
+        const auto it = accesses.find(root(t));
+        if (it != accesses.end()) {
+            const size_t beg = t->view_offs;
+            const size_t end = beg + ggml_nbytes(t);
+            for (const access & a : it->second) {
+                if ((a.write || write) && a.beg < end && beg < a.end) {
+                    res = std::max(res, a.level);
+                }
+            }
+        }
+        return res;
+    };
+
+    const auto record = [&](const ggml_tensor * t, bool write, int lvl) {
+        std::vector<access> & list = accesses[root(t)];
+        const size_t beg = t->view_offs;
+        const size_t end = beg + ggml_nbytes(t);
+        // a later access to the same range supersedes an earlier one of the same kind, levels only grow along a chain
+        for (access & a : list) {
+            if (a.write == write && a.beg == beg && a.end == end) {
+                a.level = std::max(a.level, lvl);
+                return;
+            }
+        }
+        list.push_back({ beg, end, lvl, write });
+    };
+
+    int floor = 0; // groups after an op with unknown accesses stay after it
+    int top   = 0;
+
+    for (int i = 0; i < n; ++i) {
+        const node_info & node = nodes[i];
+
+        std::vector<const ggml_tensor *> ts;
+        ts.push_back(node.node);
+        for (const ggml_tensor * f : node.fused) {
+            ts.push_back(f);
+        }
+
+        bool safe      = true;
+        bool all_empty = true;
+        for (const ggml_tensor * t : ts) {
+            safe      = safe && is_safe(t->op);
+            all_empty = all_empty && ggml_op_is_empty(t->op);
+        }
+
+        int lvl = floor;
+
+        if (all_empty) {
+            // views: no access, placed with what they view
+            for (const ggml_tensor * t : ts) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (t->src[j]) {
+                        const auto it = node_level.find(t->src[j]);
+                        if (it != node_level.end()) {
+                            lvl = std::max(lvl, it->second);
+                        }
+                    }
+                }
+            }
+        } else if (!safe) {
+            lvl = top + 1;
+            floor = lvl;
+        } else {
+            for (const ggml_tensor * t : ts) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    const ggml_tensor * src = t->src[j];
+                    if (src && !node.is_output(src)) {
+                        lvl = std::max(lvl, after(src, false));
+                    }
+                }
+                if (!ggml_op_is_empty(t->op)) {
+                    lvl = std::max(lvl, after(t, true));
+                }
+            }
+            lvl++;
+        }
+
+        if (!all_empty) {
+            for (const ggml_tensor * t : ts) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    const ggml_tensor * src = t->src[j];
+                    if (src && !node.is_output(src)) {
+                        record(src, false, lvl);
+                    }
+                }
+                if (!ggml_op_is_empty(t->op)) {
+                    record(t, true, lvl);
+                }
+            }
+        }
+
+        for (const ggml_tensor * t : ts) {
+            node_level[t] = lvl;
+        }
+
+        level[i] = lvl;
+        top = std::max(top, lvl);
+    }
+
+    std::vector<int> res(n);
+    for (int i = 0; i < n; ++i) {
+        res[i] = i;
+    }
+    std::stable_sort(res.begin(), res.end(), [&](int a, int b) { return level[a] < level[b]; });
+
+    return res;
+}
+
 void ggml_graph_optimize(ggml_cgraph * gf) {
     const int n = gf->n_nodes;
+
 
     std::vector<node_info> nodes;
     nodes.reserve(gf->n_nodes);
@@ -593,7 +747,12 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
 
 #if 1
     // reorder to improve concurrency
-    const auto order = ggml_metal_graph_optimize_reorder(nodes);
+    // GGML_METAL_REORDER=lookahead for the greedy lookahead instead of the levels
+    static const bool use_levels = getenv("GGML_METAL_REORDER") == nullptr || strcmp(getenv("GGML_METAL_REORDER"), "lookahead") != 0;
+
+    const auto order = use_levels ?
+        ggml_metal_graph_optimize_levels(nodes, ggml_metal_graph_optimize_is_safe) :
+        ggml_metal_graph_optimize_reorder(nodes);
 #else
     std::vector<int> order(nodes.size());
     for (size_t i = 0; i < nodes.size(); i++) {
