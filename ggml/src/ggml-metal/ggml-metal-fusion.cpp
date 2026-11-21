@@ -1236,6 +1236,52 @@ static std::vector<ggml_op> ggml_metal_fusion_ops_depth_mix(int k) {
     }
     return ops;
 }
+// TANH SCALE MUL TANH MUL ADD: y = (s*tanh(f) + b)*x + tanh(g)*m, the output of an Inkling 2 loop controller
+// (forget and gain gates on the layer input and the cross-pass message). two branches: unsafe = true
+static bool ggml_metal_fusion_check_gated_mix(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n = (int) fusion->ops.size();
+
+    const ggml_tensor * tf  = nodes[0];
+    const ggml_tensor * sc  = nodes[1];
+    const ggml_tensor * m1  = nodes[2];
+    const ggml_tensor * tg  = nodes[3];
+    const ggml_tensor * m2  = nodes[4];
+    const ggml_tensor * add = nodes[5];
+
+    if (ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH ||
+        sc->src[0] != tf || m1->src[0] != sc || m2->src[0] != tg || add->src[0] != m1 || add->src[1] != m2) {
+        return false;
+    }
+
+    const ggml_tensor * f = tf->src[0];
+    const ggml_tensor * g = tg->src[0];
+    const ggml_tensor * x = m1->src[1];
+    const ggml_tensor * m = m2->src[1];
+
+    for (const ggml_tensor * t : { tf, sc, m1, tg, m2, add, f, g, x, m }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, add) || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+
+    for (int j = 0; j < n; ++j) {
+        if (nodes[j]->view_src != nullptr) {
+            return false;
+        }
+    }
+
+    const int outputs[1] = { node_idxs[idx + n - 1] };
+
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
+}
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -1294,6 +1340,9 @@ static const std::vector<ggml_op> ops_situ = {
 static const std::vector<ggml_op> ops_expert_scale = { GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_short_conv = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
+};
+static const std::vector<ggml_op> ops_gated_mix = {
+    GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD
 };
 static const std::vector<ggml_op> ops_l2_clip = {
     GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
@@ -1358,6 +1407,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SITU,         ops_situ,         {}, true, ggml_metal_fusion_check_situ },
     { GGML_METAL_FUSION_EXPERT_SCALE, ops_expert_scale, {}, true, ggml_metal_fusion_check_expert_scale },
     { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv,   {1}, true, ggml_metal_fusion_check_short_conv },
+    { GGML_METAL_FUSION_GATED_MIX,    ops_gated_mix,    {}, true, ggml_metal_fusion_check_gated_mix },
 
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(0), {}, true, ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(1), {}, true, ggml_metal_fusion_check_depth_mix },

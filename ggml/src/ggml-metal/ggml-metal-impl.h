@@ -772,6 +772,12 @@ typedef struct {
 } ggml_metal_kargs_depth_mix;
 
 typedef struct {
+    int64_t n; // elements
+    float   s; // forget gate scale and bias
+    float   b;
+} ggml_metal_kargs_gated_mix;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

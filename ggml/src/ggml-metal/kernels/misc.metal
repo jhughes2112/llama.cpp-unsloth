@@ -756,6 +756,21 @@ kernel void kernel_depth_mix_f32(
         y[i] = v;
     }
 }
+// y = (s*tanh(f) + b)*x + tanh(g)*m, elementwise; dst may be any of the inputs in place
+kernel void kernel_gated_mix_f32(
+        constant ggml_metal_kargs_gated_mix & args,
+        device const float * f,
+        device const float * g,
+        device const float * x,
+        device const float * m,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n) {
+        return;
+    }
+
+    dst[gid] = (args.s*precise::tanh(f[gid]) + args.b)*x[gid] + precise::tanh(g[gid])*m[gid];
+}
 template [[host_name("kernel_snake_f32")]]  kernel void kernel_snake<float>(constant ggml_metal_kargs_snake &, device const float *, device const float *, device const float *, device float *, uint, uint, uint);
 template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(constant ggml_metal_kargs_snake &, device const half *, device const float *, device const float *, device half *, uint, uint, uint);
 #if defined(GGML_METAL_HAS_BF16)

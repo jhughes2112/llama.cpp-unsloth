@@ -849,6 +849,14 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
             return ggml_metal_op_situ(ctx, idx, n);
         }
     }
+    if (op->op == GGML_OP_UNARY && ctx->use_fusion() && ggml_get_unary_op(op) == GGML_UNARY_OP_TANH) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GATED_MIX) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_gated_mix(ctx, idx, n);
+        }
+    }
     if (op->op == GGML_OP_SQR && ctx->use_fusion()) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
@@ -5710,6 +5718,42 @@ int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_threadgroup_memory_size(enc, 2*8*32*sizeof(float), 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, args.nq, args.n_tokens, 1, nth, 1, 1);
+
+    return n;
+}
+// Dispatch the fused loop controller output from the matched tanh scale mul tanh mul add run.
+int ggml_metal_op_gated_mix(ggml_metal_op_t ctx, int idx, int n) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * tf  = ctx->node(idx + 0);
+    const ggml_tensor * sc  = ctx->node(idx + 1);
+    const ggml_tensor * m1  = ctx->node(idx + 2);
+    const ggml_tensor * tg  = ctx->node(idx + 3);
+    const ggml_tensor * m2  = ctx->node(idx + 4);
+    ggml_tensor *       dst = ctx->node(idx + n - 1);
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n);
+
+    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_gated_mix_f32");
+
+    ggml_metal_kargs_gated_mix args = {
+        /*.n =*/ ggml_nelements(dst),
+        /*.s =*/ ggml_get_op_params_f32(sc, 0),
+        /*.b =*/ ggml_get_op_params_f32(sc, 1),
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(tf->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(tg->src[0]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(m1->src[1]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(m2->src[1]), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        5);
+
+    const int nth = 256;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n + nth - 1)/nth, 1, 1, nth, 1, 1);
 
     return n;
 }

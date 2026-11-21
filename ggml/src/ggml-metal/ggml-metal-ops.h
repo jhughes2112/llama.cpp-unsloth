@@ -99,6 +99,7 @@ int ggml_metal_op_situ              (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_expert_scale      (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_short_conv        (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_depth_mix         (ggml_metal_op_t ctx, int idx, int n);
+int ggml_metal_op_gated_mix         (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_upscale           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pad               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pad_reflect_1d    (ggml_metal_op_t ctx, int idx);

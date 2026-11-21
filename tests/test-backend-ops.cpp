@@ -4983,6 +4983,46 @@ struct test_inkling2_depth_mix : public test_case {
         }
     }
 };
+// the output of an Inkling 2 loop controller: y = (1 - tanh(f))*x + tanh(g)*m, forget and gain gates on the layer
+// input x and the cross-pass message m. the Metal backend runs the tanh scale mul tanh mul add run as one kernel
+struct test_inkling2_gated_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_GATED_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    test_inkling2_gated_mix(int64_t n_embd = 2304, int64_t n_tokens = 1)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in[4];
+        for (int i = 0; i < 4; ++i) {
+            in[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(in[i], "in");
+            // some op first, as the projections in the model, so that the output can be allocated in place
+            in[i] = ggml_scale(ctx, in[i], 1.0f + i);
+        }
+
+        ggml_tensor * forget = ggml_tanh(ctx, in[0]);
+        ggml_tensor * gain   = ggml_tanh(ctx, in[1]);
+
+        ggml_tensor * out = ggml_add(ctx,
+                ggml_mul(ctx, ggml_scale_bias(ctx, forget, -1.0f, 1.0f), in[2]),
+                ggml_mul(ctx, gain, in[3]));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -11252,6 +11292,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling2_depth_mix( 200, n_blocks, 3, 33));
         test_cases.emplace_back(new test_inkling2_depth_mix(  17, n_blocks, 2,  5));
     }
+    // Inkling 2 loop controller output
+    test_cases.emplace_back(new test_inkling2_gated_mix(2304,   1));
+    test_cases.emplace_back(new test_inkling2_gated_mix(2304,  33));
+    test_cases.emplace_back(new test_inkling2_gated_mix( 300, 512));
+    test_cases.emplace_back(new test_inkling2_gated_mix(   7,   3));
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block
