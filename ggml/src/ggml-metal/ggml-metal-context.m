@@ -12,6 +12,30 @@
 
 #import <Metal/Metal.h>
 
+#include <stdatomic.h>
+
+// GGML_METAL_PROFILE=1: sum the GPU execution time of every command buffer, printed when a context is freed.
+// against the wall time of a decode it tells GPU work from waiting (encoding, scheduling, idle gaps)
+static int             g_profile = -1;
+static _Atomic int64_t g_profile_gpu_ns   = 0;
+static _Atomic int64_t g_profile_sched_ns = 0; // kernel start -> GPU start
+static _Atomic int64_t g_profile_n_cb     = 0;
+static _Atomic int64_t g_profile_n_graphs = 0;
+
+static void ggml_metal_profile_cmd_buf(id<MTLCommandBuffer> cmd_buf) {
+    if (g_profile < 0) {
+        g_profile = getenv("GGML_METAL_PROFILE") != NULL ? 1 : 0;
+    }
+    if (!g_profile) {
+        return;
+    }
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        atomic_fetch_add(&g_profile_gpu_ns,   (int64_t) (([cb GPUEndTime] - [cb GPUStartTime])*1e9));
+        atomic_fetch_add(&g_profile_sched_ns, (int64_t) (([cb GPUStartTime] - [cb kernelStartTime])*1e9));
+        atomic_fetch_add(&g_profile_n_cb, 1);
+    }];
+}
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -218,6 +242,11 @@ void ggml_metal_free(ggml_metal_t ctx) {
     if (ctx->pipelines_ext) {
         ggml_metal_pipelines_free(ctx->pipelines_ext);
         ctx->pipelines_ext = nil;
+    }
+
+    if (g_profile > 0) {
+        fprintf(stderr, "ggml_metal_free: profile: %lld graphs, %lld command buffers, GPU time %.1f ms, kernel-to-GPU wait %.1f ms\n",
+                (long long) g_profile_n_graphs, (long long) g_profile_n_cb, g_profile_gpu_ns/1e6, g_profile_sched_ns/1e6);
     }
 
     if (ggml_metal_fusion_info_debug(ctx->finfo) > 0) {
@@ -574,6 +603,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
             ctx->cmd_bufs[n_cb].obj = cmd_buf;
 
+            ggml_metal_profile_cmd_buf(cmd_buf);
+            atomic_fetch_add(&g_profile_n_graphs, 1);
+
             [cmd_buf enqueue];
 
             ctx->encode_async(n_cb);
@@ -592,6 +624,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 [ctx->cmd_bufs[cb_idx].obj release];
             }
             ctx->cmd_bufs[cb_idx].obj = cmd_buf;
+
+            ggml_metal_profile_cmd_buf(cmd_buf);
 
             // always enqueue the first two command buffers
             // enqueue all of the command buffers if we don't need to abort
