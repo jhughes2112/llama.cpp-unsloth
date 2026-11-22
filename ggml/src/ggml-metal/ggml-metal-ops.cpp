@@ -2866,6 +2866,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
+    // GGML_METAL_MV_EXT_MIN: the fewest src1 rows for the small-batch kernels (9 and more: never)
+    static const int mv_ext_min = getenv("GGML_METAL_MV_EXT_MIN") ? atoi(getenv("GGML_METAL_MV_EXT_MIN")) : 2;
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
@@ -2885,7 +2888,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_MXFP4 ||
            op->src[0]->type == GGML_TYPE_NVFP4 ||
            op->src[0]->type == GGML_TYPE_IQ4_NL ||
-           false) && (ne11 >= 2 && ne11 <= 8)
+           false) && (ne11 >= mv_ext_min && ne11 <= 8)
          ) ||
          (
           (
