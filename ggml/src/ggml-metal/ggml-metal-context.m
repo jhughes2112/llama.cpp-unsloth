@@ -22,6 +22,44 @@ static _Atomic int64_t g_profile_sched_ns = 0; // kernel start -> GPU start
 static _Atomic int64_t g_profile_n_cb     = 0;
 static _Atomic int64_t g_profile_n_graphs = 0;
 
+// GPU time by graph size, to tell the graphs of a round apart (the model, its drafter, their small helpers)
+#define GGML_METAL_PROFILE_BUCKETS 24
+static _Atomic int64_t g_profile_bucket_nodes [GGML_METAL_PROFILE_BUCKETS];
+static _Atomic int64_t g_profile_bucket_graphs[GGML_METAL_PROFILE_BUCKETS];
+static _Atomic int64_t g_profile_bucket_gpu_ns[GGML_METAL_PROFILE_BUCKETS];
+
+static int ggml_metal_profile_bucket(int n_nodes) {
+    for (int i = 0; i < GGML_METAL_PROFILE_BUCKETS; ++i) {
+        int64_t cur = atomic_load(&g_profile_bucket_nodes[i]);
+        if (cur == n_nodes) {
+            return i;
+        }
+        if (cur == 0) {
+            int64_t expected = 0;
+            if (atomic_compare_exchange_strong(&g_profile_bucket_nodes[i], &expected, (int64_t) n_nodes) || expected == n_nodes) {
+                return i;
+            }
+        }
+    }
+    return GGML_METAL_PROFILE_BUCKETS - 1;
+}
+
+static void ggml_metal_profile_cmd_buf_graph(id<MTLCommandBuffer> cmd_buf, int n_nodes, bool first) {
+    if (g_profile < 0) {
+        g_profile = getenv("GGML_METAL_PROFILE") != NULL ? 1 : 0;
+    }
+    if (!g_profile) {
+        return;
+    }
+    const int b = ggml_metal_profile_bucket(n_nodes);
+    if (first) {
+        atomic_fetch_add(&g_profile_bucket_graphs[b], 1);
+    }
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        atomic_fetch_add(&g_profile_bucket_gpu_ns[b], (int64_t) (([cb GPUEndTime] - [cb GPUStartTime])*1e9));
+    }];
+}
+
 static void ggml_metal_profile_cmd_buf(id<MTLCommandBuffer> cmd_buf) {
     if (g_profile < 0) {
         g_profile = getenv("GGML_METAL_PROFILE") != NULL ? 1 : 0;
@@ -245,6 +283,13 @@ void ggml_metal_free(ggml_metal_t ctx) {
     }
 
     if (g_profile > 0) {
+        for (int i = 0; i < GGML_METAL_PROFILE_BUCKETS; ++i) {
+            if (g_profile_bucket_graphs[i] > 0) {
+                fprintf(stderr, "ggml_metal_free: profile: graphs of %6lld nodes: %6lld, GPU %8.1f ms, %6.2f ms each\n",
+                        (long long) g_profile_bucket_nodes[i], (long long) g_profile_bucket_graphs[i],
+                        g_profile_bucket_gpu_ns[i]/1e6, g_profile_bucket_gpu_ns[i]/1e6/g_profile_bucket_graphs[i]);
+            }
+        }
         int64_t barriers, depth, kernels;
         ggml_metal_op_profile_get(&barriers, &depth, &kernels);
         fprintf(stderr, "ggml_metal_free: profile: %lld kernels, %lld barriers, depth %lld (summed over encoders)" "\n", (long long) kernels, (long long) barriers, (long long) depth);
@@ -607,6 +652,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             ctx->cmd_bufs[n_cb].obj = cmd_buf;
 
             ggml_metal_profile_cmd_buf(cmd_buf);
+            ggml_metal_profile_cmd_buf_graph(cmd_buf, gf->n_nodes, true);
             atomic_fetch_add(&g_profile_n_graphs, 1);
 
             [cmd_buf enqueue];
@@ -629,6 +675,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             ctx->cmd_bufs[cb_idx].obj = cmd_buf;
 
             ggml_metal_profile_cmd_buf(cmd_buf);
+            ggml_metal_profile_cmd_buf_graph(cmd_buf, gf->n_nodes, false);
 
             // always enqueue the first two command buffers
             // enqueue all of the command buffers if we don't need to abort
