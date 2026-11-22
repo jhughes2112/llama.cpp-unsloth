@@ -6230,7 +6230,7 @@ int ggml_metal_op_kv_conv_store(ggml_metal_op_t ctx, int idx, int n) {
         /*.n_t      =*/ (int32_t) conv->ne[1],
         /*.n_s      =*/ (int32_t) conv->ne[2],
         /*.is_norm  =*/ is_k ? 0 : 1,
-        /*.is_f16   =*/ set->type == GGML_TYPE_F16 ? 1 : 0,
+        /*.is_f16   =*/ set->type == GGML_TYPE_F16 ? 1 : (set->type == GGML_TYPE_Q8_0 ? 2 : 0), // 2: Q8_0 blocks
         /*.pad      =*/ 0,
         /*.nb_past2 =*/ past->nb[2],
         /*.nb_cell1 =*/ cell->nb[1],

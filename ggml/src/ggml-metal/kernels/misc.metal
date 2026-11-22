@@ -1258,7 +1258,19 @@ kernel void kernel_kv_conv_store_f32(
             clamp(args.cc/(args.cs*sqrt(ss) + args.cb), args.lo, args.hi);
 
         device char * row = dst + (ulong) idxs[tok0 + t]*args.nb_row;
-        if (args.is_f16) {
+        if (args.is_f16 == 2) {
+            // Q8_0: a simdgroup is one block of 32 channels (D is a multiple of 32): { half d; int8 qs[32]; }
+            const float v    = y*f;
+            const float amax = simd_max(fabs(v));
+            const float d    = amax/127.0f;
+            const float id   = d > 0.0f ? 1.0f/d : 0.0f;
+
+            device char * blk = row + (ulong) (c/32)*34;
+            if (tiisg == 0) {
+                *((device half *) blk) = half(d);
+            }
+            ((device char *) (blk + 2))[c%32] = (char) round(v*id);
+        } else if (args.is_f16) {
             ((device half *) row)[c] = half(y*f);
         } else {
             ((device float *) row)[c] = y*f;

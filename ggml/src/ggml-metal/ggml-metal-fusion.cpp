@@ -2105,7 +2105,9 @@ static bool ggml_metal_fusion_check_kv_conv_store(
     if (resh->view_src != scale || resh->ne[0]*resh->ne[1] != C || resh->ne[2] != T || resh->ne[3] != 1 || D < 1 || D > 1024 ||
         view->view_src != head || view->ne[0] != C || view->ne[1] != T || view->ne[2] != 1 || view->ne[3] != 1 ||
         set->src[0] != view || set->view_src == nullptr || set->ne[0] != C || set->ne[2] != 1 || set->ne[3] != 1 ||
-        (set->type != GGML_TYPE_F16 && set->type != GGML_TYPE_F32) || set->nb[0] != ggml_type_size(set->type) ||
+        // (a Q8_0 cache: a simdgroup of the kernel is a block of 32 channels, it finds the scale of its block)
+        (set->type != GGML_TYPE_F16 && set->type != GGML_TYPE_F32 && !(set->type == GGML_TYPE_Q8_0 && D % 32 == 0 && C % 32 == 0)) ||
+        set->nb[0] != ggml_type_size(set->type) ||
         idxs->type != GGML_TYPE_I64 || ggml_nelements(idxs) != T || !ggml_is_contiguous(idxs)) {
         return false;
     }
