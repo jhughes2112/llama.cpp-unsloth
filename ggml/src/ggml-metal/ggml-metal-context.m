@@ -163,6 +163,14 @@ struct ggml_metal {
     int      rec_n_nodes;
     uint64_t rec_gen;
     uint64_t rec_hash;
+
+    // GGML_METAL_PREENCODE: the command buffer of the next execution of the same graph, encoded while the GPU runs
+    // this one
+    id<MTLCommandBuffer> pre_buf;
+    void *   pre_nodes;
+    int      pre_n_nodes;
+    uint64_t pre_gen;
+    uint64_t pre_hash;
     void *   seen_nodes; // of the last graph that was encoded: one that comes back is worth recording
     int      seen_n_nodes;
     uint64_t seen_gen;
@@ -316,6 +324,10 @@ void ggml_metal_free(ggml_metal_t ctx) {
         [ctx->buf_refs release];
     }
 
+    if (ctx->pre_buf != nil) {
+        [ctx->pre_buf release];
+        ctx->pre_buf = nil;
+    }
     ggml_metal_recording_free(ctx->rec);
     ctx->rec = NULL;
 
@@ -614,6 +626,25 @@ static uint64_t ggml_metal_graph_identity(const struct ggml_cgraph * gf) {
     return h;
 }
 
+// encode the whole graph in one command buffer, on this thread; the caller commits it
+static id<MTLCommandBuffer> ggml_metal_encode_whole(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+    id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+    [cmd_buf retain];
+
+    ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, 0, gf->n_nodes, ctx->use_concurrency, false, ctx->debug_graph);
+    for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+        const int res = ggml_metal_op_encode(ctx_op, idx);
+        if (res == 0) {
+            break;
+        }
+        idx += res - 1;
+    }
+    ggml_metal_op_free(ctx_op);
+
+    return cmd_buf;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -657,6 +688,54 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
         const bool seen = force || (ctx->seen_hash == hash &&
             ctx->seen_nodes == (void *) gf->nodes && ctx->seen_n_nodes == gf->n_nodes && ctx->seen_gen == ctx->graph_gen);
+
+        static int preencode = -1;
+        if (preencode < 0) {
+            // on by default; GGML_METAL_PREENCODE_DISABLE falls back to the recording in an indirect command buffer
+            preencode = getenv("GGML_METAL_PREENCODE_DISABLE") == NULL;
+        }
+        if (preencode && seen) {
+            @autoreleasepool {
+                ctx->gf = gf;
+
+                id<MTLCommandBuffer> cmd_buf = nil;
+                if (ctx->pre_buf != nil && ctx->pre_hash == hash && ctx->pre_nodes == (void *) gf->nodes &&
+                    ctx->pre_n_nodes == gf->n_nodes && ctx->pre_gen == ctx->graph_gen) {
+                    cmd_buf = ctx->pre_buf;
+                    atomic_fetch_add(&g_profile_n_replayed, 1);
+                } else {
+                    if (ctx->pre_buf != nil) {
+                        [ctx->pre_buf release];
+                    }
+                    cmd_buf = ggml_metal_encode_whole(ctx, gf);
+                }
+                ctx->pre_buf = nil;
+
+                for (int i = 0; i <= ctx->n_cb; ++i) {
+                    if (ctx->cmd_bufs[i].obj) {
+                        [ctx->cmd_bufs[i].obj release];
+                        ctx->cmd_bufs[i].obj = nil;
+                    }
+                }
+                ctx->cmd_bufs[ctx->n_cb].obj = cmd_buf;
+
+                ggml_metal_profile_cmd_buf(cmd_buf);
+                ggml_metal_profile_cmd_buf_graph(cmd_buf, gf->n_nodes, true);
+                atomic_fetch_add(&g_profile_n_graphs, 1);
+
+                [cmd_buf commit];
+                ctx->cmd_buf_last = cmd_buf;
+
+                // the next one, while the GPU works
+                ctx->pre_buf     = ggml_metal_encode_whole(ctx, gf);
+                ctx->pre_nodes   = (void *) gf->nodes;
+                ctx->pre_n_nodes = gf->n_nodes;
+                ctx->pre_gen     = ctx->graph_gen;
+                ctx->pre_hash    = hash;
+            }
+
+            return GGML_STATUS_SUCCESS;
+        }
 
         if (!recorded && seen && !ctx->seen_failed) {
             // the second time in a row: record it, on this thread, with the encoders of the ops as they are

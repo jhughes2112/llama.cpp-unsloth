@@ -887,6 +887,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 #define GGML_METAL_RECORDING_BINDS     31
 #define GGML_METAL_RECORDING_RESOURCES 64
 
+#define GGML_METAL_RECORDING_STEP_RES 48
+
 struct ggml_metal_recording {
     id<MTLIndirectCommandBuffer> icb;
     id<MTLBuffer> args; // the arguments that were set_bytes
@@ -895,6 +897,10 @@ struct ggml_metal_recording {
     int n;
     int n_max;
     bool failed;
+    int * starts; // the first command of each serial step
+    int n_starts;
+    id<MTLBuffer> __unsafe_unretained * step_res; // the buffers of each step, GGML_METAL_RECORDING_STEP_RES a step
+    int * step_n_res;
     id<MTLBuffer> resources[GGML_METAL_RECORDING_RESOURCES];
     int n_resources;
 
@@ -913,6 +919,8 @@ struct ggml_metal_recording {
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    id<MTLCommandBuffer> cmd; // for GGML_METAL_BARRIER=encoder
+    bool concurrent;
 
     // recording: no Metal encoder, the state of one is kept here and written to a command at each dispatch
     ggml_metal_recording_t rec;
@@ -946,6 +954,9 @@ ggml_metal_recording_t ggml_metal_recording_init(ggml_metal_device_t dev, int n_
     [desc release];
 
     res->n_max     = n_max;
+    res->starts    = calloc(n_max + 1, sizeof(int));
+    res->step_res   = (id<MTLBuffer> __unsafe_unretained *) calloc((size_t) (n_max + 1)*GGML_METAL_RECORDING_STEP_RES, sizeof(void *));
+    res->step_n_res = calloc(n_max + 1, sizeof(int));
     res->args_size = (size_t) n_max*256;
     res->args      = [device newBufferWithLength:res->args_size options:MTLResourceStorageModeShared];
     res->failed    = res->icb == nil || res->args == nil;
@@ -959,6 +970,9 @@ void ggml_metal_recording_free(ggml_metal_recording_t rec) {
     }
     [rec->icb release];
     [rec->args release];
+    free(rec->starts);
+    free(rec->step_res);
+    free(rec->step_n_res);
     for (int i = 0; i < rec->n_windows; ++i) {
         [rec->windows[i].buf release];
     }
@@ -1045,6 +1059,24 @@ static bool ggml_metal_recording_window(ggml_metal_recording_t rec, id<MTLBuffer
 void ggml_metal_recording_replay(ggml_metal_recording_t rec, ggml_metal_cmd_buf_t cmd_buf_raw) {
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
+    // GGML_METAL_REPLAY_STEPS=encoder: an encoder a serial step (experiment)
+    static int steps = -1;
+    if (steps < 0) {
+        const char * v = getenv("GGML_METAL_REPLAY_STEPS");
+        steps = v && strcmp(v, "encoder") == 0 ? 1 : 0;
+    }
+    if (steps == 1) {
+        for (int i = 0; i < rec->n_starts; ++i) {
+            const int beg = rec->starts[i];
+            const int end = i + 1 < rec->n_starts ? rec->starts[i + 1] : rec->n;
+            id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            [enc useResources:rec->step_res + (size_t) i*GGML_METAL_RECORDING_STEP_RES count:rec->step_n_res[i] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+            [enc executeCommandsInBuffer:rec->icb withRange:NSMakeRange(beg, end - beg)];
+            [enc endEncoding];
+        }
+        return;
+    }
+
     id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 
     // every execution has to declare the buffers: with the buffers only kept resident (a residency set on the
@@ -1073,6 +1105,9 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
     }
 
     [res->obj retain];
+
+    res->cmd        = cmd_buf;
+    res->concurrent = concurrent;
 
     return res;
 }
@@ -1185,6 +1220,11 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
             return;
         }
 
+        if (encoder->barrier || rec->n == 0) {
+            rec->step_n_res[rec->n_starts] = 0;
+            rec->starts[rec->n_starts++] = rec->n;
+        }
+
         // the state of the encoder as it is now: what was bound for earlier kernels stays bound, as in Metal
         id<MTLIndirectComputeCommand> cmd = [rec->icb indirectComputeCommandAtIndex:rec->n++];
 
@@ -1199,6 +1239,22 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
                 }
                 [cmd setKernelBuffer:buf offset:offs atIndex:i];
                 ggml_metal_recording_use(rec, buf);
+                {
+                    const int is = rec->n_starts - 1;
+                    id<MTLBuffer> __unsafe_unretained * sr = rec->step_res + (size_t) is*GGML_METAL_RECORDING_STEP_RES;
+                    int k = 0;
+                    while (k < rec->step_n_res[is] && sr[k] != buf) {
+                        k++;
+                    }
+                    if (k == rec->step_n_res[is]) {
+                        if (k == GGML_METAL_RECORDING_STEP_RES) {
+                            rec->failed = true;
+                            return;
+                        }
+                        sr[k] = buf;
+                        rec->step_n_res[is]++;
+                    }
+                }
             }
         }
         for (int i = 0; i < 2; ++i) {
@@ -1223,6 +1279,22 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
     if (encoder->rec) {
         encoder->barrier = true;
+        return;
+    }
+    // a serial step is a new encoder rather than a barrier in this one: measured on an M5 Ultra, a chain of small
+    // kernels takes 2.2 us a step this way and 3.7 with a barrier, and Inkling 2 Mini has 1,140 steps a token.
+    // GGML_METAL_BARRIER=scope goes back to the barrier
+    static int mode = -1;
+    if (mode < 0) {
+        const char * v = getenv("GGML_METAL_BARRIER");
+        mode = v && strcmp(v, "scope") == 0 ? 0 : 1;
+    }
+    if (mode == 1) {
+        [encoder->obj endEncoding];
+        [encoder->obj release];
+        encoder->obj = encoder->concurrent ?
+            [encoder->cmd computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent] : [encoder->cmd computeCommandEncoder];
+        [encoder->obj retain];
         return;
     }
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
