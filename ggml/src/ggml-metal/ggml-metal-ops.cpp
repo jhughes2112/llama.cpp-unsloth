@@ -648,6 +648,10 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_short_conv_rs(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DEPTH_MIX_NORM) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_depth_mix_impl(ctx, idx, n, true);
+        }
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CTRL_DOWN) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_ctrl_down(ctx, idx, n);
@@ -4798,6 +4802,10 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_depth_mix(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DEPTH_MIX_NORM) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_depth_mix_impl(ctx, idx, n, true);
+        }
     }
     ggml_tensor * op = ctx->node(idx);
 
@@ -5873,10 +5881,15 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
 }
 // Dispatch the fused attention over depth from the matched concat.. rms_norm cont repeat mul_mat soft_max mul_mat run.
 int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx, int n) {
+    return ggml_metal_op_depth_mix_impl(ctx, idx, n, false);
+}
+
+// norm: the run ends with the rms norm and the weight of the result (one query)
+int ggml_metal_op_depth_mix_impl(ggml_metal_op_t ctx, int idx, int n, bool norm) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    const int k = n - 6;
+    const int k = n - 6 - (norm ? 2 : 0);
 
     const ggml_tensor * rms = ctx->node(idx + k + 0);
     const ggml_tensor * rep = ctx->node(idx + k + 2);
@@ -5890,10 +5903,12 @@ int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_kargs_depth_mix args = {
         /*.n_embd   =*/ (int32_t) dst->ne[0],
         /*.n_states =*/ k + 1,
-        /*.nq       =*/ (int32_t) dst->ne[1],
-        /*.n_tokens =*/ (int32_t) dst->ne[2],
+        /*.nq       =*/ norm ? 1 : (int32_t) dst->ne[1],
+        /*.n_tokens =*/ (int32_t) (norm ? dst->ne[1] : dst->ne[2]),
         /*.eps      =*/ ggml_get_op_params_f32(rms, 0),
         /*.scale    =*/ ggml_get_op_params_f32(sm,  0),
+        /*.has_norm =*/ norm ? 1 : 0,
+        /*.eps_out  =*/ norm ? ggml_get_op_params_f32(ctx->node(idx + n - 2), 0) : 0.0f,
         /*.offs     =*/ { 0 },
     };
 
@@ -5912,6 +5927,7 @@ int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_buffer  (enc, bid_src,                               1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rep->src[0]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),         3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(norm ? dst->src[1] : dst), 4);
 
     // wide and shallow: a thread reads only a few elements of each state
     int nth = 32;
@@ -5919,7 +5935,7 @@ int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx, int n) {
         nth *= 2;
     }
 
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, 2*8*32*sizeof(float), 0);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, (2*8 + 1)*32*sizeof(float), 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, args.nq, args.n_tokens, 1, nth, 1, 1);
 

@@ -1011,6 +1011,36 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
 
+    // GGML_METAL_DUMP_RAW=file: the nodes in the order the graph was built in, before any reordering, for writing
+    // fusion patterns (which match consecutive nodes). the last graph optimized wins
+    {
+        static const char * dump = NULL;
+        static bool dump_init = false;
+        if (!dump_init) {
+            dump = getenv("GGML_METAL_DUMP_RAW");
+            dump_init = true;
+        }
+        if (dump) {
+            FILE * f = fopen(dump, "w");
+            if (f) {
+                for (int i = 0; i < gf->n_nodes; ++i) {
+                    const struct ggml_tensor * t = gf->nodes[i];
+                    fprintf(f, "%5d %-14s %-28s %s[%lld,%lld,%lld,%lld]", i, ggml_op_name(t->op), t->name, ggml_type_name(t->type),
+                            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+                    for (int j = 0; j < GGML_MAX_SRC && t->src[j]; ++j) {
+                        int k = i - 1;
+                        while (k >= 0 && gf->nodes[k] != t->src[j]) {
+                            k--;
+                        }
+                        fprintf(f, " <%d:%s", k, t->src[j]->name);
+                    }
+                    fprintf(f, "\n");
+                }
+                fclose(f);
+            }
+        }
+    }
+
     if (ctx->use_graph_optimize) {
         ggml_graph_optimize(gf);
     }

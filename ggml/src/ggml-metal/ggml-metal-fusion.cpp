@@ -1249,9 +1249,9 @@ static bool ggml_metal_fusion_match_depth_mix(
         const ggml_tensor * const * nodes,
         const ggml_cgraph         * gf,
         int                         raw0,
+        int                         k, // concatenations
         ggml_metal_depth_mix_match * match) {
-    const int n = (int) fusion->ops.size();
-    const int k = n - 6;
+    GGML_UNUSED(fusion);
 
     if (k + 1 > GGML_METAL_DEPTH_MIX_MAX) {
         return false;
@@ -1350,9 +1350,31 @@ static bool ggml_metal_fusion_check_depth_mix(
         }
     }
 
+    // the variant with the norm behind the mix: [RESHAPE] RMS_NORM MUL more, one query
+    const bool with_norm = fusion->id == GGML_METAL_FUSION_DEPTH_MIX_NORM;
+    const int  k         = n - 6 - (with_norm ? 2 : 0);
+
     ggml_metal_depth_mix_match match;
-    if (!ggml_metal_fusion_match_depth_mix(fusion, nodes, gf, raw0, &match)) {
+    if (!ggml_metal_fusion_match_depth_mix(fusion, nodes, gf, raw0, k, &match)) {
         return false;
+    }
+
+    if (with_norm) {
+        const ggml_tensor * mm2  = nodes[k + 5];
+        const ggml_tensor * rn   = nodes[k + 6];
+        const ggml_tensor * mul  = nodes[k + 7];
+        const ggml_tensor * resh = gf->nodes[raw0 + k + 7];
+        const ggml_tensor * w    = mul->src[1];
+
+        // a thread keeps up to 4 values of the mix for the norm
+        if (mm2->ne[1] != 1 || mm2->ne[0] > 4096 || resh->view_src != mm2 || rn->src[0] != resh || mul->src[0] != rn ||
+            rn->view_src != nullptr || mul->view_src != nullptr ||
+            rn->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            mul->ne[0] != mm2->ne[0] || mul->ne[1] != mm2->ne[2] || mul->ne[2] != 1 || mul->ne[3] != 1 ||
+            !ggml_are_same_shape(rn, mul) || !ggml_is_contiguous(mul) ||
+            w->ne[0] != mm2->ne[0] || ggml_nelements(w) != mm2->ne[0] || !ggml_is_contiguous(w) || w->data == nullptr) {
+            return false;
+        }
     }
 
     if (mode == GGML_METAL_FUSION_FULL) {
@@ -1367,6 +1389,16 @@ static bool ggml_metal_fusion_check_depth_mix(
     const int outputs[1] = { raw0 + n_raw - 1 };
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
+}
+
+static std::vector<ggml_op> ggml_metal_fusion_ops_depth_mix(int k);
+
+static std::vector<ggml_op> ggml_metal_fusion_ops_depth_mix_norm(int k) {
+    std::vector<ggml_op> ops = ggml_metal_fusion_ops_depth_mix(k);
+    for (ggml_op op : { GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL }) {
+        ops.push_back(op);
+    }
+    return ops;
 }
 
 static std::vector<ggml_op> ggml_metal_fusion_ops_depth_mix(int k) {
@@ -1957,6 +1989,14 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
 
+    { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(0), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(1), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(2), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(3), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(4), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(5), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(6), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(7), {}, true, ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(0), {}, true, ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(1), {}, true, ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(2), {}, true, ggml_metal_fusion_check_depth_mix },

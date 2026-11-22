@@ -810,6 +810,8 @@ typedef struct {
     int32_t  n_tokens;
     float    eps;     // of the rms norm
     float    scale;   // of the softmax
+    int32_t  has_norm; // an rms norm with a weight on the result (one query)
+    float    eps_out;
     uint64_t offs[8]; // of each state in the source buffer
 } ggml_metal_kargs_depth_mix;
 

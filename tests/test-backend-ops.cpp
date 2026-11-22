@@ -4970,6 +4970,7 @@ struct test_inkling2_depth_mix : public test_case {
     const int64_t n_blocks;
     const int64_t n_queries;
     const int64_t n_tokens;
+    const bool    norm; // an rms norm with a weight behind the mix, as the layers of the model apply (one query)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4979,11 +4980,11 @@ struct test_inkling2_depth_mix : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_blocks, n_queries, n_tokens);
+        return VARS_TO_STR5(n_embd, n_blocks, n_queries, n_tokens, norm);
     }
 
-    test_inkling2_depth_mix(int64_t n_embd = 2304, int64_t n_blocks = 2, int64_t n_queries = 1, int64_t n_tokens = 1)
-        : n_embd(n_embd), n_blocks(n_blocks), n_queries(n_queries), n_tokens(n_tokens) {}
+    test_inkling2_depth_mix(int64_t n_embd = 2304, int64_t n_blocks = 2, int64_t n_queries = 1, int64_t n_tokens = 1, bool norm = false)
+        : n_embd(n_embd), n_blocks(n_blocks), n_queries(n_queries), n_tokens(n_tokens), norm(norm) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_queries);
@@ -5012,6 +5013,11 @@ struct test_inkling2_depth_mix : public test_case {
         scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
         ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        if (norm) {
+            ggml_tensor * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+            ggml_set_name(weight, "weight");
+            out = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, out, n_embd, n_tokens), 1e-5f), weight);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -11479,6 +11485,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Inkling 2 attention over depth
     for (int64_t n_blocks : {0, 1, 2, 4, 7}) {
         test_cases.emplace_back(new test_inkling2_depth_mix(2304, n_blocks, 1,  1));
+        test_cases.emplace_back(new test_inkling2_depth_mix(2304, n_blocks, 1,  1, true));
+        test_cases.emplace_back(new test_inkling2_depth_mix(2304, n_blocks, 1,  4, true));
+        test_cases.emplace_back(new test_inkling2_depth_mix(4096, n_blocks, 1,  2, true));
+        test_cases.emplace_back(new test_inkling2_depth_mix(  17, n_blocks, 1,  5, true));
         test_cases.emplace_back(new test_inkling2_depth_mix(2304, n_blocks, 3,  1));
         test_cases.emplace_back(new test_inkling2_depth_mix( 200, n_blocks, 3, 33));
         test_cases.emplace_back(new test_inkling2_depth_mix(  17, n_blocks, 2,  5));

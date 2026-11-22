@@ -746,6 +746,7 @@ kernel void kernel_depth_mix_f32(
         device const char  * src,
         device const float * query,
         device       float * dst,
+        device const float * weight,
         threadgroup  float * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort3 tpitg [[thread_position_in_threadgroup]],
@@ -816,13 +817,47 @@ kernel void kernel_depth_mix_f32(
 
     device float * y = dst + ((ulong) it*args.nq + iq)*args.n_embd;
 
-    for (int i = tpitg.x; i < args.n_embd; i += ntg.x) {
-        float v = 0.0f;
-        for (int s = 0; s < args.n_states; ++s) {
-            device const float * x = (device const float *) (src + args.offs[s]) + (ulong) it*args.n_embd;
-            v += coef[s]*x[i];
+    // with the norm behind the mix: a thread keeps its (up to 4) values, the sum of their squares goes through shmem
+    float yv[4];
+    float sy = 0.0f;
+
+    {
+        int j = 0;
+        for (int i = tpitg.x; i < args.n_embd; i += ntg.x, ++j) {
+            float v = 0.0f;
+            for (int s = 0; s < args.n_states; ++s) {
+                device const float * x = (device const float *) (src + args.offs[s]) + (ulong) it*args.n_embd;
+                v += coef[s]*x[i];
+            }
+            if (args.has_norm) {
+                yv[j] = v;
+                sy   += v*v;
+            } else {
+                y[i] = v;
+            }
         }
-        y[i] = v;
+    }
+
+    if (args.has_norm) {
+        sy = simd_sum(sy);
+
+        if (tiisg == 0) {
+            shmem[16*N_SIMDWIDTH + sgitg] = sy;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        sy = 0.0f;
+        for (int i = 0; i < ntg.x/N_SIMDWIDTH; ++i) {
+            sy += shmem[16*N_SIMDWIDTH + i];
+        }
+
+        const float sc = 1.0f/sqrt(sy/args.n_embd + args.eps_out);
+
+        int j = 0;
+        for (int i = tpitg.x; i < args.n_embd; i += ntg.x, ++j) {
+            y[i] = yv[j]*sc*weight[i];
+        }
     }
 }
 // y = (s*tanh(f) + b)*x + tanh(g)*m, elementwise; dst may be any of the inputs in place

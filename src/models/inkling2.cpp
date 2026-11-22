@@ -465,6 +465,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         } else if (is_swa) {
             inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
             inputs[1] = inputs[2] = inputs[0];
+            // right behind the mix (order only), so that backends can fuse the norm into it
+            ggml_build_forward_order(gf, inputs[0]);
         } else {
             inputs[0] = build_norm(inputs[0], layer.attn_q_inp_norm, nullptr, LLM_NORM_RMS, il);
             inputs[1] = build_norm(inputs[1], layer.attn_k_inp_norm, nullptr, LLM_NORM_RMS, il);
@@ -649,6 +651,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             cur = normed;
         } else {
             cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+            ggml_build_forward_order(gf, cur);
         }
 
         cur = build_moe_ffn(cur,
@@ -679,6 +682,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    ggml_build_forward_order(gf, cur);
 
     res->t_layer_inp[n_layer] = cur;
 

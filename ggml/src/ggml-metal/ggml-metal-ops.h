@@ -103,6 +103,7 @@ int ggml_metal_op_expert_scale      (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_short_conv        (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_depth_mix         (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_gated_mix         (ggml_metal_op_t ctx, int idx, int n);
+int ggml_metal_op_depth_mix_impl    (ggml_metal_op_t ctx, int idx, int n, bool norm);
 int ggml_metal_op_expert_situ       (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_expert_reduce     (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_ctrl_down         (ggml_metal_op_t ctx, int idx, int n);
