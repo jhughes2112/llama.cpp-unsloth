@@ -653,6 +653,11 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_kv_conv_store(ctx, idx, n);
         }
+        if (fusion && (ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CONV_MIX ||
+                       ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CONV_MIX_NORM)) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_conv_mix(ctx, idx, n, ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CONV_MIX_NORM);
+        }
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DEPTH_MIX_NORM) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_depth_mix_impl(ctx, idx, n, true);
@@ -5957,6 +5962,93 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
 
     return n;
 }
+// Dispatch the attention over depth of a convolved layer output from the matched short conv [+ residual] + depth mix
+// [+ norm] run.
+int ggml_metal_op_conv_mix(ggml_metal_op_t ctx, int idx, int n, bool norm) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * cat   = ctx->node(idx + 0);
+    const ggml_tensor * cpy   = ctx->node(idx + 1);
+    const ggml_tensor * conv  = ctx->node(idx + 2);
+    const ggml_tensor * add   = ctx->node(idx + 3);
+    const ggml_tensor * scale = ctx->node(idx + 4);
+
+    const bool has_res = ctx->node(idx + 5)->op == GGML_OP_ADD;
+
+    ggml_tensor * lout = ctx->node(idx + (has_res ? 5 : 4));
+
+    const int m0 = idx + (has_res ? 6 : 5); // the nodes of the mix
+    const int k  = n - (m0 - idx) - 6 - (norm ? 2 : 0);
+
+    const ggml_tensor * rms = ctx->node(m0 + k + 0);
+    const ggml_tensor * rep = ctx->node(m0 + k + 2);
+    const ggml_tensor * sm  = ctx->node(m0 + k + 4);
+    ggml_tensor *       dst = ctx->node(idx + n - 1);
+
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * cell = cpy->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * cur  = add->src[0];
+    const ggml_tensor * res  = has_res ? (lout->src[0] == scale ? lout->src[1] : lout->src[0]) : nullptr;
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n);
+
+    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_conv_mix_f32");
+
+    ggml_metal_kargs_conv_mix args = {
+        /*.n_embd   =*/ (int32_t) dst->ne[0],
+        /*.n_states =*/ k + 1,
+        /*.nq       =*/ norm ? 1 : (int32_t) dst->ne[1],
+        /*.n_tokens =*/ (int32_t) (norm ? dst->ne[1] : dst->ne[2]),
+        /*.eps      =*/ ggml_get_op_params_f32(rms, 0),
+        /*.scale    =*/ ggml_get_op_params_f32(sm,  0),
+        /*.has_norm =*/ norm ? 1 : 0,
+        /*.eps_out  =*/ norm ? ggml_get_op_params_f32(ctx->node(idx + n - 2), 0) : 0.0f,
+        /*.nc       =*/ (int32_t) w->ne[0],
+        /*.n_t      =*/ (int32_t) conv->ne[1],
+        /*.has_res  =*/ has_res ? 1 : 0,
+        /*.cs       =*/ ggml_get_op_params_f32(scale, 0),
+        /*.cb       =*/ ggml_get_op_params_f32(scale, 1),
+        /*.pad      =*/ 0,
+        /*.nb_past2 =*/ past->nb[2],
+        /*.nb_cell1 =*/ cell->nb[1],
+        /*.offs     =*/ { 0 },
+    };
+
+    // the blocks on top of the layer output, all in its buffer (checked by the fusion)
+    ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(lout);
+    for (int j = 0; j < k; ++j) {
+        args.offs[j + 1] = ggml_metal_get_buffer_id(ctx->node(m0 + j)->src[0]).offs;
+    }
+    bid_src.offs = 0;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_src,                               1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rep->src[0]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),         3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(norm ? dst->src[1] : dst), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(past),        5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur),         6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),           7);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell),        8);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res ? res : cur), 9);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(lout),        10);
+
+    // wide and shallow: a thread reads only a few elements of each state
+    int nth = 32;
+    while (nth*2 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) && nth*2 <= args.n_embd && nth < 1024) {
+        nth *= 2;
+    }
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, (2*8 + 1)*32*sizeof(float), 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, args.nq, args.n_tokens, 1, nth, 1, 1);
+
+    return n;
+}
+
 // Dispatch K or V from its projection to the KV cache from the matched short conv + clip or norm + set_rows run.
 int ggml_metal_op_kv_conv_store(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_library_t lib = ctx->lib;
