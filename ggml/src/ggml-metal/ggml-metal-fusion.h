@@ -58,6 +58,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SHORT_CONV_DYN, // SHORT_CONV + (CONT + MUL + ADD) per lag (input-dependent taps per head)
     GGML_METAL_FUSION_CLIP_REL_BIAS, // L2_CLIP + REL_BIAS (the clip of the relative features inside the bias mask kernel)
     GGML_METAL_FUSION_KV_CONV_STORE, // SHORT_CONV + L2_CLIP or RMS_NORM per head + SET_ROWS (K or V from the projection to the cache)
+    GGML_METAL_FUSION_REDUCE_CONV,  // EXPERT_REDUCE + SHORT_CONV with its residual (the MoE output through its convolution)
     GGML_METAL_FUSION_CTRL_DOWN,    // CONCAT + RMS_NORM + MUL_MAT (the normalized pair of a loop controller projected to its rank)
     GGML_METAL_FUSION_CTRL_OUT,     // MUL_MAT + MUL_MAT + GATED_MIX (both gates of a loop controller and its output)
 } ggml_metal_fusion_id;

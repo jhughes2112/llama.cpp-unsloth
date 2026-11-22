@@ -780,6 +780,20 @@ typedef struct {
     int32_t  C;        // channels
     int32_t  n_t;      // tokens per sequence
     int32_t  n_s;      // sequences
+    int32_t  ne1;      // experts used
+    int32_t  pad;
+    uint64_t nb_past2; // sequence strides of the stored window and of the state cell
+    uint64_t nb_cell1;
+    uint64_t nb_ids1;  // stride of the ids from one token to the next
+    float    s;        // output scale and bias of the convolution
+    float    b;
+} ggml_metal_kargs_reduce_conv;
+
+typedef struct {
+    int32_t  nc;       // taps
+    int32_t  C;        // channels
+    int32_t  n_t;      // tokens per sequence
+    int32_t  n_s;      // sequences
     uint64_t nb_past2; // sequence strides of the stored window and of the state cell
     uint64_t nb_cell1;
     float    s;        // output scale and bias

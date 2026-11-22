@@ -1011,6 +1011,73 @@ kernel void kernel_rel_bias_f32_f16(
 
     dst[((ulong) ih*args.n_tokens + it)*args.n_kv + kv] = half(sumf - sink[it*args.n_head + ih] + mask[it*args.n_kv + kv]);
 }
+// the MoE output through its convolution, one thread a channel and sequence:
+//   m[c, t] = sum_e (x[c, e, t]*sc[ids[e, t]])*wt[e, t], y[c, t] = s*(m + conv(m)) + b + res[c, t], cell <- the window
+kernel void kernel_reduce_conv_f32(
+        constant ggml_metal_kargs_reduce_conv & args,
+        device const float * x,
+        device const float * sc,
+        device const char  * ids,
+        device const float * wt,
+        device const char  * past,
+        device const float * w,
+        device       char  * cell,
+        device const float * res,
+        device       float * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int c  = gid.x;
+    const int is = gid.y;
+    if (c >= args.C || is >= args.n_s) {
+        return;
+    }
+
+    const int nh = args.nc - 1;
+
+    float h[8];
+
+    device const float * p = (device const float *) (past + is*args.nb_past2) + c*nh;
+    for (int j = 0; j < nh; ++j) {
+        h[j] = p[j];
+    }
+
+    device const float * wc = w + c*args.nc;
+
+    const ulong tok0 = (ulong) is*args.n_t;
+
+    for (int t = 0; t < args.n_t; ++t) {
+        const ulong tok = tok0 + t;
+
+        device const int   * id = (device const int *) (ids + tok*args.nb_ids1);
+        device const float * xe = x + tok*args.ne1*args.C + c;
+        device const float * we = wt + tok*args.ne1;
+
+        float xt = 0.0f;
+        for (int e = 0; e < args.ne1; ++e) {
+            xt += (xe[(ulong) e*args.C]*sc[id[e]])*we[e];
+        }
+
+        float acc = 0.0f;
+        for (int j = 0; j < nh; ++j) {
+            acc += h[j]*wc[j];
+        }
+        acc += xt*wc[nh];
+
+        // dst may be the residual in place: read before the write
+        const float r = res[tok*args.C + c];
+
+        dst[tok*args.C + c] = args.s*(xt + acc) + args.b + r;
+
+        for (int j = 0; j < nh - 1; ++j) {
+            h[j] = h[j + 1];
+        }
+        h[nh - 1] = xt;
+    }
+
+    device float * q = (device float *) (cell + is*args.nb_cell1) + c*nh;
+    for (int j = 0; j < nh; ++j) {
+        q[j] = h[j];
+    }
+}
 // K or V of a layer from its projection to the KV cache, one threadgroup a head and sequence, one thread a channel:
 // the short convolution of kernel_short_conv_f32, then the L2 clip or the RMS norm of the head, and the result goes
 // to the cache row of its token. the sum of squares of a head is reduced through shmem for each token

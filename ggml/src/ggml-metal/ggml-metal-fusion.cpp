@@ -2050,6 +2050,55 @@ static bool ggml_metal_fusion_check_kv_conv_store(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 3);
 }
 
+// EXPERT_REDUCE [VIEW RESHAPE TRANSPOSE] SHORT_CONV + residual ADD: the weighted sum of the expert outputs, the short
+// convolution over it and the residual of the layer, a thread a channel. the sum is never written
+static bool ggml_metal_fusion_check_reduce_conv(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (n != 17 || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1 || node_idxs[idx + 11] != raw0 + 22) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_metal_fusion * reduce_f = ggml_metal_fusion_find(GGML_METAL_FUSION_EXPERT_REDUCE, 11);
+    const ggml_metal_fusion * conv_f   = ggml_metal_fusion_find(GGML_METAL_FUSION_SHORT_CONV, 6);
+    if (reduce_f == nullptr || conv_f == nullptr || (int) reduce_f->ops_all.size() != 19 ||
+        !reduce_f->check(reduce_f, nodes, gf, node_idxs, idx, mode) ||
+        !conv_f->check(conv_f, nodes + 11, gf, node_idxs, idx + 11, mode)) {
+        return false;
+    }
+
+    // the convolution is over the sum, and the residual is not it
+    const ggml_tensor * sum   = nodes[10];
+    const ggml_tensor * add   = nodes[14];
+    const ggml_tensor * scale = nodes[15];
+    const ggml_tensor * radd  = nodes[16];
+    const ggml_tensor * res   = radd->src[0] == scale ? radd->src[1] : radd->src[0];
+    if (add->src[0] != sum || res == sum) {
+        return false;
+    }
+
+    // outputs: the result, the state store and its cell view; the stored window is a view of an input
+    const int outputs[4] = { raw0 + n_raw - 1, raw0 + 22 + 3, raw0 + 22 + 2, raw0 + 19 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 4);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -2146,6 +2195,14 @@ static const std::vector<ggml_op> ops_v_conv_store = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
     GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS
 };
+static const std::vector<ggml_op> ops_reduce_conv = {
+    GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL,
+    GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_TRANSPOSE,
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD
+};
 static const std::vector<ggml_op> ops_clip_rel_bias = {
     GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
     GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
@@ -2239,6 +2296,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
     { GGML_METAL_FUSION_CLIP_REL_BIAS, ops_clip_rel_bias, {}, true, ggml_metal_fusion_check_clip_rel_bias },
+    { GGML_METAL_FUSION_REDUCE_CONV, ops_reduce_conv, {12}, true, ggml_metal_fusion_check_reduce_conv },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_v_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
 

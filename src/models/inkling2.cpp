@@ -414,9 +414,15 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 ggml_tensor * m_attn = mix(bank, bank_last, q_attn);
                 ggml_tensor * m_kv   = mix(bank, bank_last, q_kv);
 
+                // column j of a mix, [n_embd, n_tokens]: one token is contiguous where it is, more are copied
+                const auto column = [&](ggml_tensor * m, int j) {
+                    return n_tokens == 1 ?
+                        ggml_view_2d(ctx0, m, n_embd, 1, m->nb[1], j*m->nb[1]) :
+                        ggml_cont(ctx0, ggml_view_2d(ctx0, m, n_embd, n_tokens, m->nb[2], j*m->nb[1]));
+                };
                 for (int j = 0; j < 2; ++j) {
-                    messages[j == 0 ? 0 : 3] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_attn, n_embd, n_tokens, m_attn->nb[2], j*m_attn->nb[1]));
-                    messages[j == 0 ? 1 : 2] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_kv,   n_embd, n_tokens, m_kv->nb[2],   j*m_kv->nb[1]));
+                    messages[j == 0 ? 0 : 3] = column(m_attn, j);
+                    messages[j == 0 ? 1 : 2] = column(m_kv,   j);
                 }
             }
         }

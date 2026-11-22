@@ -771,6 +771,10 @@ int ggml_metal_op_repeat(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_expert_reduce(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_REDUCE_CONV) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_reduce_conv(ctx, idx, n);
+        }
     }
     ggml_tensor * op = ctx->node(idx);
 
@@ -5795,6 +5799,64 @@ int ggml_metal_op_expert_reduce(ggml_metal_op_t ctx, int idx, int n) {
     const int nth = 256;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + nth - 1)/nth, args.ne2, 1, nth, 1, 1);
+
+    return n;
+}
+
+// Dispatch the MoE output through its convolution from the matched expert reduce + short conv + residual run.
+int ggml_metal_op_reduce_conv(ggml_metal_op_t ctx, int idx, int n) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * rep   = ctx->node(idx + 0);
+    const ggml_tensor * rows  = ctx->node(idx + 1);
+    const ggml_tensor * mul   = ctx->node(idx + 2);
+    const ggml_tensor * mulw  = ctx->node(idx + 3);
+    const ggml_tensor * cat   = ctx->node(idx + 11);
+    const ggml_tensor * cpy   = ctx->node(idx + 12);
+    const ggml_tensor * conv  = ctx->node(idx + 13);
+    const ggml_tensor * scale = ctx->node(idx + 15);
+    ggml_tensor *       dst   = ctx->node(idx + n - 1);
+
+    const ggml_tensor * x    = mul->src[0];
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * cell = cpy->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * res  = dst->src[0] == scale ? dst->src[1] : dst->src[0];
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n);
+
+    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_reduce_conv_f32");
+
+    ggml_metal_kargs_reduce_conv args = {
+        /*.nc       =*/ (int32_t) w->ne[0],
+        /*.C        =*/ (int32_t) w->ne[1],
+        /*.n_t      =*/ (int32_t) conv->ne[1],
+        /*.n_s      =*/ (int32_t) conv->ne[2],
+        /*.ne1      =*/ (int32_t) x->ne[1],
+        /*.pad      =*/ 0,
+        /*.nb_past2 =*/ past->nb[2],
+        /*.nb_cell1 =*/ cell->nb[1],
+        /*.nb_ids1  =*/ rows->src[1]->nb[1],
+        /*.s        =*/ ggml_get_op_params_f32(scale, 0),
+        /*.b        =*/ ggml_get_op_params_f32(scale, 1),
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),            1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rep->src[0]),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rows->src[1]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mulw->src[1]), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(past),         5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),            6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell),         7);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res),          8);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),          9);
+
+    const int nth = 64;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.C + nth - 1)/nth, args.n_s, 1, nth, 1, 1);
 
     return n;
 }
