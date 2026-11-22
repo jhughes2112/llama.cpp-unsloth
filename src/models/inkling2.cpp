@@ -494,12 +494,27 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 }
             }
 
+            // with a plain cache on the dense path, K and V go to the cache right behind their convolutions, so that the
+            // convolution, the clip or norm and the store are one run of nodes that backends can fuse
+            const auto * kv_cache = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+            const bool store_early = !cparams.training && !use_banded(il, is_swa) &&
+                !(is_swa ? attn->self_k_rot_swa[il] : attn->self_k_rot[il]) &&
+                !(is_swa ? attn->self_v_rot_swa[il] : attn->self_v_rot[il]) &&
+                !kv_cache->get_k_scale(il) && !kv_cache->get_v_scale(il);
+
             Kcur = convolve(Kcur, layer.attn_k_conv, Ktap, state, history, recr, 0);
+            Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
+            if (store_early) {
+                ggml_build_forward_expand(gf, kv_cache->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
+            }
+
             Vcur = convolve(Vcur, layer.attn_v_conv, Vtap, state, history, recr, n_embd_k_gqa);
+            Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
+            if (store_early) {
+                ggml_build_forward_expand(gf, kv_cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
+            }
 
             Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
-            Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
-            Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
             Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
 
             if (!is_swa) {
@@ -626,7 +641,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     // only the first chunk stores K and V
                     ggml_tensor * out = build_attn(inp,
                             nullptr, nullptr, nullptr,
-                            q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, r0);
+                            q_c, r0 == 0 && !store_early ? Kcur : nullptr, r0 == 0 && !store_early ? Vcur : nullptr, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, r0);
                     outs.push_back(all ? out : ggml_reshape_3d(ctx0, out, out->ne[0], nr, n_stream));
                 }
                 while (outs.size() > 1) {

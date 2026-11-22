@@ -1972,6 +1972,84 @@ static bool ggml_metal_fusion_check_clip_rel_bias(
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 2);
 }
+static const ggml_metal_fusion * ggml_metal_fusion_find(ggml_metal_fusion_id id, int n_ops);
+
+// SHORT_CONV [RESHAPE] (L2_CLIP | RMS_NORM) [VIEW] SET_ROWS: K or V of an Inkling 2 layer from its projection to the
+// KV cache: the short convolution over the stored window, the clip (K) or the RMS norm (V) of each head, and the
+// store in the cache rows of the tokens. one threadgroup a head, which reduces its sum of squares
+static bool ggml_metal_fusion_check_kv_conv_store(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    // the convolution, as a short conv of its own
+    const ggml_metal_fusion * conv_f = ggml_metal_fusion_find(GGML_METAL_FUSION_SHORT_CONV, 5);
+    if (conv_f == nullptr || !conv_f->check(conv_f, nodes, gf, node_idxs, idx, mode)) {
+        return false;
+    }
+
+    const bool is_k = n == 14; // conv (5) + clip (8) + store, or conv (5) + norm + store
+
+    const ggml_tensor * scale = nodes[4];
+    const ggml_tensor * resh  = gf->nodes[raw0 + 8];
+    const ggml_tensor * head  = nodes[n - 2]; // the clipped or normalized heads
+    const ggml_tensor * view  = gf->nodes[raw0 + n_raw - 2];
+    const ggml_tensor * set   = nodes[n - 1];
+    const ggml_tensor * idxs  = set->src[1];
+
+    if (is_k) {
+        if (!ggml_metal_fusion_l2_clip_core(nodes + 5, 8) || nodes[5]->src[0] != resh) {
+            return false;
+        }
+    } else {
+        if (head->src[0] != resh || head->type != GGML_TYPE_F32 || head->view_src != nullptr || !ggml_are_same_shape(head, resh)) {
+            return false;
+        }
+    }
+
+    const int64_t C = scale->ne[0];
+    const int64_t T = scale->ne[1];
+    const int64_t D = resh->ne[0];
+
+    // heads of up to 1024 values, the rows of the cache are the channels
+    if (resh->view_src != scale || resh->ne[0]*resh->ne[1] != C || resh->ne[2] != T || resh->ne[3] != 1 || D < 1 || D > 1024 ||
+        view->view_src != head || view->ne[0] != C || view->ne[1] != T || view->ne[2] != 1 || view->ne[3] != 1 ||
+        set->src[0] != view || set->view_src == nullptr || set->ne[0] != C || set->ne[2] != 1 || set->ne[3] != 1 ||
+        (set->type != GGML_TYPE_F16 && set->type != GGML_TYPE_F32) || set->nb[0] != ggml_type_size(set->type) ||
+        idxs->type != GGML_TYPE_I64 || ggml_nelements(idxs) != T || !ggml_is_contiguous(idxs)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (set->data == nullptr) {
+            return false;
+        }
+    }
+
+    // outputs: the store in the cache, the state store of the convolution and its cell view
+    const int outputs[3] = { raw0 + n_raw - 1, raw0 + 3, raw0 + 2 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 3);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -2058,6 +2136,15 @@ static const std::vector<ggml_op> ops_ctrl_out = {
 static const std::vector<ggml_op> ops_rel_bias = {
     GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
     GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY
+};
+static const std::vector<ggml_op> ops_k_conv_store = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
+    GGML_OP_RESHAPE, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_SET_ROWS
+};
+static const std::vector<ggml_op> ops_v_conv_store = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
+    GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS
 };
 static const std::vector<ggml_op> ops_clip_rel_bias = {
     GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
@@ -2152,6 +2239,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
     { GGML_METAL_FUSION_CLIP_REL_BIAS, ops_clip_rel_bias, {}, true, ggml_metal_fusion_check_clip_rel_bias },
+    { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
+    { GGML_METAL_FUSION_KV_CONV_STORE, ops_v_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
 
     { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(0), {}, true, ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(1), {}, true, ggml_metal_fusion_check_depth_mix },
@@ -2170,6 +2259,16 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(6), {}, true, ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(7), {}, true, ggml_metal_fusion_check_depth_mix },
 };
+
+// the pattern of a fusion with this many (non-empty) ops
+static const ggml_metal_fusion * ggml_metal_fusion_find(ggml_metal_fusion_id id, int n_ops) {
+    for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+        if (fusion.id == id && (int) fusion.ops.size() == n_ops) {
+            return &fusion;
+        }
+    }
+    return nullptr;
+}
 
 // ---- alloc deps -----------------------------------------------------------
 

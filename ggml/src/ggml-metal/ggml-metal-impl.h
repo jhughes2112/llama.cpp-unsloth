@@ -791,6 +791,28 @@ typedef struct {
 typedef struct {
     int32_t  nc;       // taps
     int32_t  C;        // channels
+    int32_t  D;        // channels a head
+    int32_t  n_t;      // tokens per sequence
+    int32_t  n_s;      // sequences
+    int32_t  is_norm;  // 1: rms norm of each head (V), 0: L2 clip (K)
+    int32_t  is_f16;   // type of the cache
+    int32_t  pad;
+    uint64_t nb_past2; // sequence strides of the stored window and of the state cell
+    uint64_t nb_cell1;
+    uint64_t nb_row;   // row stride of the cache
+    float    s;        // output scale and bias of the convolution
+    float    b;
+    float    eps;      // of the norm
+    float    cs;       // clip: y*clamp(cc/(cs*|y| + cb), lo, hi)
+    float    cb;
+    float    cc;
+    float    lo;
+    float    hi;
+} ggml_metal_kargs_kv_conv_store;
+
+typedef struct {
+    int32_t  nc;       // taps
+    int32_t  C;        // channels
     int32_t  n_t;      // tokens per sequence
     int32_t  n_s;      // sequences
     int32_t  Kw;       // windows stored, the newest last

@@ -1011,6 +1011,90 @@ kernel void kernel_rel_bias_f32_f16(
 
     dst[((ulong) ih*args.n_tokens + it)*args.n_kv + kv] = half(sumf - sink[it*args.n_head + ih] + mask[it*args.n_kv + kv]);
 }
+// K or V of a layer from its projection to the KV cache, one threadgroup a head and sequence, one thread a channel:
+// the short convolution of kernel_short_conv_f32, then the L2 clip or the RMS norm of the head, and the result goes
+// to the cache row of its token. the sum of squares of a head is reduced through shmem for each token
+kernel void kernel_kv_conv_store_f32(
+        constant ggml_metal_kargs_kv_conv_store & args,
+        device const char  * past,
+        device const float * cur,
+        device const float * w,
+        device       char  * cell,
+        device const long  * idxs,
+        device       char  * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const int c   = tgpig.x*args.D + tpitg.x;
+    const int is  = tgpig.y;
+    const int nsg = (ntg.x + N_SIMDWIDTH - 1)/N_SIMDWIDTH;
+
+    const int nh = args.nc - 1;
+
+    float h[8];
+
+    device const float * p = (device const float *) (past + is*args.nb_past2) + c*nh;
+    for (int j = 0; j < nh; ++j) {
+        h[j] = p[j];
+    }
+
+    device const float * wc = w + c*args.nc;
+
+    const ulong tok0 = (ulong) is*args.n_t;
+
+    for (int t = 0; t < args.n_t; ++t) {
+        const float xt = cur[(tok0 + t)*args.C + c];
+
+        float acc = 0.0f;
+        for (int j = 0; j < nh; ++j) {
+            acc += h[j]*wc[j];
+        }
+        acc += xt*wc[nh];
+
+        const float y = args.s*(xt + acc) + args.b;
+
+        for (int j = 0; j < nh - 1; ++j) {
+            h[j] = h[j + 1];
+        }
+        h[nh - 1] = xt;
+
+        // the sum of squares of the head
+        float ss = simd_sum(y*y);
+
+        if (tiisg == 0) {
+            shmem[sgitg] = ss;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        ss = 0.0f;
+        for (int i = 0; i < nsg; ++i) {
+            ss += shmem[i];
+        }
+
+        // (the next token writes shmem again)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float f = args.is_norm ?
+            1.0f/sqrt(ss/args.D + args.eps) :
+            clamp(args.cc/(args.cs*sqrt(ss) + args.cb), args.lo, args.hi);
+
+        device char * row = dst + (ulong) idxs[tok0 + t]*args.nb_row;
+        if (args.is_f16) {
+            ((device half *) row)[c] = half(y*f);
+        } else {
+            ((device float *) row)[c] = y*f;
+        }
+    }
+
+    device float * q = (device float *) (cell + is*args.nb_cell1) + c*nh;
+    for (int j = 0; j < nh; ++j) {
+        q[j] = h[j];
+    }
+}
 // kernel_short_conv_f32 with per-head, input-dependent taps on top of the weights:
 //   y[c, t] = s*(cur[c, t] + sum_j w[j, c]*x[t + j, c] + sum_l tap[l, head(c), t]*x[t + nc - 1 - l, c]) + b
 // the window lives in registers, so dst may be cur in place
