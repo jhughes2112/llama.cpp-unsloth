@@ -6164,7 +6164,8 @@ int ggml_metal_op_ctrl_down(ggml_metal_op_t ctx, int idx, int n) {
 
     // wide and shallow: a thread reads only a few elements of the row
     int nth = 32;
-    while (nth*2 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) && nth*2 <= args.n_embd && nth < 256) {
+    static const int nth_env = getenv("GGML_METAL_CTRL_NTH") ? atoi(getenv("GGML_METAL_CTRL_NTH")) : 1024;
+    while (nth*2 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) && nth*2 <= args.n_embd && nth < nth_env) {
         nth *= 2;
     }
 
@@ -6211,9 +6212,14 @@ int ggml_metal_op_ctrl_out(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g->src[0]),  5);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        6);
 
-    const int nth = 256;
+    // a simdgroup an element; GGML_METAL_CTRL_NSG simdgroups a threadgroup
+    static const int nsg_env = getenv("GGML_METAL_CTRL_NSG") ? atoi(getenv("GGML_METAL_CTRL_NSG")) : 8;
+    int nsg = 1;
+    while (nsg*2*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) && nsg < nsg_env) {
+        nsg *= 2;
+    }
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_embd + nth - 1)/nth, dst->ne[1], 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_embd + nsg - 1)/nsg, dst->ne[1], 1, 32*nsg, 1, 1);
 
     return n;
 }

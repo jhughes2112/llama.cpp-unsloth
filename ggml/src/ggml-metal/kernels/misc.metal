@@ -932,8 +932,8 @@ kernel void kernel_ctrl_down_f32(
         dst[(ulong) tgpig.y*args.n_rank + tgpig.x] = px/sqrt(sx/n + args.eps) + pm/sqrt(sm/n + args.eps);
     }
 }
-// loop controller, both gates and the output: y = (s*tanh(F h) + b)*x + tanh(G h)*m, one thread an element.
-// dst may be x or m in place
+// loop controller, both gates and the output: y = (s*tanh(F h) + b)*x + tanh(G h)*m, one simdgroup an element:
+// a thread takes every 32nd term of the two products. dst may be x or m in place
 kernel void kernel_ctrl_out_f32(
         constant ggml_metal_kargs_ctrl & args,
         device const float * x,
@@ -942,26 +942,33 @@ kernel void kernel_ctrl_out_f32(
         device const float * F,
         device const float * G,
         device       float * dst,
-        uint3 gid [[thread_position_in_grid]]) {
-    const int i = gid.x;
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const int i = tgpig.x*(ntg.x/N_SIMDWIDTH) + sgitg;
     if (i >= args.n_embd) {
         return;
     }
 
-    const ulong e = (ulong) gid.y*args.n_embd + i;
+    const ulong e = (ulong) tgpig.y*args.n_embd + i;
 
-    device const float * hs = h + (ulong) gid.y*args.n_rank;
+    device const float * hs = h + (ulong) tgpig.y*args.n_rank;
     device const float * Fi = F + (ulong) i*args.n_rank;
     device const float * Gi = G + (ulong) i*args.n_rank;
 
     float f = 0.0f;
     float g = 0.0f;
-    for (int r = 0; r < args.n_rank; ++r) {
+    for (int r = tiisg; r < args.n_rank; r += N_SIMDWIDTH) {
         f += Fi[r]*hs[r];
         g += Gi[r]*hs[r];
     }
+    f = simd_sum(f);
+    g = simd_sum(g);
 
-    dst[e] = (args.s*precise::tanh(f) + args.b)*x[e] + precise::tanh(g)*m[e];
+    if (tiisg == 0) {
+        dst[e] = (args.s*precise::tanh(f) + args.b)*x[e] + precise::tanh(g)*m[e];
+    }
 }
 // the per-head attention mask with the relative-position bias, one thread per mask element:
 //   m[kv, t, h] = sum_r bias[r, pos[kv, t]]*R[r, h, t] - sink[h, t] + mask[kv, t], no bias at pos == nc
