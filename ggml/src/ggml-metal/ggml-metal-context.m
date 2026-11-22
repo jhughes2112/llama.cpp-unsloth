@@ -28,6 +28,12 @@ static _Atomic int64_t g_profile_n_graphs = 0;
 static _Atomic int64_t g_profile_bucket_nodes [GGML_METAL_PROFILE_BUCKETS];
 static _Atomic int64_t g_profile_bucket_graphs[GGML_METAL_PROFILE_BUCKETS];
 static _Atomic int64_t g_profile_bucket_gpu_ns[GGML_METAL_PROFILE_BUCKETS];
+// profile: from the end of a graph on the GPU to the CPU running again, and from there to the commit of the next
+static double g_profile_t_wake      = 0.0;
+static double g_profile_wake_s      = 0.0;
+static double g_profile_turnaround_s = 0.0;
+static int    g_profile_n_wake      = 0;
+
 static _Atomic int64_t g_profile_gap_graph_ns = 0;
 static _Atomic int64_t g_profile_gap_cb_ns    = 0;
 static _Atomic int64_t g_profile_n_recorded   = 0;
@@ -347,6 +353,10 @@ void ggml_metal_free(ggml_metal_t ctx) {
         fprintf(stderr, "ggml_metal_free: profile: %lld graphs recorded, %lld executed from a recording\n", (long long) g_profile_n_recorded, (long long) g_profile_n_replayed);
         fprintf(stderr, "ggml_metal_free: profile: GPU idle between graphs %.1f ms, between the command buffers of a graph %.1f ms\n",
                 g_profile_gap_graph_ns/1e6, g_profile_gap_cb_ns/1e6);
+        if (g_profile_n_wake > 0) {
+            fprintf(stderr, "ggml_metal_free: profile: a token: GPU end to CPU awake %.0f us, CPU to the next commit %.0f us (%d waits)\n",
+                    g_profile_wake_s*1e6/g_profile_n_wake, g_profile_turnaround_s*1e6/g_profile_n_wake, g_profile_n_wake);
+        }
         int64_t barriers, depth, kernels;
         ggml_metal_op_profile_get(&barriers, &depth, &kernels);
         fprintf(stderr, "ggml_metal_free: profile: %lld kernels, %lld barriers, depth %lld (summed over encoders)" "\n", (long long) kernels, (long long) barriers, (long long) depth);
@@ -388,7 +398,14 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
+        // (polling the status instead brought the thread back in 60 us rather than 89 on an M5 Ultra, but only when it
+        // polled for the whole execution: sleeping until shortly before the end and polling from there gained nothing)
         [ctx->cmd_buf_last waitUntilCompleted];
+        if (getenv("GGML_METAL_PROFILE")) {
+            g_profile_t_wake  = [[NSProcessInfo processInfo] systemUptime];
+            g_profile_wake_s += g_profile_t_wake - [ctx->cmd_buf_last GPUEndTime];
+            g_profile_n_wake++;
+        }
         ctx->cmd_buf_last = nil;
     }
 
@@ -609,7 +626,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 // shapes and their parameters. a graph that did not go through ggml_metal_graph_optimize keeps all of this, but a
 // caller that computes graphs without a scheduler reuses node memory for another graph without telling the backend
 static uint64_t ggml_metal_graph_identity(const struct ggml_cgraph * gf) {
-    uint64_t h = 1469598103934665603ull;
+    uint64_t hs[4] = { 1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull };
     for (int i = 0; i < gf->n_nodes; ++i) {
         const struct ggml_tensor * t = gf->nodes[i];
         uint64_t p[8];
@@ -621,9 +638,10 @@ static uint64_t ggml_metal_graph_identity(const struct ggml_cgraph * gf) {
         for (int j = 0; j < GGML_MAX_SRC && t->src[j]; ++j) {
             x ^= ((uint64_t) (uintptr_t) t->src[j] << (5 + 3*j)) ^ ((uint64_t) (uintptr_t) t->src[j]->data >> 2);
         }
-        h = (h ^ x)*1099511628211ull;
+        // four interleaved chains: the multiplies of one do not wait for those of another
+        hs[i & 3] = (hs[i & 3] ^ x)*1099511628211ull;
     }
-    return h;
+    return hs[0] ^ (hs[1]*3) ^ (hs[2]*5) ^ (hs[3]*7);
 }
 
 // encode the whole graph in one command buffer, on this thread; the caller commits it
@@ -722,6 +740,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 ggml_metal_profile_cmd_buf(cmd_buf);
                 ggml_metal_profile_cmd_buf_graph(cmd_buf, gf->n_nodes, true);
                 atomic_fetch_add(&g_profile_n_graphs, 1);
+
+                if (g_profile_t_wake > 0.0) {
+                    g_profile_turnaround_s += [[NSProcessInfo processInfo] systemUptime] - g_profile_t_wake;
+                    g_profile_t_wake = 0.0;
+                }
 
                 [cmd_buf commit];
                 ctx->cmd_buf_last = cmd_buf;

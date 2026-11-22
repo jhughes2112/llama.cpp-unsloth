@@ -964,6 +964,41 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_situ(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SOFTCAP) {
+            ctx->count_fusions(fusion);
+
+            const ggml_tensor * s1  = ctx->node(idx + 0);
+            const ggml_tensor * s2  = ctx->node(idx + 2);
+            ggml_tensor *       dst = ctx->node(idx + n - 1);
+
+            for (int i = 1; i < n; ++i) {
+                if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                    break;
+                }
+            }
+
+            auto pipeline = ggml_metal_library_get_pipeline_named(ctx->lib, "kernel_softcap_f32");
+
+            ggml_metal_kargs_softcap args = {
+                /*.ne0_src =*/ (int32_t) s1->ne[0],
+                /*.ne0     =*/ (int32_t) dst->ne[0],
+                /*.ne1     =*/ (int32_t) dst->ne[1],
+                /*.a       =*/ ggml_get_op_params_f32(s1, 0),
+                /*.b       =*/ ggml_get_op_params_f32(s2, 0),
+            };
+
+            ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+            ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(s1->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(dst),        2);
+
+            const int nth = 256;
+
+            ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (args.ne0 + nth - 1)/nth, args.ne1, 1, nth, 1, 1);
+
+            return n;
+        }
     }
     if (op->op == GGML_OP_UNARY && ctx->use_fusion() && ggml_get_unary_op(op) == GGML_UNARY_OP_TANH) {
         int n = 1;

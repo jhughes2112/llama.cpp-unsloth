@@ -776,6 +776,14 @@ typedef struct {
 } ggml_metal_kargs_expert_reduce;
 
 typedef struct {
+    int32_t ne0_src; // rows of a source column
+    int32_t ne0;     // rows kept
+    int32_t ne1;
+    float   a;       // y = b*tanh(a*x)
+    float   b;
+} ggml_metal_kargs_softcap;
+
+typedef struct {
     int32_t  nc;       // taps
     int32_t  C;        // channels
     int32_t  n_t;      // tokens per sequence

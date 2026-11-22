@@ -2099,6 +2099,63 @@ static bool ggml_metal_fusion_check_reduce_conv(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 4);
 }
 
+// SCALE TANH SCALE [VIEW] CONT: y = c*tanh(x/c) of the leading rows of each column, copied out contiguous: the soft cap
+// of the logits and the drop of the padded vocabulary, four passes over the vocabulary as one. unsafe = true
+static bool ggml_metal_fusion_check_softcap(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * s1   = nodes[0];
+    const ggml_tensor * th   = nodes[1];
+    const ggml_tensor * s2   = nodes[2];
+    const ggml_tensor * cont = nodes[3];
+    const ggml_tensor * view = gf->nodes[raw0 + 3];
+    const ggml_tensor * x    = s1->src[0];
+
+    if (ggml_get_unary_op(th) != GGML_UNARY_OP_TANH || th->src[0] != s1 || s2->src[0] != th || cont->src[0] != view ||
+        view->view_src != s2 || view->view_offs != 0 || view->nb[1] != s2->nb[1] ||
+        ggml_get_op_params_f32(s1, 1) != 0.0f || ggml_get_op_params_f32(s2, 1) != 0.0f) {
+        return false;
+    }
+
+    for (const ggml_tensor * t : { s1, th, s2, cont, x }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[2] != 1 || t->ne[3] != 1) {
+            return false;
+        }
+    }
+
+    if (!ggml_are_same_shape(x, s1) || !ggml_are_same_shape(x, th) || !ggml_are_same_shape(x, s2) ||
+        cont->ne[0] > x->ne[0] || cont->ne[1] != x->ne[1] || view->ne[0] != cont->ne[0] || view->ne[1] != cont->ne[1] ||
+        s1->view_src != nullptr || th->view_src != nullptr || s2->view_src != nullptr || cont->view_src != nullptr) {
+        return false;
+    }
+
+    const int outputs[1] = { raw0 + n_raw - 1 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -2203,6 +2260,7 @@ static const std::vector<ggml_op> ops_reduce_conv = {
     GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_TRANSPOSE,
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD
 };
+static const std::vector<ggml_op> ops_softcap = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_CONT };
 static const std::vector<ggml_op> ops_clip_rel_bias = {
     GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
     GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
@@ -2296,6 +2354,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
     { GGML_METAL_FUSION_CLIP_REL_BIAS, ops_clip_rel_bias, {}, true, ggml_metal_fusion_check_clip_rel_bias },
+    { GGML_METAL_FUSION_SOFTCAP, ops_softcap, {}, true, ggml_metal_fusion_check_softcap },
     { GGML_METAL_FUSION_REDUCE_CONV, ops_reduce_conv, {12}, true, ggml_metal_fusion_check_reduce_conv },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_v_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },

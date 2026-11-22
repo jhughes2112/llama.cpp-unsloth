@@ -660,6 +660,19 @@ kernel void kernel_expert_reduce_f32(
     dst[(ulong) it*args.ne0 + i] = sum;
 }
 
+// y = b*tanh(a*x) of the leading ne0 rows of each column of x, contiguous
+kernel void kernel_softcap_f32(
+        constant ggml_metal_kargs_softcap & args,
+        device const float * x,
+        device       float * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    if (gid.x >= args.ne0) {
+        return;
+    }
+
+    dst[(ulong) gid.y*args.ne0 + gid.x] = args.b*precise::tanh(args.a*x[(ulong) gid.y*args.ne0_src + gid.x]);
+}
+
 // y[i, e, t] = x[i, e, t]*s[ids[e, t]]; dst may be x in place
 kernel void kernel_expert_scale_f32(
         constant ggml_metal_kargs_expert_scale & args,
