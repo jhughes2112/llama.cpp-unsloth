@@ -601,6 +601,37 @@ kernel void kernel_situ_f32(
     dst[gid] = act*(args.ub*precise::tanh(args.ua*u));
 }
 
+// situ of the gate and up halves of a merged row, each scaled by the scalar of its expert first:
+//   dst[i, e, t] = situ(c*x[i, e, t], c*x[n + i, e, t]), c = s[ids[e, t]]. dst is contiguous and not x
+kernel void kernel_expert_situ_f32(
+        constant ggml_metal_kargs_expert_situ & args,
+        device const char  * x,
+        device const float * s,
+        device const char  * ids,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = (uint) args.ne0*args.ne1*args.ne2;
+    if (gid >= n) {
+        return;
+    }
+
+    const uint i0 = gid%args.ne0;
+    const uint r  = gid/args.ne0;
+    const uint i1 = r%args.ne1;
+    const uint i2 = r/args.ne1;
+
+    const float c = s[((device const int *) (ids + i2*args.nb_ids1))[i1]];
+
+    device const char * row = x + i2*args.nb2 + i1*args.nb1;
+
+    const float g = c*((device const float *) row)[i0];
+    const float u = c*((device const float *) (row + args.offs_up))[i0];
+
+    const float act = (args.gb*precise::tanh(args.ga*g))*(1/(1 + exp(-g)));
+
+    dst[gid] = act*(args.ub*precise::tanh(args.ua*u));
+}
+
 // y[i, e, t] = x[i, e, t]*s[ids[e, t]]; dst may be x in place
 kernel void kernel_expert_scale_f32(
         constant ggml_metal_kargs_expert_scale & args,
@@ -633,6 +664,7 @@ kernel void kernel_short_conv_f32(
         device const float * w,
         device       char  * cell,
         device       float * dst,
+        device const float * res,
         uint3 gid [[thread_position_in_grid]]) {
     const int c  = gid.x;
     const int is = gid.y;
@@ -662,7 +694,10 @@ kernel void kernel_short_conv_f32(
         }
         acc += xt*wc[nh];
 
-        dst[base + (ulong) t*args.C] = args.s*(xt + acc) + args.b;
+        // with a residual, dst may be it in place: read before the write
+        const float r = args.has_res ? res[base + (ulong) t*args.C] : 0.0f;
+
+        dst[base + (ulong) t*args.C] = args.s*(xt + acc) + args.b + r;
 
         for (int j = 0; j < nh - 1; ++j) {
             h[j] = h[j + 1];
@@ -908,6 +943,7 @@ kernel void kernel_short_conv_rs_f32(
         device const int   * order,
         device       char  * slots,
         device       float * dst,
+        device const float * res,
         uint3 gid [[thread_position_in_grid]]) {
     const int c  = gid.x;
     const int is = gid.y;
@@ -937,7 +973,10 @@ kernel void kernel_short_conv_rs_f32(
         }
         acc += xt*wc[nh];
 
-        dst[base + (ulong) t*args.C] = args.s*(xt + acc) + args.b;
+        // with a residual, dst may be it in place: read before the write
+        const float r = args.has_res ? res[base + (ulong) t*args.C] : 0.0f;
+
+        dst[base + (ulong) t*args.C] = args.s*(xt + acc) + args.b + r;
 
         for (int j = 0; j < nh - 1; ++j) {
             h[j] = h[j + 1];

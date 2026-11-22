@@ -876,16 +876,8 @@ static bool ggml_metal_fusion_check_l2_clip(
 }
 // SCALE TANH SCALE SIGMOID MUL SCALE TANH SCALE MUL: situ(gate, up) = b*tanh(gate/b)*sigmoid(gate) * lb*tanh(up/lb),
 // with gate and up two same-shape views. the gate is read twice, so the structural checks live here (unsafe = true)
-static bool ggml_metal_fusion_check_situ(
-        const ggml_metal_fusion       * fusion,
-        const ggml_tensor * const     * nodes,
-        const ggml_cgraph             * gf,
-        const int                     * node_idxs,
-              int                       idx,
-              ggml_metal_fusion_mode    mode) {
-    GGML_UNUSED(mode);
-
-    const int n = (int) fusion->ops.size();
+static bool ggml_metal_fusion_situ_core(const ggml_tensor * const * nodes, int n) {
+    GGML_UNUSED(n);
 
     const ggml_tensor * g_in  = nodes[0]; // gate/b
     const ggml_tensor * g_th  = nodes[1];
@@ -933,14 +925,10 @@ static bool ggml_metal_fusion_check_situ(
         return false;
     }
 
-    const int outputs[1] = { node_idxs[idx + n - 1] };
-
-    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
+    return true;
 }
 
-// REPEAT GET_ROWS MUL: y[i, e, t] = x[i, e, t]*s[ids[e, t]], the per-expert scalar of each selected expert.
-// the table is a [1, n_expert, 1] tensor repeated over the tokens, so the rows of the repeat are all the same
-static bool ggml_metal_fusion_check_expert_scale(
+static bool ggml_metal_fusion_check_situ(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
         const ggml_cgraph             * gf,
@@ -950,6 +938,20 @@ static bool ggml_metal_fusion_check_expert_scale(
     GGML_UNUSED(mode);
 
     const int n = (int) fusion->ops.size();
+
+    if (!ggml_metal_fusion_situ_core(nodes, n)) {
+        return false;
+    }
+
+    const int outputs[1] = { node_idxs[idx + n - 1] };
+
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
+}
+
+// REPEAT GET_ROWS MUL: y[i, e, t] = x[i, e, t]*s[ids[e, t]], the per-expert scalar of each selected expert.
+// the table is a [1, n_expert, 1] tensor repeated over the tokens, so the rows of the repeat are all the same
+static bool ggml_metal_fusion_expert_scale_core(const ggml_tensor * const * nodes, int n) {
+    GGML_UNUSED(n);
 
     const ggml_tensor * rep  = nodes[0];
     const ggml_tensor * rows = nodes[1];
@@ -982,9 +984,74 @@ static bool ggml_metal_fusion_check_expert_scale(
         return false;
     }
 
+    return true;
+}
+
+static bool ggml_metal_fusion_check_expert_scale(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n = (int) fusion->ops.size();
+
+    if (!ggml_metal_fusion_expert_scale_core(nodes, n)) {
+        return false;
+    }
+
     const int outputs[1] = { node_idxs[idx + n - 1] };
 
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
+}
+
+// REPEAT GET_ROWS MUL [VIEW] SITU [with its VIEW]: the scalar of each selected expert applied to the gate and up
+// halves of a merged gate_up row inside the activation, so that the scaled row is never written
+static bool ggml_metal_fusion_check_expert_situ(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    if (!ggml_metal_fusion_expert_scale_core(nodes, 3) || !ggml_metal_fusion_situ_core(nodes + 3, n - 3)) {
+        return false;
+    }
+
+    const ggml_tensor * mul  = nodes[2];
+    const ggml_tensor * gate = nodes[3]->src[0];
+    const ggml_tensor * up   = nodes[8]->src[0];
+
+    // gate and up are the two views of the scaled row, in the run
+    if (gate != gf->nodes[raw0 + 3] || up != gf->nodes[raw0 + 9] || gate->view_src != mul || up->view_src != mul ||
+        gate->ne[1] != mul->ne[1] || gate->ne[2] != mul->ne[2] || gate->nb[1] != mul->nb[1] || gate->nb[2] != mul->nb[2] ||
+        gate->view_offs + (gate->ne[0] - 1)*sizeof(float) >= mul->nb[1] || up->view_offs + (up->ne[0] - 1)*sizeof(float) >= mul->nb[1]) {
+        return false;
+    }
+
+    const int outputs[1] = { raw0 + n_raw - 1 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
 }
 // CONCAT [VIEW VIEW] CPY SSM_CONV [RESHAPE] ADD SCALE: a short causal convolution with its recurrent state,
 //   x = concat(past, cur^T), cell <- the last columns of x, y = s*(cur + ssm_conv(x, w)) + b
@@ -1089,6 +1156,17 @@ static bool ggml_metal_fusion_check_short_conv(
     }
 
     // outputs: the result, the state store and its cell view
+    // the variant with the residual ADD behind the scale: the kernel adds it to what it writes
+    if (n == 6) {
+        const ggml_tensor * radd = nodes[5];
+        const ggml_tensor * res  = radd->src[0] == scale ? radd->src[1] : radd->src[0];
+        if ((radd->src[0] != scale && radd->src[1] != scale) || res == scale || radd->view_src != nullptr ||
+            radd->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 || !ggml_are_same_shape(radd, scale) ||
+            !ggml_are_same_shape(res, scale) || !ggml_is_contiguous(res) || !ggml_is_contiguous(radd)) {
+            return false;
+        }
+    }
+
     const int outputs[3] = { raw0 + n_raw - 1, raw0 + 3, raw0 + 2 };
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 3);
@@ -1335,6 +1413,17 @@ static bool ggml_metal_fusion_check_short_conv_rs(
     if (mode == GGML_METAL_FUSION_FULL) {
         // the kernel writes straight to the state; it walks the tokens of a channel in order (see SHORT_CONV)
         if (set->data == nullptr || n_t < 1 || n_t > 16) {
+            return false;
+        }
+    }
+
+    // the variant with the residual ADD behind the scale: the kernel adds it to what it writes
+    if (n == 6) {
+        const ggml_tensor * radd = nodes[5];
+        const ggml_tensor * res  = radd->src[0] == scale ? radd->src[1] : radd->src[0];
+        if ((radd->src[0] != scale && radd->src[1] != scale) || res == scale || radd->view_src != nullptr ||
+            radd->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 || !ggml_are_same_shape(radd, scale) ||
+            !ggml_are_same_shape(res, scale) || !ggml_is_contiguous(res) || !ggml_is_contiguous(radd)) {
             return false;
         }
     }
@@ -1692,6 +1781,11 @@ static const std::vector<ggml_op> ops_situ = {
     GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL
 };
 static const std::vector<ggml_op> ops_expert_scale = { GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_expert_situ = {
+    GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL, GGML_OP_VIEW,
+    GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL
+};
 static const std::vector<ggml_op> ops_short_conv = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
 };
@@ -1708,6 +1802,13 @@ static const std::vector<ggml_op> ops_rel_bias = {
 };
 static const std::vector<ggml_op> ops_short_conv_rs = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
+};
+static const std::vector<ggml_op> ops_short_conv_add = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_short_conv_rs_add = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
+    GGML_OP_ADD
 };
 static const std::vector<ggml_op> ops_l2_clip = {
     GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
@@ -1771,8 +1872,11 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_SITU,         ops_situ,         {}, true, ggml_metal_fusion_check_situ },
     { GGML_METAL_FUSION_EXPERT_SCALE, ops_expert_scale, {}, true, ggml_metal_fusion_check_expert_scale },
+    { GGML_METAL_FUSION_EXPERT_SITU,  ops_expert_situ,  {}, true, ggml_metal_fusion_check_expert_situ },
     { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv,   {1}, true, ggml_metal_fusion_check_short_conv },
+    { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv_add, {1}, true, ggml_metal_fusion_check_short_conv },
     { GGML_METAL_FUSION_SHORT_CONV_RS, ops_short_conv_rs, {1}, true, ggml_metal_fusion_check_short_conv_rs },
+    { GGML_METAL_FUSION_SHORT_CONV_RS, ops_short_conv_rs_add, {1}, true, ggml_metal_fusion_check_short_conv_rs },
     { GGML_METAL_FUSION_GATED_MIX,    ops_gated_mix,    {}, true, ggml_metal_fusion_check_gated_mix },
     { GGML_METAL_FUSION_CTRL_DOWN,    ops_ctrl_down,    {}, true, ggml_metal_fusion_check_ctrl_down },
     { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },

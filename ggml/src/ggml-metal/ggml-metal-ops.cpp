@@ -310,7 +310,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         if (skip) {
             char key[64];
             snprintf(key, sizeof(key), ",%s,", ggml_op_name(node->op));
-            if (strstr(skip, key)) {
+            // GGML_METAL_PROFILE_SKIP_MIN / _MAX: only the ops whose first source has that many elements
+            static const char * skip_min = getenv("GGML_METAL_PROFILE_SKIP_MIN");
+            static const char * skip_max = getenv("GGML_METAL_PROFILE_SKIP_MAX");
+            const int64_t ne_src = node->src[0] ? ggml_nelements(node->src[0]) : 0;
+            if (strstr(skip, key) && (!skip_min || ne_src >= atoll(skip_min)) && (!skip_max || ne_src <= atoll(skip_max))) {
                 return 1;
             }
         }
@@ -742,6 +746,10 @@ int ggml_metal_op_repeat(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_EXPERT_SCALE) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_expert_scale(ctx, idx, n);
+        }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_EXPERT_SITU) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_expert_situ(ctx, idx, n);
         }
     }
     ggml_tensor * op = ctx->node(idx);
@@ -5667,6 +5675,62 @@ int ggml_metal_op_situ(ggml_metal_op_t ctx, int idx, int n) {
     return n;
 }
 
+// Dispatch the per-expert scale and the SiTU of the scaled halves from the matched repeat get_rows mul + situ run.
+int ggml_metal_op_expert_situ(ggml_metal_op_t ctx, int idx, int n) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * rep   = ctx->node(idx + 0);
+    const ggml_tensor * rows  = ctx->node(idx + 1);
+    const ggml_tensor * mul   = ctx->node(idx + 2);
+    const ggml_tensor * g_in  = ctx->node(idx + 3);
+    const ggml_tensor * g_out = ctx->node(idx + 5);
+    const ggml_tensor * u_in  = ctx->node(idx + 8);
+    const ggml_tensor * u_out = ctx->node(idx + 10);
+    ggml_tensor *       dst   = ctx->node(idx + n - 1);
+
+    const ggml_tensor * x    = mul->src[0];
+    const ggml_tensor * gate = g_in->src[0];
+    const ggml_tensor * up   = u_in->src[0];
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n);
+
+    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_expert_situ_f32");
+
+    ggml_metal_kargs_expert_situ args = {
+        /*.ne0     =*/ (int32_t) dst->ne[0],
+        /*.ne1     =*/ (int32_t) dst->ne[1],
+        /*.ne2     =*/ (int32_t) dst->ne[2],
+        /*.pad     =*/ 0,
+        /*.nb1     =*/ x->nb[1],
+        /*.nb2     =*/ x->nb[2],
+        /*.offs_up =*/ up->view_offs - gate->view_offs,
+        /*.nb_ids1 =*/ rows->src[1]->nb[1],
+        /*.ga      =*/ ggml_get_op_params_f32(g_in,  0),
+        /*.gb      =*/ ggml_get_op_params_f32(g_out, 0),
+        /*.ua      =*/ ggml_get_op_params_f32(u_in,  0),
+        /*.ub      =*/ ggml_get_op_params_f32(u_out, 0),
+    };
+
+    // the scaled row is not written: read the unscaled one where the gate view starts
+    ggml_metal_buffer_id bid_x = ggml_metal_get_buffer_id(x);
+    bid_x.offs += gate->view_offs;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_x,                                  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rep->src[0]),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rows->src[1]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),          4);
+
+    const int64_t total = ggml_nelements(dst);
+    const int     nth   = 256;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return n;
+}
+
 // Dispatch the fused per-expert scale from the matched repeat get_rows mul chain.
 int ggml_metal_op_expert_scale(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_library_t lib = ctx->lib;
@@ -5713,7 +5777,11 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
     const ggml_tensor * cpy   = ctx->node(idx + 1);
     const ggml_tensor * conv  = ctx->node(idx + 2);
     const ggml_tensor * add   = ctx->node(idx + 3);
-    ggml_tensor *       dst   = ctx->node(idx + 4);
+    const ggml_tensor * scale = ctx->node(idx + 4);
+    ggml_tensor *       dst   = ctx->node(idx + n - 1);
+
+    // the residual of the variant with an ADD behind the scale
+    const ggml_tensor * res = n == 6 ? (dst->src[0] == scale ? dst->src[1] : dst->src[0]) : nullptr;
 
     const ggml_tensor * past = cat->src[0];
     const ggml_tensor * cell = cpy->src[1];
@@ -5731,8 +5799,10 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
         /*.n_s      =*/ (int32_t) conv->ne[2],
         /*.nb_past2 =*/ past->nb[2],
         /*.nb_cell1 =*/ cell->nb[1],
-        /*.s        =*/ ggml_get_op_params_f32(dst, 0),
-        /*.b        =*/ ggml_get_op_params_f32(dst, 1),
+        /*.s        =*/ ggml_get_op_params_f32(scale, 0),
+        /*.b        =*/ ggml_get_op_params_f32(scale, 1),
+        /*.has_res  =*/ res ? 1 : 0,
+        /*.pad      =*/ 0,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -5742,6 +5812,7 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),    3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell), 4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),  5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res ? res : dst), 6);
 
     const int nth = 64;
 
@@ -5973,7 +6044,11 @@ int ggml_metal_op_short_conv_rs(ggml_metal_op_t ctx, int idx, int n) {
     const ggml_tensor * set   = ctx->node(idx + 1);
     const ggml_tensor * conv  = ctx->node(idx + 2);
     const ggml_tensor * add   = ctx->node(idx + 3);
-    ggml_tensor *       dst   = ctx->node(idx + 4);
+    const ggml_tensor * scale = ctx->node(idx + 4);
+    ggml_tensor *       dst   = ctx->node(idx + n - 1);
+
+    // the residual of the variant with an ADD behind the scale
+    const ggml_tensor * res = n == 6 ? (dst->src[0] == scale ? dst->src[1] : dst->src[0]) : nullptr;
 
     const ggml_tensor * past  = cat->src[0];
     const ggml_tensor * wins  = set->src[0];
@@ -5991,13 +6066,13 @@ int ggml_metal_op_short_conv_rs(ggml_metal_op_t ctx, int idx, int n) {
         /*.n_t      =*/ (int32_t) conv->ne[1],
         /*.n_s      =*/ (int32_t) conv->ne[2],
         /*.Kw       =*/ (int32_t) wins->ne[1],
-        /*.pad      =*/ 0,
+        /*.has_res  =*/ res ? 1 : 0,
         /*.nb_past2 =*/ past->nb[2],
         /*.nb_slot1 =*/ set->nb[1],
         /*.nb_slot2 =*/ set->nb[2],
         /*.nb_slot3 =*/ set->nb[3],
-        /*.s        =*/ ggml_get_op_params_f32(dst, 0),
-        /*.b        =*/ ggml_get_op_params_f32(dst, 1),
+        /*.s        =*/ ggml_get_op_params_f32(scale, 0),
+        /*.b        =*/ ggml_get_op_params_f32(scale, 1),
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -6008,6 +6083,7 @@ int ggml_metal_op_short_conv_rs(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(order), 4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(set),   5);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),   6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res ? res : dst), 7);
 
     const int nth = 64;
 

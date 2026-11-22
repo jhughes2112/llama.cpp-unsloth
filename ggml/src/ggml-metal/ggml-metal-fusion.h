@@ -51,6 +51,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_GATED_MIX,    // TANH + SCALE + MUL + TANH + MUL + ADD ((s*tanh(f) + b)*x + tanh(g)*m, the loop controller output)
     GGML_METAL_FUSION_REL_BIAS,     // PAD + MUL_MAT + SUB + CONT + GET_ROWS + CONT + ADD + CPY (relative-position bias mask)
     GGML_METAL_FUSION_SHORT_CONV_RS, // CONCAT + SET_ROWS + SSM_CONV + ADD + SCALE (SHORT_CONV whose state keeps rollback slots)
+    GGML_METAL_FUSION_EXPERT_SITU,  // EXPERT_SCALE + SITU (the scalar of each expert applied to gate and up inside the activation)
     GGML_METAL_FUSION_CTRL_DOWN,    // CONCAT + RMS_NORM + MUL_MAT (the normalized pair of a loop controller projected to its rank)
     GGML_METAL_FUSION_CTRL_OUT,     // MUL_MAT + MUL_MAT + GATED_MIX (both gates of a loop controller and its output)
 } ggml_metal_fusion_id;

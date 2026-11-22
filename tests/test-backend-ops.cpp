@@ -4863,6 +4863,7 @@ struct test_inkling2_short_conv : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const int64_t n_slots; // rollback slots of the state, 0 for a plain copy of the last columns
+    const bool    residual; // a residual added behind the convolution, as the layers of the model do
 
     ggml_tensor * cpy_node = nullptr;
 
@@ -4875,11 +4876,11 @@ struct test_inkling2_short_conv : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_conv, n_channels, n_seq_tokens, n_seqs, n_slots);
+        return VARS_TO_STR6(n_conv, n_channels, n_seq_tokens, n_seqs, n_slots, residual);
     }
 
-    test_inkling2_short_conv(int64_t n_conv = 4, int64_t n_channels = 2304, int64_t n_seq_tokens = 1, int64_t n_seqs = 1, int64_t n_slots = 0)
-        : n_conv(n_conv), n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), n_slots(n_slots) {}
+    test_inkling2_short_conv(int64_t n_conv = 4, int64_t n_channels = 2304, int64_t n_seq_tokens = 1, int64_t n_seqs = 1, int64_t n_slots = 0, bool residual = false)
+        : n_conv(n_conv), n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), n_slots(n_slots), residual(residual) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_tokens = n_seq_tokens*n_seqs;
@@ -4889,6 +4890,14 @@ struct test_inkling2_short_conv : public test_case {
 
         ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_tokens);
         ggml_set_name(cur, "cur");
+
+        ggml_tensor * res = nullptr;
+        if (residual) {
+            res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_tokens);
+            ggml_set_name(res, "cur");
+            res = ggml_scale(ctx, res, 0.5f);
+            ggml_build_forward_expand(gf, res);
+        }
 
         ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv, n_channels);
         ggml_set_name(weight, "weight");
@@ -4934,6 +4943,9 @@ struct test_inkling2_short_conv : public test_case {
         ggml_tensor * out = ggml_ssm_conv(ctx, x, weight);
         out = ggml_reshape_2d(ctx, out, n_channels, n_tokens);
         out = ggml_scale(ctx, ggml_add(ctx, cur, out), 1.0f/sqrtf(n_conv + 1));
+        if (res) {
+            out = ggml_add(ctx, res, out);
+        }
         ggml_set_name(out, "out");
         ggml_build_forward_expand(gf, out);
 
@@ -11453,10 +11465,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_inkling2_short_conv(2, 7, 5, 2));
     test_cases.emplace_back(new test_inkling2_short_conv(8, 5, 3, 1));
+    test_cases.emplace_back(new test_inkling2_short_conv(4, 2304, 1, 1, 0, true));
+    test_cases.emplace_back(new test_inkling2_short_conv(4, 2304, 4, 1, 0, true));
+    test_cases.emplace_back(new test_inkling2_short_conv(4,   96, 3, 3, 0, true));
     for (int64_t n_seq_tokens : {1, 2, 3, 4, 7}) {
         for (int64_t n_slots : {1, 2, 4}) {
             test_cases.emplace_back(new test_inkling2_short_conv(4, 2304, n_seq_tokens, 1, n_slots));
             test_cases.emplace_back(new test_inkling2_short_conv(4,   96, n_seq_tokens, 3, n_slots));
+            test_cases.emplace_back(new test_inkling2_short_conv(4, 2304, n_seq_tokens, 1, n_slots, true));
+            test_cases.emplace_back(new test_inkling2_short_conv(4,   96, n_seq_tokens, 3, n_slots, true));
         }
     }
     // Inkling 2 attention over depth

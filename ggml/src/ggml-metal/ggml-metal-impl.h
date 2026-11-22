@@ -753,6 +753,21 @@ typedef struct {
 } ggml_metal_kargs_expert_scale;
 
 typedef struct {
+    int32_t  ne0;     // of a half row
+    int32_t  ne1;     // experts used
+    int32_t  ne2;     // tokens
+    int32_t  pad;
+    uint64_t nb1;     // strides of the merged gate_up rows
+    uint64_t nb2;
+    uint64_t offs_up; // of the up half in a row
+    uint64_t nb_ids1; // stride of the ids from one token to the next
+    float    ga;      // gate: gb*tanh(ga*x)*sigmoid(x)
+    float    gb;
+    float    ua;      // up: ub*tanh(ua*x)
+    float    ub;
+} ggml_metal_kargs_expert_situ;
+
+typedef struct {
     int32_t  nc;       // taps
     int32_t  C;        // channels
     int32_t  n_t;      // tokens per sequence
@@ -761,6 +776,8 @@ typedef struct {
     uint64_t nb_cell1;
     float    s;        // output scale and bias
     float    b;
+    int32_t  has_res;  // add the residual to the output
+    int32_t  pad;
 } ggml_metal_kargs_short_conv;
 
 typedef struct {
@@ -769,7 +786,7 @@ typedef struct {
     int32_t  n_t;      // tokens per sequence
     int32_t  n_s;      // sequences
     int32_t  Kw;       // windows stored, the newest last
-    int32_t  pad;
+    int32_t  has_res;  // add the residual to the output
     uint64_t nb_past2; // sequence stride of the stored window
     uint64_t nb_slot1; // slot, channel and sequence strides of the state
     uint64_t nb_slot2;

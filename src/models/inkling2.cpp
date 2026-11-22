@@ -634,6 +634,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             blocks.push_back(inpSA);
         } else {
             cur = ggml_add(ctx0, inpSA, cur);
+            // right behind the convolution (order only), so that backends can fuse the residual into it
+            ggml_build_forward_order(gf, cur);
         }
 
         ggml_tensor * ffn_inp = cur;
@@ -671,6 +673,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, ffn_inp, cur);
+        ggml_build_forward_order(gf, cur);
         cb(cur, "l_out", il);
     }
 
