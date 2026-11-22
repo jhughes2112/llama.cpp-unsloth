@@ -1740,6 +1740,65 @@ static bool ggml_metal_fusion_check_ctrl_down(
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
 }
+// RMS_NORM MUL MUL_MAT with F32 weights and a few tokens (the router of a MoE layer): two kernels in one step. the norm
+// kernel writes the normalized input for whoever else reads it; the mat-mul reads the input of the norm and norms
+// it itself, one threadgroup a row, so it does not wait for the norm. unsafe = true
+static bool ggml_metal_fusion_check_norm_router(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+    GGML_UNUSED(fusion);
+
+    static const bool off = getenv("GGML_METAL_NO_NORM_ROUTER") != nullptr;
+    if (off) {
+        return false;
+    }
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + 3 > gf->n_nodes || node_idxs[idx + 2] != raw0 + 2) {
+        return false;
+    }
+
+    const ggml_tensor * rms = nodes[0];
+    const ggml_tensor * mul = nodes[1];
+    const ggml_tensor * mm  = nodes[2];
+
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mul->src[1];
+    const ggml_tensor * W = mm->src[0];
+
+    const int64_t n = rms->ne[0];
+
+    if (mul->src[0] != rms || mm->src[1] != mul || W == nullptr || w == nullptr) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || rms->ne[1] > 8 || rms->ne[2] != 1 || rms->ne[3] != 1 ||
+        !ggml_are_same_shape(rms, mul)) {
+        return false;
+    }
+    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || ggml_nelements(w) != n) {
+        return false;
+    }
+    if (W->type != GGML_TYPE_F32 || !ggml_is_contiguous(W) || W->data == nullptr || W->ne[0] != n ||
+        ggml_nelements(W) != W->ne[0]*W->ne[1] || W->ne[1] > 256 ||
+        mm->type != GGML_TYPE_F32 || mm->ne[0] != W->ne[1] || mm->ne[1] != rms->ne[1] || ggml_nelements(mm) != mm->ne[0]*mm->ne[1]) {
+        return false;
+    }
+    for (int j = 0; j < 3; ++j) {
+        if (nodes[j]->view_src != nullptr) {
+            return false;
+        }
+    }
+
+    const int raw_idxs[3] = { raw0, raw0 + 1, raw0 + 2 };
+    const int outputs[2]  = { raw0 + 1, raw0 + 2 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, 3, fusion->ops.data(), outputs, 2);
+}
 // MUL_MAT MUL_MAT TANH SCALE MUL TANH MUL ADD: y, one thread an element. unsafe = true
 static bool ggml_metal_fusion_check_ctrl_out(
         const ggml_metal_fusion       * fusion,
@@ -2609,6 +2668,7 @@ static const std::vector<ggml_op> ops_short_conv = {
 static const std::vector<ggml_op> ops_gated_mix = {
     GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD
 };
+static const std::vector<ggml_op> ops_norm_router = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_ctrl_down = { GGML_OP_CONCAT, GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_ctrl_out = {
     GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD
@@ -2734,6 +2794,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SHORT_CONV_RS, ops_short_conv_rs_add, {1}, true, ggml_metal_fusion_check_short_conv_rs },
     { GGML_METAL_FUSION_GATED_MIX,    ops_gated_mix,    {}, true, ggml_metal_fusion_check_gated_mix },
     { GGML_METAL_FUSION_CTRL_DOWN,    ops_ctrl_down,    {}, true, ggml_metal_fusion_check_ctrl_down },
+    { GGML_METAL_FUSION_NORM_ROUTER,  ops_norm_router,  {}, true, ggml_metal_fusion_check_norm_router },
     { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
     { GGML_METAL_FUSION_CLIP_REL_BIAS, ops_clip_rel_bias, {}, true, ggml_metal_fusion_check_clip_rel_bias },

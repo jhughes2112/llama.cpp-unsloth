@@ -66,6 +66,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_GATHER_FA,    // CONT + GET_ROWS + CONT + ADD + CPY + FA_GATE (the attention looks its bias up: no mask per head)
     GGML_METAL_FUSION_CTRL_DOWN,    // CONCAT + RMS_NORM + MUL_MAT (the normalized pair of a loop controller projected to its rank)
     GGML_METAL_FUSION_CTRL_OUT,     // MUL_MAT + MUL_MAT + GATED_MIX (both gates of a loop controller and its output)
+    GGML_METAL_FUSION_NORM_ROUTER,  // RMS_NORM + MUL + MUL_MAT (few rows: the mat-mul norms its input itself, beside the norm kernel)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

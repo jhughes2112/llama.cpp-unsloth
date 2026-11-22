@@ -945,6 +945,52 @@ kernel void kernel_ctrl_down_f32(
         dst[(ulong) tgpig.y*args.n_rank + tgpig.x] = px/sqrt(sx/n + args.eps) + pm/sqrt(sm/n + args.eps);
     }
 }
+// a few-row mat-mul over the weighted rms norm of its input: dst[r] = W[r] . (x*w)/rms(x), one threadgroup a row and
+// token. every threadgroup sums the squares of x again, in the loop of its products
+kernel void kernel_norm_router_f32(
+        constant ggml_metal_kargs_ctrl & args,
+        device const float * x,
+        device const float * w,
+        device const float * W,
+        device       float * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const int n   = args.n_embd;
+    const int nsg = ntg.x/N_SIMDWIDTH;
+
+    device const float * xs = x + (ulong) tgpig.y*n;
+    device const float * Wr = W + (ulong) tgpig.x*n;
+
+    float px = 0.0f;
+    float sx = 0.0f;
+    for (int i = tpitg.x; i < n; i += ntg.x) {
+        px += Wr[i]*(xs[i]*w[i]);
+        sx += xs[i]*xs[i];
+    }
+    px = simd_sum(px);
+    sx = simd_sum(sx);
+
+    if (tiisg == 0) {
+        shmem[2*sgitg + 0] = px;
+        shmem[2*sgitg + 1] = sx;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tpitg.x == 0) {
+        px = sx = 0.0f;
+        for (int i = 0; i < nsg; ++i) {
+            px += shmem[2*i + 0];
+            sx += shmem[2*i + 1];
+        }
+
+        dst[(ulong) tgpig.y*args.n_rank + tgpig.x] = px/sqrt(sx/n + args.eps);
+    }
+}
 // loop controller, both gates and the output: y = (s*tanh(F h) + b)*x + tanh(G h)*m, one simdgroup an element:
 // a thread takes every 32nd term of the two products. dst may be x or m in place
 kernel void kernel_ctrl_out_f32(
