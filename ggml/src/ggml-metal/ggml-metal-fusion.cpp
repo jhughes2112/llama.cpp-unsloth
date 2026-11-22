@@ -748,6 +748,67 @@ static bool ggml_metal_fusion_check_moe_reduce(
     return true;
 }
 
+static bool ggml_metal_fusion_expert_scale_core(const ggml_tensor * const * nodes, int n);
+
+// REPEAT GET_ROWS MUL [RESHAPE] MOE_REDUCE: the scalar of each selected expert applied inside the weighted sum of
+// the expert outputs, so that the scaled outputs are never written. unsafe = true
+static bool ggml_metal_fusion_check_expert_reduce(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    static const std::vector<ggml_op> ops_reduce = {
+        GGML_OP_MUL,
+        GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+        GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+    };
+
+    const int raw0  = node_idxs[idx];
+    const int raw_w = raw0 + n_raw - (int) ops_reduce.size();
+    if (n != 11 || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1 || node_idxs[idx + 3] != raw_w) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    if (!ggml_metal_fusion_expert_scale_core(nodes, 3)) {
+        return false;
+    }
+
+    ggml_metal_moe_reduce_match match;
+    if (!ggml_metal_fusion_match_moe_reduce(gf, raw_w, ops_reduce, &match) || match.experts != nodes[2]) {
+        return false;
+    }
+
+    const ggml_tensor * x = nodes[2]->src[0];
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (!x->data || !match.weights->data || !match.dst->data) {
+            return false;
+        }
+
+        // the kernel reads the expert outputs and the weights while it writes dst
+        if (ggml_metal_fusion_overlap(match.dst, x) || ggml_metal_fusion_overlap(match.dst, match.weights)) {
+            return false;
+        }
+    }
+
+    const int outputs[1] = { raw0 + n_raw - 1 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
+}
+
 // true if t is or views a tensor in a buffer marked as weights, such as a bias; the model loader marks its buffers before
 // any graph is optimized, and tensors in unmarked or not yet allocated buffers count as non-weights in both phases
 static bool ggml_metal_tensor_is_weight(const struct ggml_tensor * t) {
@@ -1781,6 +1842,18 @@ static const std::vector<ggml_op> ops_situ = {
     GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL
 };
 static const std::vector<ggml_op> ops_expert_scale = { GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_expert_reduce = {
+    GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL,
+    GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_expert_reduce_r = {
+    GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL, GGML_OP_RESHAPE,
+    GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+};
 static const std::vector<ggml_op> ops_expert_situ = {
     GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL, GGML_OP_VIEW,
     GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
@@ -1873,6 +1946,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SITU,         ops_situ,         {}, true, ggml_metal_fusion_check_situ },
     { GGML_METAL_FUSION_EXPERT_SCALE, ops_expert_scale, {}, true, ggml_metal_fusion_check_expert_scale },
     { GGML_METAL_FUSION_EXPERT_SITU,  ops_expert_situ,  {}, true, ggml_metal_fusion_check_expert_situ },
+    { GGML_METAL_FUSION_EXPERT_REDUCE, ops_expert_reduce,   {}, true, ggml_metal_fusion_check_expert_reduce },
+    { GGML_METAL_FUSION_EXPERT_REDUCE, ops_expert_reduce_r, {}, true, ggml_metal_fusion_check_expert_reduce },
     { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv,   {1}, true, ggml_metal_fusion_check_short_conv },
     { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv_add, {1}, true, ggml_metal_fusion_check_short_conv },
     { GGML_METAL_FUSION_SHORT_CONV_RS, ops_short_conv_rs, {1}, true, ggml_metal_fusion_check_short_conv_rs },

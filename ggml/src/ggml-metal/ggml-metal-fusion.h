@@ -20,7 +20,7 @@ struct ggml_metal_device_props;
 
 // the maximum number of nodes that can be fused in a single kernel
 // (also the maximum length of a packed fusion group during graph optimization)
-#define GGML_METAL_FUSION_MAX 16
+#define GGML_METAL_FUSION_MAX 24
 
 typedef enum ggml_metal_fusion_mode {
     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
@@ -52,6 +52,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_REL_BIAS,     // PAD + MUL_MAT + SUB + CONT + GET_ROWS + CONT + ADD + CPY (relative-position bias mask)
     GGML_METAL_FUSION_SHORT_CONV_RS, // CONCAT + SET_ROWS + SSM_CONV + ADD + SCALE (SHORT_CONV whose state keeps rollback slots)
     GGML_METAL_FUSION_EXPERT_SITU,  // EXPERT_SCALE + SITU (the scalar of each expert applied to gate and up inside the activation)
+    GGML_METAL_FUSION_EXPERT_REDUCE, // EXPERT_SCALE + MOE_REDUCE (the scalar of each expert applied inside the weighted sum)
     GGML_METAL_FUSION_CTRL_DOWN,    // CONCAT + RMS_NORM + MUL_MAT (the normalized pair of a loop controller projected to its rank)
     GGML_METAL_FUSION_CTRL_OUT,     // MUL_MAT + MUL_MAT + GATED_MIX (both gates of a loop controller and its output)
 } ggml_metal_fusion_id;

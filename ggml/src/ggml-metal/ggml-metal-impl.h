@@ -768,6 +768,14 @@ typedef struct {
 } ggml_metal_kargs_expert_situ;
 
 typedef struct {
+    int32_t  ne0;     // n_embd
+    int32_t  ne1;     // experts used
+    int32_t  ne2;     // tokens
+    int32_t  pad;
+    uint64_t nb_ids1; // stride of the ids from one token to the next
+} ggml_metal_kargs_expert_reduce;
+
+typedef struct {
     int32_t  nc;       // taps
     int32_t  C;        // channels
     int32_t  n_t;      // tokens per sequence

@@ -632,6 +632,34 @@ kernel void kernel_expert_situ_f32(
     dst[gid] = act*(args.ub*precise::tanh(args.ua*u));
 }
 
+// the weighted sum of the expert outputs, each scaled by the scalar of its expert first:
+//   dst[i, t] = sum_e (x[i, e, t]*s[ids[e, t]])*w[e, t]. dst is not x
+kernel void kernel_expert_reduce_f32(
+        constant ggml_metal_kargs_expert_reduce & args,
+        device const float * x,
+        device const float * s,
+        device const char  * ids,
+        device const float * w,
+        device       float * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int i  = gid.x;
+    const int it = gid.y;
+    if (i >= args.ne0) {
+        return;
+    }
+
+    device const int   * id = (device const int *) (ids + it*args.nb_ids1);
+    device const float * xt = x + (ulong) it*args.ne1*args.ne0 + i;
+    device const float * wt = w + (ulong) it*args.ne1;
+
+    float sum = 0.0f;
+    for (int e = 0; e < args.ne1; ++e) {
+        sum += (xt[(ulong) e*args.ne0]*s[id[e]])*wt[e];
+    }
+
+    dst[(ulong) it*args.ne0 + i] = sum;
+}
+
 // y[i, e, t] = x[i, e, t]*s[ids[e, t]]; dst may be x in place
 kernel void kernel_expert_scale_f32(
         constant ggml_metal_kargs_expert_scale & args,

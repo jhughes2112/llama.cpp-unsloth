@@ -304,6 +304,13 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     {
+        // profiling aid: GGML_METAL_PROFILE_STOP_AT=N leaves out every node from N on (use one command buffer). the GPU
+        // time of the graphs as N grows is what each stretch of nodes costs, and these do add up
+        static const char * stop_at = getenv("GGML_METAL_PROFILE_STOP_AT");
+        if (stop_at && idx >= atoi(stop_at)) {
+            return 1;
+        }
+
         // profiling aid: GGML_METAL_PROFILE_SKIP_OPS=,MUL_MAT,MUL_MAT_ID, leaves the kernels of the named ops out.
         // the results are garbage; with GGML_METAL_PROFILE the GPU time that goes missing is what those kernels cost
         static const char * skip = getenv("GGML_METAL_PROFILE_SKIP_OPS");
@@ -750,6 +757,10 @@ int ggml_metal_op_repeat(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_EXPERT_SITU) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_expert_situ(ctx, idx, n);
+        }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_EXPERT_REDUCE) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_expert_reduce(ctx, idx, n);
         }
     }
     ggml_tensor * op = ctx->node(idx);
@@ -5727,6 +5738,46 @@ int ggml_metal_op_expert_situ(ggml_metal_op_t ctx, int idx, int n) {
     const int     nth   = 256;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return n;
+}
+
+// Dispatch the per-expert scale and the weighted sum of the expert outputs from the matched repeat get_rows mul + reduce run.
+int ggml_metal_op_expert_reduce(ggml_metal_op_t ctx, int idx, int n) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * rep  = ctx->node(idx + 0);
+    const ggml_tensor * rows = ctx->node(idx + 1);
+    const ggml_tensor * mul  = ctx->node(idx + 2);
+    const ggml_tensor * mulw = ctx->node(idx + 3);
+    ggml_tensor *       dst  = ctx->node(idx + n - 1);
+
+    const ggml_tensor * x = mul->src[0];
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n);
+
+    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_expert_reduce_f32");
+
+    ggml_metal_kargs_expert_reduce args = {
+        /*.ne0     =*/ (int32_t) x->ne[0],
+        /*.ne1     =*/ (int32_t) x->ne[1],
+        /*.ne2     =*/ (int32_t) x->ne[2],
+        /*.pad     =*/ 0,
+        /*.nb_ids1 =*/ rows->src[1]->nb[1],
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),            1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rep->src[0]),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rows->src[1]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mulw->src[1]), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),          5);
+
+    const int nth = 256;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + nth - 1)/nth, args.ne2, 1, nth, 1, 1);
 
     return n;
 }
