@@ -303,6 +303,19 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    {
+        // profiling aid: GGML_METAL_PROFILE_SKIP_OPS=,MUL_MAT,MUL_MAT_ID, leaves the kernels of the named ops out.
+        // the results are garbage; with GGML_METAL_PROFILE the GPU time that goes missing is what those kernels cost
+        static const char * skip = getenv("GGML_METAL_PROFILE_SKIP_OPS");
+        if (skip) {
+            char key[64];
+            snprintf(key, sizeof(key), ",%s,", ggml_op_name(node->op));
+            if (strstr(skip, key)) {
+                return 1;
+            }
+        }
+    }
+
     switch (node->op) {
         case GGML_OP_CONCAT:
             {
