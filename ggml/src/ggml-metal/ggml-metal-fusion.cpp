@@ -976,7 +976,8 @@ static bool ggml_metal_fusion_check_expert_scale(
         return false;
     }
 
-    if (!ggml_is_contiguous(s) || !ggml_is_contiguous(ids) || !ggml_is_contiguous(x) || !ggml_is_contiguous(mul) ||
+    // the ids of a token are dense; from one token to the next they can be strided (the top of a longer sorted row)
+    if (!ggml_is_contiguous(s) || ids->nb[0] != sizeof(int32_t) || !ggml_is_contiguous(x) || !ggml_is_contiguous(mul) ||
         rep->view_src != nullptr || rows->view_src != nullptr || mul->view_src != nullptr) {
         return false;
     }

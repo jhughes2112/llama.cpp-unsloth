@@ -606,7 +606,7 @@ kernel void kernel_expert_scale_f32(
         constant ggml_metal_kargs_expert_scale & args,
         device const float * x,
         device const float * s,
-        device const int   * ids,
+        device const char  * ids,
         device       float * dst,
         uint gid [[thread_position_in_grid]]) {
     const uint n = (uint) args.ne0*args.ne1*args.ne2;
@@ -614,7 +614,13 @@ kernel void kernel_expert_scale_f32(
         return;
     }
 
-    dst[gid] = x[gid]*s[ids[gid/args.ne0]];
+    const uint r  = gid/args.ne0;
+    const uint ie = r%args.ne1;
+    const uint it = r/args.ne1;
+
+    const int id = ((device const int *) (ids + it*args.nb_ids1))[ie];
+
+    dst[gid] = x[gid]*s[id];
 }
 // short causal convolution with its recurrent state, one thread per channel and sequence:
 //   y[c, t] = s*(cur[c, t] + sum_j w[j, c]*x[t + j, c]) + b, x = [past[0 .. nc - 2, c], cur[c, 0 .. n_t - 1]],

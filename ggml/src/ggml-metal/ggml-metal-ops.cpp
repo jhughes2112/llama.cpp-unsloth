@@ -5653,6 +5653,8 @@ int ggml_metal_op_expert_scale(ggml_metal_op_t ctx, int idx, int n) {
         /*.ne0 =*/ (int32_t) x->ne[0],
         /*.ne1 =*/ (int32_t) x->ne[1],
         /*.ne2 =*/ (int32_t) x->ne[2],
+        /*.pad =*/ 0,
+        /*.nb_ids1 =*/ rows->src[1]->nb[1],
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);

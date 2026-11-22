@@ -748,6 +748,8 @@ typedef struct {
     int32_t ne0;
     int32_t ne1; // experts used
     int32_t ne2; // tokens
+    int32_t pad;
+    uint64_t nb_ids1; // stride of the ids from one token to the next
 } ggml_metal_kargs_expert_scale;
 
 typedef struct {
