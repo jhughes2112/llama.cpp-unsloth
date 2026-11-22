@@ -1108,6 +1108,7 @@ kernel void kernel_clip_rel_table_f32(
         device const float * sink,
         device const float * w,
         device       float * dst,
+        device const float * tau,
         uint3 gid [[thread_position_in_grid]]) {
     const int p  = gid.x;
     const int it = gid.y;
@@ -1131,6 +1132,10 @@ kernel void kernel_clip_rel_table_f32(
         }
 
         sumf *= clamp(args.c/(args.s*sqrt(ss) + args.b), args.lo, args.hi);
+
+        if (args.has_tau) {
+            sumf *= tau[it];
+        }
     }
 
     dst[((ulong) it*args.n_head + ih)*(args.nc + 1) + p] = sumf - sink[it*args.n_head + ih];

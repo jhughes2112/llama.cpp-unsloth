@@ -2458,7 +2458,10 @@ static bool ggml_metal_fusion_check_clip_rel_table(
     const int n_raw = (int) fusion->ops_all.size();
 
     const int raw0 = node_idxs[idx];
-    if (n != 12 || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+    // with a factor a token on the clipped features: a MUL behind the clip
+    const int o = n - 12;
+
+    if ((o != 0 && o != 1) || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
         return false;
     }
 
@@ -2476,18 +2479,27 @@ static bool ggml_metal_fusion_check_clip_rel_table(
         return false;
     }
 
-    const ggml_tensor * pad    = nodes[9];
-    const ggml_tensor * mm     = nodes[10];
-    const ggml_tensor * sub    = nodes[11];
-    const ggml_tensor * sink_r = gf->nodes[raw0 + 11]; // sinks as [1, H, T]
+    const ggml_tensor * pad    = nodes[9 + o];
+    const ggml_tensor * mm     = nodes[10 + o];
+    const ggml_tensor * sub    = nodes[11 + o];
+    const ggml_tensor * sink_r = gf->nodes[raw0 + 11 + o]; // sinks as [1, H, T]
 
     const ggml_tensor * in   = nodes[0]->src[0];
     const ggml_tensor * w    = nodes[0]->src[1];
     const ggml_tensor * bias = pad->src[0];
     const ggml_tensor * R    = mm->src[1];
 
-    if (mm->src[0] != pad || R != nodes[8] || sub->src[0] != mm || sub->src[1] != sink_r) {
+    if (mm->src[0] != pad || R != nodes[8 + o] || sub->src[0] != mm || sub->src[1] != sink_r) {
         return false;
+    }
+
+    if (o) {
+        const ggml_tensor * tmul = nodes[9];
+        const ggml_tensor * tau  = tmul->src[1];
+        if (tmul->src[0] != nodes[8] || tmul->view_src != nullptr || tmul->type != GGML_TYPE_F32 || !ggml_are_same_shape(tmul, nodes[8]) ||
+            tau->type != GGML_TYPE_F32 || !ggml_is_contiguous(tau) || tau->ne[0] != 1 || tau->ne[1] != 1 || tau->ne[2] != tmul->ne[2] || tau->ne[3] != 1) {
+            return false;
+        }
     }
 
     for (const ggml_tensor * t : { pad, mm, sub, bias, sink_r }) {
@@ -2520,7 +2532,7 @@ static bool ggml_metal_fusion_check_clip_rel_table(
     }
 
     // outputs: the table; the reshape of the sinks is a view of an input
-    const int outputs[2] = { raw0 + n_raw - 1, raw0 + 11 };
+    const int outputs[2] = { raw0 + n_raw - 1, raw0 + 11 + o };
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 2);
 }
@@ -2631,6 +2643,10 @@ static const std::vector<ggml_op> ops_reduce_conv = {
 };
 static const std::vector<ggml_op> ops_softcap = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_CONT };
 static const std::vector<ggml_op> ops_fa_gate = { GGML_OP_FLASH_ATTN_EXT, GGML_OP_RESHAPE, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_clip_rel_table_tau = {
+    GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
+    GGML_OP_MUL, GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB
+};
 static const std::vector<ggml_op> ops_clip_rel_table = {
     GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
     GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB
@@ -2738,6 +2754,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(1, 1), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
     { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(1, 2), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
     { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(1, 3), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
+    { GGML_METAL_FUSION_CLIP_REL_TABLE, ops_clip_rel_table_tau, {}, true, ggml_metal_fusion_check_clip_rel_table },
     { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(0), {}, true, ggml_metal_fusion_check_gather_fa },
     { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(1), {}, true, ggml_metal_fusion_check_gather_fa },
     { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(2), {}, true, ggml_metal_fusion_check_gather_fa },
