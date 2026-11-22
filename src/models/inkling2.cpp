@@ -410,6 +410,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 ggml_tensor * q_attn = ggml_view_2d(ctx0, model.loop_res_query,    n_embd, 2, model.loop_res_query->nb[1],    row*model.loop_res_query->nb[1]);
                 ggml_tensor * q_kv   = ggml_view_2d(ctx0, model.loop_kv_res_query, n_embd, 2, model.loop_kv_res_query->nb[1], row*model.loop_kv_res_query->nb[1]);
 
+                // (the views of the queries first, order only: each mix is then one run of nodes that backends can fuse)
+                ggml_build_forward_order(gf, q_attn);
+                ggml_build_forward_order(gf, q_kv);
                 // rows: (attn, mlp) and (k, v)
                 ggml_tensor * m_attn = mix(bank, bank_last, q_attn);
                 ggml_tensor * m_kv   = mix(bank, bank_last, q_kv);

@@ -620,6 +620,22 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
     }
 
     int res = ggml_metal_op_encode_impl(ctx, idx);
+
+    {
+        // profiling aid: GGML_METAL_PROFILE_DUP=,CONCAT*8,MUL_MAT*1, runs the kernels of the named ops (with the number
+        // of nodes they fuse) a second time, as a serial step of their own. the results are garbage; the GPU time this
+        // adds, over the number of kernels it adds, is what one such kernel costs where it is
+        static const char * dup = getenv("GGML_METAL_PROFILE_DUP");
+        if (dup && res > 0 && !ggml_is_empty(ctx->node(idx)) && !ggml_op_is_empty(ctx->node(idx)->op)) {
+            char key[64];
+            snprintf(key, sizeof(key), ",%s*%d,", ggml_op_name(ctx->node(idx)->op), res);
+            if (strstr(dup, key)) {
+                ggml_metal_op_concurrency_reset(ctx);
+                ggml_metal_op_encode_impl(ctx, idx);
+            }
+        }
+    }
+
     if (idx + res > ctx->n_nodes()) {
         GGML_ABORT("fusion error: nodes spanning multiple encoders have been fused. this indicates a bug in the fusion logic %s",
                 "https://github.com/ggml-org/llama.cpp/pull/14849");
