@@ -2156,6 +2156,61 @@ static bool ggml_metal_fusion_check_softcap(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
 }
 
+extern "C" bool ggml_metal_op_flash_attn_ext_reduces(const struct ggml_tensor * op); // ggml-metal-ops.cpp
+
+// FLASH_ATTN_EXT [RESHAPE] MUL: the attention output times a gate of its shape. for one or a few queries the attention
+// ends in a kernel that reduces its workgroups: it writes the gated result, and the attention output is never stored
+static bool ggml_metal_fusion_check_fa_gate(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * fa   = nodes[0];
+    const ggml_tensor * mul  = nodes[1];
+    const ggml_tensor * resh = gf->nodes[raw0 + 1];
+
+    static const bool off = getenv("GGML_METAL_NO_FA_GATE") != nullptr;
+    if (off) {
+        return false;
+    }
+
+    if (resh->view_src != fa || (mul->src[0] == resh) == (mul->src[1] == resh) || !ggml_metal_op_flash_attn_ext_reduces(fa)) {
+        return false;
+    }
+
+    const ggml_tensor * gate = mul->src[0] == resh ? mul->src[1] : mul->src[0];
+
+    if (fa->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        fa->view_src != nullptr || mul->view_src != nullptr || !ggml_is_contiguous(fa) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(gate) ||
+        ggml_nelements(mul) != ggml_nelements(fa) || ggml_nelements(gate) != ggml_nelements(fa) || !ggml_are_same_shape(mul, resh)) {
+        return false;
+    }
+
+    const int outputs[1] = { raw0 + n_raw - 1 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -2261,6 +2316,7 @@ static const std::vector<ggml_op> ops_reduce_conv = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD
 };
 static const std::vector<ggml_op> ops_softcap = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_CONT };
+static const std::vector<ggml_op> ops_fa_gate = { GGML_OP_FLASH_ATTN_EXT, GGML_OP_RESHAPE, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_clip_rel_bias = {
     GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
     GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
@@ -2354,6 +2410,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
     { GGML_METAL_FUSION_CLIP_REL_BIAS, ops_clip_rel_bias, {}, true, ggml_metal_fusion_check_clip_rel_bias },
+    { GGML_METAL_FUSION_FA_GATE, ops_fa_gate, {}, true, ggml_metal_fusion_check_fa_gate },
     { GGML_METAL_FUSION_SOFTCAP, ops_softcap, {}, true, ggml_metal_fusion_check_softcap },
     { GGML_METAL_FUSION_REDUCE_CONV, ops_reduce_conv, {12}, true, ggml_metal_fusion_check_reduce_conv },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },

@@ -498,7 +498,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
             // the projections of the layer input first (order only): they are independent, so a backend can run them
             // together, and the two convolutions after them
-            for (ggml_tensor * t : {Qcur, Kcur, Vcur, Rcur, Ktap, Vtap}) {
+            // (and the gate of the attention output: it is ready when the attention is, so a backend can apply it there)
+            ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0]));
+
+            for (ggml_tensor * t : {Qcur, Kcur, Vcur, Rcur, Ktap, Vtap, gate}) {
                 if (t) {
                     ggml_build_forward_order(gf, t);
                 }
@@ -673,7 +676,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 cur = n_rows_max >= n_seq_tokens ? outs[0] : ggml_reshape_2d(ctx0, outs[0], outs[0]->ne[0], n_tokens);
             }
 
-            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+            cur = ggml_mul(ctx0, cur, gate);
+            // right behind the attention (order only), so that backends can fuse the gate into it
+            ggml_build_forward_order(gf, cur);
             cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
             cb(cur, "attn_out", il);
         }

@@ -3776,8 +3776,25 @@ size_t ggml_metal_op_flash_attn_ext_extra_rows(const ggml_tensor * op) {
     return k_size + v_size;
 }
 
+bool ggml_metal_op_flash_attn_ext_reduces(const ggml_tensor * op) {
+    return op->op == GGML_OP_FLASH_ATTN_EXT && ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op) == 0 &&
+        !ggml_metal_op_flash_attn_ext_use_tensor(op, true) && ggml_metal_op_flash_attn_ext_use_vec(op);
+}
+
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    // FA_GATE: the MUL behind the attention by a gate, applied by the reduce kernel
+    int n_gate = 1;
+    const ggml_tensor * gate_mul = nullptr;
+    if (ctx->use_fusion()) {
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_gate);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_FA_GATE) {
+            gate_mul = ctx->node(idx + 1);
+        } else {
+            n_gate = 1;
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -4477,6 +4494,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 }
             }
         } else {
+            // (one workgroup would write the result itself, with no temporary and no reduce kernel behind it, but
+            // measured slower for one token of Inkling 2 Mini at a short context: 8.83 against 8.72 ms)
             nwg = 32;
             nsg = 1;
             while (2*nwg*nsg*ncpsg < ne11_attn && nsg < 4) {
@@ -4577,16 +4596,26 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
                 ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = {
                     nrows,
+                    gate_mul ? 1 : 0,
                 };
+
+                // the other operand of the MUL: the first is a reshape of the attention output
+                const ggml_tensor * gate = !gate_mul ? nullptr :
+                    (gate_mul->src[0]->view_src == op || gate_mul->src[0] == op) ? gate_mul->src[1] : gate_mul->src[0];
 
                 auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
-                ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+                ggml_metal_encoder_set_buffer  (enc, gate_mul ? ggml_metal_get_buffer_id(gate_mul) : bid_dst, 2);
+                ggml_metal_encoder_set_buffer  (enc, gate ? ggml_metal_get_buffer_id(gate) : bid_dst, 3);
 
                 ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+
+                if (gate_mul) {
+                    return n_gate;
+                }
             }
         }
     }

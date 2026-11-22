@@ -365,6 +365,7 @@ kernel void kernel_flash_attn_ext_vec_reduce(
         constant ggml_metal_kargs_flash_attn_ext_vec_reduce & args,
         device  const char * htmp,
         device        char * dst,
+        device  const char * gate,
         uint   tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
@@ -390,12 +391,14 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
     device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+    device const float4 * gate4 = (device const float4 *) gate + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG) {
         const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
 
         if (iwg == 0) {
-            dst4[i] = v*S;
+            // with a gate the attention output itself is never written
+            dst4[i] = args.has_gate ? v*S*gate4[i] : v*S;
         }
     }
 

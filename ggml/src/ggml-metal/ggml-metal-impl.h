@@ -525,6 +525,7 @@ typedef struct {
 
 typedef struct {
     int32_t  nrows;
+    int32_t  has_gate; // multiply the result by a gate of its shape
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
 
 typedef struct {
