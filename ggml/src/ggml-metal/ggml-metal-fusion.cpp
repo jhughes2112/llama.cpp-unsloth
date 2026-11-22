@@ -1822,6 +1822,8 @@ static bool ggml_metal_fusion_check_ctrl_out(
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
 }
+static bool ggml_metal_fusion_gather_fa_follows(const ggml_cgraph * gf, const ggml_tensor * table, int raw, ggml_metal_fusion_mode mode);
+
 static bool ggml_metal_fusion_rel_bias_core(const ggml_tensor * const * nodes, const ggml_cgraph * gf, int raw0) {
     const ggml_tensor * pad   = nodes[0];
     const ggml_tensor * mm    = nodes[1];
@@ -1921,13 +1923,16 @@ static bool ggml_metal_fusion_check_rel_bias(
         return false;
     }
 
+    // the attention behind looks the bias up in the table itself: the table (pad, mul_mat, sub) is all it needs
+    if (ggml_metal_fusion_gather_fa_follows(gf, gf->nodes[raw0 + 3], raw0 + 4, mode)) {
+        return false;
+    }
+
     // outputs: the mask; the reshape of the sinks is a view of an input
     const int outputs[2] = { raw0 + n_raw - 1, raw0 + 2 };
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 2);
 }
-static bool ggml_metal_fusion_gather_fa_follows(const ggml_cgraph * gf, int raw, ggml_metal_fusion_mode mode);
-
 // L2_CLIP (with its weight) + REL_BIAS: the clip of the relative features of a query and the bias mask made of them.
 // a thread of the mask clips its head again (16 features), so the two are one step
 static bool ggml_metal_fusion_check_clip_rel_bias(
@@ -1960,7 +1965,7 @@ static bool ggml_metal_fusion_check_clip_rel_bias(
     }
 
     // the attention behind looks the bias up in the table itself: CLIP_REL_TABLE makes the table
-    if (ggml_metal_fusion_gather_fa_follows(gf, raw0 + 13, mode)) {
+    if (ggml_metal_fusion_gather_fa_follows(gf, gf->nodes[raw0 + 12], raw0 + 13, mode)) {
         return false;
     }
 
@@ -2366,7 +2371,7 @@ static bool ggml_metal_fusion_check_clip_rel_table(
         }
     }
 
-    if (!ggml_metal_fusion_l2_clip_core(nodes, 9) || !ggml_metal_fusion_gather_fa_follows(gf, raw0 + n_raw, mode)) {
+    if (!ggml_metal_fusion_l2_clip_core(nodes, 9) || !ggml_metal_fusion_gather_fa_follows(gf, gf->nodes[raw0 + n_raw - 1], raw0 + n_raw, mode)) {
         return false;
     }
 
@@ -2661,26 +2666,35 @@ static const ggml_metal_fusion * ggml_metal_fusion_find(ggml_metal_fusion_id id,
     return nullptr;
 }
 
-// true if the nodes from raw on (the views between them aside) are a GATHER_FA run
-static bool ggml_metal_fusion_gather_fa_follows(const ggml_cgraph * gf, int raw, ggml_metal_fusion_mode mode) {
-    const ggml_tensor * nodes[7];
-    int idxs[7];
-    int n = 0;
-    for (int i = raw; i < gf->n_nodes && n < 7; ++i) {
-        if (!ggml_op_is_empty(gf->nodes[i]->op)) {
-            nodes[n] = gf->nodes[i];
-            idxs[n]  = i;
-            n++;
+// true if a GATHER_FA run reads this bias table. the run is looked for among the next nodes: where the graph is ordered
+// by depth it is in the level after the table, not right behind it
+static bool ggml_metal_fusion_gather_fa_follows(const ggml_cgraph * gf, const ggml_tensor * table, int raw, ggml_metal_fusion_mode mode) {
+    for (int i0 = raw; i0 < gf->n_nodes && i0 < raw + 512; ++i0) {
+        const ggml_tensor * cont = gf->nodes[i0];
+        if (cont->op != GGML_OP_CONT || cont->src[0] == nullptr || cont->src[0]->op != GGML_OP_PERMUTE || cont->src[0]->view_src != table) {
+            continue;
         }
-    }
-    if (n < 7) {
-        return false;
-    }
 
-    for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
-        if (fusion.id == GGML_METAL_FUSION_GATHER_FA && fusion.check(&fusion, nodes, gf, idxs, 0, mode)) {
-            return true;
+        const ggml_tensor * nodes[7];
+        int idxs[7];
+        int n = 0;
+        for (int i = i0; i < gf->n_nodes && n < 7; ++i) {
+            if (!ggml_op_is_empty(gf->nodes[i]->op)) {
+                nodes[n] = gf->nodes[i];
+                idxs[n]  = i;
+                n++;
+            }
         }
+        if (n < 7) {
+            return false;
+        }
+
+        for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            if (fusion.id == GGML_METAL_FUSION_GATHER_FA && fusion.check(&fusion, nodes, gf, idxs, 0, mode)) {
+                return true;
+            }
+        }
+        return false;
     }
     return false;
 }
@@ -2716,8 +2730,12 @@ static void ggml_metal_fusion_add_pattern_alloc_deps(
         ggml_tensor * node = gf->nodes[node_idx + j];
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
             ggml_tensor * src = node->src[s];
-            if (src && seen.insert(src).second) {
-                add_alloc_dep(user_data, src, gf->nodes[last_node]);
+            // an input read through a view: the tensor under the view has to stay as well. its own last use can be
+            // the first node of the run, and its memory would go to a tensor of the run that the kernel writes
+            for (ggml_tensor * t = src; t != nullptr; t = t->view_src) {
+                if (seen.insert(t).second) {
+                    add_alloc_dep(user_data, t, gf->nodes[last_node]);
+                }
             }
         }
         seen.insert(node);
@@ -2728,23 +2746,14 @@ void ggml_metal_fusion_add_alloc_deps(
         void * user_data,
         void (*add_alloc_dep)(void *, ggml_tensor *, ggml_tensor *),
         ggml_cgraph * gf) {
+    // which pattern the encoder takes at a node depends on its checks, and a pattern can yield to one that starts
+    // inside its run. so the inputs are kept for every pattern whose ops match, at every node: taking only the
+    // longest and skipping its run left the run of the pattern actually encoded without its inputs
     for (int i = 0; i < gf->n_nodes; ++i) {
-        const ggml_metal_fusion * best = nullptr;
-        int best_raw = 0;
-
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
-            if ((int) fusion.ops_all.size() <= best_raw) {
-                continue;
-            }
             if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {
-                best = &fusion;
-                best_raw = (int) fusion.ops_all.size();
+                ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, &fusion, i);
             }
-        }
-
-        if (best) {
-            ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, best, i);
-            i += best_raw - 1;
         }
     }
 }
