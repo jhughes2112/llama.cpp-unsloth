@@ -1614,6 +1614,24 @@ public:
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
             // bonus-anchor drafts read the mask positions only, like DFlash
             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
+            if (getenv("LLAMA_DRAFT_TOPK_DEBUG")) {
+                // measurement only: the four most likely first draft tokens, to compare with what the target then produces
+                const float * lg = llama_get_logits_ith(ctx_dft, beg + i_draft_beg);
+                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                int   top[4] = { -1, -1, -1, -1 };
+                float val[4] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY };
+                for (int t = 0; lg && t < n_vocab; ++t) {
+                    for (int k = 0; k < 4; ++k) {
+                        if (lg[t] > val[k]) {
+                            for (int j = 3; j > k; --j) { top[j] = top[j - 1]; val[j] = val[j - 1]; }
+                            top[k] = t; val[k] = lg[t];
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "DRAFT_TOPK %d %d %d %d %d %d %.3f %.3f\n", (int) dp.pos0, (int) dp.id_last, top[0], top[1], top[2], top[3], val[0], val[1]);
+            }
+
             for (int32_t i = i_draft_beg; i < std::min(n_block_tokens, i_draft_beg + params.n_max); ++i) {
                 const int32_t idx = beg + i;
 

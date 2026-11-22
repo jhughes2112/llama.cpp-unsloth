@@ -2561,6 +2561,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+    if (getenv("LLAMA_MOE_OVERLAP_DEBUG")) {
+        // measurement only: keep the ids readable after the graph has run
+        ggml_set_output(selected_experts->view_src ? selected_experts->view_src : selected_experts);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented

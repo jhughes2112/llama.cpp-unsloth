@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <set>
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -1928,6 +1929,39 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    if (getenv("LLAMA_MOE_OVERLAP_DEBUG")) {
+        // measurement only: how many distinct experts the tokens of a batch select in a layer, against one set a token
+        static int64_t n_sel = 0, n_unique = 0, n_layers = 0, n_tok = 0;
+        auto * g = res->get_gf();
+        for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+            ggml_tensor * t = ggml_graph_node(g, i);
+            if (strncmp(t->name, "ffn_moe_topk", 12) != 0) {
+                continue;
+            }
+            if (t->type != GGML_TYPE_I32) {
+                continue;
+            }
+            // the ids of a token are the head of its column of the sorted row
+            const ggml_tensor * root = t->view_src ? t->view_src : t;
+            std::vector<int32_t> all(ggml_nbytes(root)/sizeof(int32_t));
+            ggml_backend_tensor_get(root, all.data(), 0, ggml_nbytes(root));
+            std::set<int32_t> uniq;
+            for (int64_t j = 0; j < t->ne[1]; ++j) {
+                const int32_t * col = (const int32_t *) ((const char *) all.data() + t->view_offs + j*t->nb[1]);
+                uniq.insert(col, col + t->ne[0]);
+            }
+            n_sel    += t->ne[0]*t->ne[1];
+            n_unique += (int64_t) uniq.size();
+            n_tok    += t->ne[1];
+            n_layers++;
+        }
+        static int n_calls = 0;
+        if (++n_calls % 40 == 0 && n_layers > 0) {
+            fprintf(stderr, "moe overlap: %.2f tokens a batch, %.1f selections and %.1f distinct experts a layer pass (%.0f%% of the reads)\n",
+                    (double) n_tok/n_layers, (double) n_sel/n_layers, (double) n_unique/n_layers, 100.0*n_unique/n_sel);
+        }
+    }
 
     return res;
 }
