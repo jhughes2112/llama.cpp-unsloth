@@ -72,6 +72,20 @@ typedef void * ggml_metal_cmd_buf_t;
 
 typedef struct ggml_metal_encoder * ggml_metal_encoder_t;
 
+// the kernels of a graph recorded in an indirect command buffer, to execute again without encoding them
+typedef struct ggml_metal_recording * ggml_metal_recording_t;
+
+ggml_metal_recording_t ggml_metal_recording_init(ggml_metal_device_t dev, int n_max);
+void ggml_metal_recording_free(ggml_metal_recording_t rec);
+
+// the next encoder that is made on this thread records
+void ggml_metal_recording_begin(ggml_metal_recording_t rec);
+
+bool ggml_metal_recording_ok(ggml_metal_recording_t rec);
+int  ggml_metal_recording_n (ggml_metal_recording_t rec);
+
+void ggml_metal_recording_replay(ggml_metal_recording_t rec, ggml_metal_cmd_buf_t cmd_buf);
+
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent);
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder);
 

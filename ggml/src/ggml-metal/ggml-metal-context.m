@@ -30,6 +30,8 @@ static _Atomic int64_t g_profile_bucket_graphs[GGML_METAL_PROFILE_BUCKETS];
 static _Atomic int64_t g_profile_bucket_gpu_ns[GGML_METAL_PROFILE_BUCKETS];
 static _Atomic int64_t g_profile_gap_graph_ns = 0;
 static _Atomic int64_t g_profile_gap_cb_ns    = 0;
+static _Atomic int64_t g_profile_n_recorded   = 0;
+static _Atomic int64_t g_profile_n_replayed   = 0;
 
 static int ggml_metal_profile_bucket(int n_nodes) {
     for (int i = 0; i < GGML_METAL_PROFILE_BUCKETS; ++i) {
@@ -151,6 +153,22 @@ struct ggml_metal {
     // if Metal released them, it would do so on a Metal-internal thread without an autorelease pool, which could cause leaks
     NSMutableArray * buf_refs;
 
+    // the kernels of the last graph, recorded to be executed again without encoding (see ggml_metal_recording).
+    // a graph is the same as long as it has not gone through ggml_metal_graph_optimize again, which every graph that is
+    // built or allocated does: graph_gen counts those
+    bool     use_replay;
+    uint64_t graph_gen;
+    ggml_metal_recording_t rec;
+    void *   rec_nodes; // identity of the recorded graph: its node array, node count and generation
+    int      rec_n_nodes;
+    uint64_t rec_gen;
+    uint64_t rec_hash;
+    void *   seen_nodes; // of the last graph that was encoded: one that comes back is worth recording
+    int      seen_n_nodes;
+    uint64_t seen_gen;
+    uint64_t seen_hash;
+    bool     seen_failed;
+
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
 
@@ -263,6 +281,10 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->cmd_bufs_ext = [[NSMutableArray alloc] init];
         res->buf_refs     = [[NSMutableArray alloc] init];
 
+        // GGML_METAL_REPLAY_DISABLE: encode every graph. captures and fusion statistics need the encoders too
+        res->use_replay = getenv("GGML_METAL_REPLAY_DISABLE") == NULL && getenv("GGML_METAL_CAPTURE_COMPUTE") == NULL &&
+            !ggml_metal_fusion_info_stats(res->finfo);
+
         res->cmd_buf_last = nil;
 
         res->pipelines_ext = ggml_metal_pipelines_init();
@@ -294,6 +316,9 @@ void ggml_metal_free(ggml_metal_t ctx) {
         [ctx->buf_refs release];
     }
 
+    ggml_metal_recording_free(ctx->rec);
+    ctx->rec = NULL;
+
     if (ctx->pipelines_ext) {
         ggml_metal_pipelines_free(ctx->pipelines_ext);
         ctx->pipelines_ext = nil;
@@ -307,6 +332,7 @@ void ggml_metal_free(ggml_metal_t ctx) {
                         g_profile_bucket_gpu_ns[i]/1e6, g_profile_bucket_gpu_ns[i]/1e6/g_profile_bucket_graphs[i]);
             }
         }
+        fprintf(stderr, "ggml_metal_free: profile: %lld graphs recorded, %lld executed from a recording\n", (long long) g_profile_n_recorded, (long long) g_profile_n_replayed);
         fprintf(stderr, "ggml_metal_free: profile: GPU idle between graphs %.1f ms, between the command buffers of a graph %.1f ms\n",
                 g_profile_gap_graph_ns/1e6, g_profile_gap_cb_ns/1e6);
         int64_t barriers, depth, kernels;
@@ -567,6 +593,27 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// what the kernels encoded for a graph depend on, folded to one number: its nodes, where they are allocated, their
+// shapes and their parameters. a graph that did not go through ggml_metal_graph_optimize keeps all of this, but a
+// caller that computes graphs without a scheduler reuses node memory for another graph without telling the backend
+static uint64_t ggml_metal_graph_identity(const struct ggml_cgraph * gf) {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const struct ggml_tensor * t = gf->nodes[i];
+        uint64_t p[8];
+        memcpy(p, t->op_params, sizeof(p));
+        uint64_t x = (uint64_t) (uintptr_t) t ^ ((uint64_t) (uintptr_t) t->data << 1) ^ ((uint64_t) t->view_offs << 3) ^
+            ((uint64_t) t->op << 56) ^ ((uint64_t) t->type << 48) ^ ((uint64_t) (t->flags & GGML_TENSOR_FLAG_COMPUTE) << 40) ^
+            ((uint64_t) t->ne[0] << 8) ^ ((uint64_t) t->ne[1] << 24) ^ ((uint64_t) t->ne[2] << 36) ^ ((uint64_t) t->ne[3] << 44) ^
+            p[0] ^ (p[1] << 7) ^ (p[2] << 13) ^ (p[3] << 19) ^ (p[4] << 23) ^ (p[5] << 29) ^ (p[6] << 31) ^ (p[7] << 37);
+        for (int j = 0; j < GGML_MAX_SRC && t->src[j]; ++j) {
+            x ^= ((uint64_t) (uintptr_t) t->src[j] << (5 + 3*j)) ^ ((uint64_t) (uintptr_t) t->src[j]->data >> 2);
+        }
+        h = (h ^ x)*1099511628211ull;
+    }
+    return h;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -597,6 +644,99 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // each thread creates it's own command buffer and enqueues the ops in parallel
     //
     // tests on M1 Pro and M2 Ultra using LLaMA models, show that optimal values for n_cb are 1 or 2
+
+    if (ctx->use_replay && ctx->abort_callback == NULL) {
+        const uint64_t hash = ggml_metal_graph_identity(gf);
+
+        const bool recorded = ctx->rec != NULL && ctx->rec_hash == hash &&
+            ctx->rec_nodes == (void *) gf->nodes && ctx->rec_n_nodes == gf->n_nodes && ctx->rec_gen == ctx->graph_gen;
+        // GGML_METAL_REPLAY_FORCE: record every graph the first time it is seen (to test the recording itself)
+        static int force = -1;
+        if (force < 0) {
+            force = getenv("GGML_METAL_REPLAY_FORCE") != NULL;
+        }
+        const bool seen = force || (ctx->seen_hash == hash &&
+            ctx->seen_nodes == (void *) gf->nodes && ctx->seen_n_nodes == gf->n_nodes && ctx->seen_gen == ctx->graph_gen);
+
+        if (!recorded && seen && !ctx->seen_failed) {
+            // the second time in a row: record it, on this thread, with the encoders of the ops as they are
+            @autoreleasepool {
+                ggml_metal_recording_free(ctx->rec);
+                ctx->rec = ggml_metal_recording_init(ctx->dev, MIN(gf->n_nodes, 16384));
+
+                ctx->gf = gf;
+
+                ggml_metal_recording_begin(ctx->rec);
+                ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, NULL, gf, ctx->finfo, 0, gf->n_nodes, ctx->use_concurrency, false, ctx->debug_graph);
+
+                for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                    const int res = ggml_metal_op_encode(ctx_op, idx);
+                    if (res == 0) {
+                        break;
+                    }
+                    idx += res - 1;
+                }
+
+                ggml_metal_op_free(ctx_op);
+
+                if (ggml_metal_recording_ok(ctx->rec)) {
+                    ctx->rec_nodes   = (void *) gf->nodes;
+                    ctx->rec_n_nodes = gf->n_nodes;
+                    ctx->rec_gen     = ctx->graph_gen;
+                    ctx->rec_hash    = hash;
+                    atomic_fetch_add(&g_profile_n_recorded, 1);
+                } else {
+                    ggml_metal_recording_free(ctx->rec);
+                    ctx->rec = NULL;
+                    ctx->seen_failed = true;
+                }
+            }
+        }
+
+        if (ctx->rec != NULL && ctx->rec_hash == hash &&
+            ctx->rec_nodes == (void *) gf->nodes && ctx->rec_n_nodes == gf->n_nodes && ctx->rec_gen == ctx->graph_gen) {
+            @autoreleasepool {
+                ctx->gf = gf;
+
+                ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+                id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+                id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+                [cmd_buf retain];
+
+                // one command buffer for the graph, in the slot of the main thread
+                for (int i = 0; i <= ctx->n_cb; ++i) {
+                    if (ctx->cmd_bufs[i].obj) {
+                        [ctx->cmd_bufs[i].obj release];
+                        ctx->cmd_bufs[i].obj = nil;
+                    }
+                }
+                ctx->cmd_bufs[ctx->n_cb].obj = cmd_buf;
+
+                ggml_metal_profile_cmd_buf(cmd_buf);
+                ggml_metal_profile_cmd_buf_graph(cmd_buf, gf->n_nodes, true);
+                atomic_fetch_add(&g_profile_n_graphs, 1);
+                atomic_fetch_add(&g_profile_n_replayed, 1);
+
+                ggml_metal_recording_replay(ctx->rec, cmd_buf);
+
+                [cmd_buf commit];
+
+                ctx->cmd_buf_last = cmd_buf;
+            }
+
+            return GGML_STATUS_SUCCESS;
+        }
+
+        if (!seen) {
+            ctx->seen_nodes   = (void *) gf->nodes;
+            ctx->seen_n_nodes = gf->n_nodes;
+            ctx->seen_gen     = ctx->graph_gen;
+            ctx->seen_hash    = hash;
+            ctx->seen_failed  = false;
+        }
+    }
 
     @autoreleasepool {
         ctx->gf = gf;
@@ -795,6 +935,9 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->use_graph_optimize) {
         ggml_graph_optimize(gf);
     }
+
+    // a graph that comes through here is new or was allocated again: what was recorded for it no longer holds
+    ctx->graph_gen++;
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
 }

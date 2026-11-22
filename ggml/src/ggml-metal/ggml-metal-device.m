@@ -11,6 +11,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <unistd.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -828,7 +829,14 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         }
 
         id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
-        id<MTLComputePipelineState> obj = [device newComputePipelineStateWithFunction:mtl_function error:&error];
+        // usable from an indirect command buffer too: see ggml_metal_recording
+        MTLComputePipelineDescriptor * desc = [[MTLComputePipelineDescriptor alloc] init];
+        desc.computeFunction = mtl_function;
+        desc.supportIndirectCommandBuffers = YES;
+
+        id<MTLComputePipelineState> obj = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
+
+        [desc release];
 
         [mtl_function release];
 
@@ -873,12 +881,188 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 // MTLComputeCommandEncoder wrapper
 //
 
+// a graph that is computed again with the same nodes encodes the same kernels with the same buffers and arguments:
+// only the contents of the buffers changed. the kernels are recorded once in an indirect command buffer and executed
+// from it after that with one call, instead of being encoded again for every token
+#define GGML_METAL_RECORDING_BINDS     31
+#define GGML_METAL_RECORDING_RESOURCES 64
+
+struct ggml_metal_recording {
+    id<MTLIndirectCommandBuffer> icb;
+    id<MTLBuffer> args; // the arguments that were set_bytes
+    size_t args_size;
+    size_t args_offs;
+    int n;
+    int n_max;
+    bool failed;
+    id<MTLBuffer> resources[GGML_METAL_RECORDING_RESOURCES];
+    int n_resources;
+
+    // an indirect command does not keep a large buffer offset (measured: an offset of 4 GiB reads at 0, and a
+    // graph bound at 2 to 4 GiB computes garbage), and buffers can be larger than that. a binding beyond 2 GiB goes
+    // through a window: a second buffer over the same memory that starts every GiB, so that the offset in it is
+    // below 1 GiB. windows cost about 0.8 ms an execution (measured with 6 of them), so buffers are made small
+    // enough not to need any: see ggml_metal_buffer_view_max
+    struct {
+        id<MTLBuffer> src;
+        uint64_t      start;
+        id<MTLBuffer> buf;
+    } windows[GGML_METAL_RECORDING_RESOURCES];
+    int n_windows;
+};
+
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+
+    // recording: no Metal encoder, the state of one is kept here and written to a command at each dispatch
+    ggml_metal_recording_t rec;
+    id<MTLComputePipelineState> pso;
+    struct {
+        id<MTLBuffer> buf;
+        size_t offs;
+    } bind[GGML_METAL_RECORDING_BINDS];
+    int    n_bind;
+    size_t tg_size[2];
+    bool   barrier;
 };
+
+// the next encoder made on this thread records to this
+static __thread ggml_metal_recording_t t_recording_next = NULL;
+
+ggml_metal_recording_t ggml_metal_recording_init(ggml_metal_device_t dev, int n_max) {
+    ggml_metal_recording_t res = calloc(1, sizeof(struct ggml_metal_recording));
+
+    id<MTLDevice> device = ggml_metal_device_get_obj(dev);
+
+    MTLIndirectCommandBufferDescriptor * desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
+    desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+    desc.inheritBuffers = NO;
+    desc.inheritPipelineState = NO;
+    desc.maxKernelBufferBindCount = GGML_METAL_RECORDING_BINDS;
+    desc.maxKernelThreadgroupMemoryBindCount = 2;
+
+    res->icb = [device newIndirectCommandBufferWithDescriptor:desc maxCommandCount:n_max options:0];
+
+    [desc release];
+
+    res->n_max     = n_max;
+    res->args_size = (size_t) n_max*256;
+    res->args      = [device newBufferWithLength:res->args_size options:MTLResourceStorageModeShared];
+    res->failed    = res->icb == nil || res->args == nil;
+
+    return res;
+}
+
+void ggml_metal_recording_free(ggml_metal_recording_t rec) {
+    if (!rec) {
+        return;
+    }
+    [rec->icb release];
+    [rec->args release];
+    for (int i = 0; i < rec->n_windows; ++i) {
+        [rec->windows[i].buf release];
+    }
+    free(rec);
+}
+
+bool ggml_metal_recording_ok(ggml_metal_recording_t rec) {
+    return rec && !rec->failed && rec->n > 0;
+}
+
+int ggml_metal_recording_n(ggml_metal_recording_t rec) {
+    return rec ? rec->n : 0;
+}
+
+void ggml_metal_recording_begin(ggml_metal_recording_t rec) {
+    t_recording_next = rec;
+}
+
+static void ggml_metal_recording_use(ggml_metal_recording_t rec, id<MTLBuffer> buf) {
+    for (int i = 0; i < rec->n_resources; ++i) {
+        if (rec->resources[i] == buf) {
+            return;
+        }
+    }
+    if (rec->n_resources == GGML_METAL_RECORDING_RESOURCES) {
+        rec->failed = true;
+        return;
+    }
+    rec->resources[rec->n_resources++] = buf;
+}
+
+#define GGML_METAL_RECORDING_WINDOW_STEP ((uint64_t) 1 << 30)
+
+// the buffer and offset to bind in an indirect command for an offset in buf; false if there is no way
+static bool ggml_metal_recording_window(ggml_metal_recording_t rec, id<MTLBuffer> buf, size_t offs, id<MTLBuffer> * buf_out, size_t * offs_out) {
+    if (offs < ((uint64_t) 1 << 31)) {
+        *buf_out  = buf;
+        *offs_out = offs;
+        return true;
+    }
+
+    const uint64_t start = offs/GGML_METAL_RECORDING_WINDOW_STEP*GGML_METAL_RECORDING_WINDOW_STEP;
+
+    for (int i = 0; i < rec->n_windows; ++i) {
+        if (rec->windows[i].src == buf && rec->windows[i].start == start) {
+            *buf_out  = rec->windows[i].buf;
+            *offs_out = offs - start;
+            return true;
+        }
+    }
+
+    // only memory the host sees can be given a second buffer
+    char * contents = (char *) [buf contents];
+    if (contents == NULL || rec->n_windows == GGML_METAL_RECORDING_RESOURCES) {
+        return false;
+    }
+
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+    uint64_t len = [buf length] - start;
+    if (len > 2*GGML_METAL_RECORDING_WINDOW_STEP - page) {
+        len = 2*GGML_METAL_RECORDING_WINDOW_STEP - page;
+    }
+    len = (len + page - 1)/page*page;
+
+    id<MTLBuffer> win = [[buf device] newBufferWithBytesNoCopy:contents + start length:len options:MTLResourceStorageModeShared deallocator:nil];
+    if (win == nil) {
+        return false;
+    }
+
+    rec->windows[rec->n_windows].src   = buf;
+    rec->windows[rec->n_windows].start = start;
+    rec->windows[rec->n_windows].buf   = win;
+    rec->n_windows++;
+    if (getenv("GGML_METAL_PROFILE")) {
+        fprintf(stderr, "ggml_metal_recording: window %d: buffer of %.2f GiB at %.2f GiB" "\n", rec->n_windows, [buf length]/1073741824.0, start/1073741824.0);
+    }
+
+    *buf_out  = win;
+    *offs_out = offs - start;
+    return true;
+}
+
+// execute the recorded kernels in a command buffer
+void ggml_metal_recording_replay(ggml_metal_recording_t rec, ggml_metal_cmd_buf_t cmd_buf_raw) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+
+    // every execution has to declare the buffers: with the buffers only kept resident (a residency set on the
+    // command buffer) the kernels computed garbage
+    [enc useResources:rec->resources count:rec->n_resources usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+
+    [enc executeCommandsInBuffer:rec->icb withRange:NSMakeRange(0, rec->n)];
+    [enc endEncoding];
+}
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+
+    if (t_recording_next) {
+        res->rec = t_recording_next;
+        t_recording_next = NULL;
+        return res;
+    }
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
@@ -894,17 +1078,25 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 }
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
-    [encoder->obj release];
+    if (!encoder->rec) {
+        [encoder->obj release];
+    }
     free(encoder);
 }
 
 void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name) {
+    if (encoder->rec) {
+        return;
+    }
     @autoreleasepool {
         [encoder->obj pushDebugGroup:[NSString stringWithCString:name encoding:NSUTF8StringEncoding]];
     }
 }
 
 void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
+    if (encoder->rec) {
+        return;
+    }
     [encoder->obj popDebugGroup];
 }
 
@@ -913,14 +1105,60 @@ void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_m
         GGML_ABORT("%s: nil Metal pipeline (missing kernel; see compile_pipeline log above)\n", __func__);
     }
 
+    if (encoder->rec) {
+        // every op sets its pipeline, then all that its kernel reads: what an earlier kernel had bound is dropped, so
+        // that a command carries only its own buffers. GGML_METAL_REPLAY_KEEP_BINDS: keep them, as a Metal encoder does
+        static int keep = -1;
+        if (keep < 0) {
+            keep = getenv("GGML_METAL_REPLAY_KEEP_BINDS") != NULL;
+        }
+        if (!keep) {
+            for (int i = 0; i < encoder->n_bind; ++i) {
+                encoder->bind[i].buf = nil;
+            }
+            encoder->n_bind = 0;
+            encoder->tg_size[0] = encoder->tg_size[1] = 0;
+        }
+        encoder->pso = pipeline.pipeline->obj;
+        return;
+    }
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
 }
 
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
+    if (encoder->rec) {
+        // the bytes go to the arguments buffer of the recording and are bound like any buffer
+        ggml_metal_recording_t rec = encoder->rec;
+        const size_t offs = (rec->args_offs + 15) & ~((size_t) 15);
+        if (idx >= GGML_METAL_RECORDING_BINDS || offs + size > rec->args_size) {
+            rec->failed = true;
+            return;
+        }
+        memcpy((char *) [rec->args contents] + offs, data, size);
+        rec->args_offs = offs + size;
+        encoder->bind[idx].buf  = rec->args;
+        encoder->bind[idx].offs = offs;
+        if (idx >= encoder->n_bind) {
+            encoder->n_bind = idx + 1;
+        }
+        return;
+    }
     [encoder->obj setBytes:data length:size atIndex:idx];
 }
 
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx) {
+    if (encoder->rec) {
+        if (idx >= GGML_METAL_RECORDING_BINDS) {
+            encoder->rec->failed = true;
+            return;
+        }
+        encoder->bind[idx].buf  = buffer.metal;
+        encoder->bind[idx].offs = buffer.offs;
+        if (idx >= encoder->n_bind) {
+            encoder->n_bind = idx + 1;
+        }
+        return;
+    }
     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
 }
 
@@ -928,18 +1166,72 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
     // ref: https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setthreadgroupmemorylength(_:index:)
     GGML_ASSERT(size % 16 == 0);
 
+    if (encoder->rec) {
+        if (idx >= 2) {
+            encoder->rec->failed = true;
+            return;
+        }
+        encoder->tg_size[idx] = size;
+        return;
+    }
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    if (encoder->rec) {
+        ggml_metal_recording_t rec = encoder->rec;
+        if (rec->failed || rec->n == rec->n_max || encoder->pso == nil) {
+            rec->failed = true;
+            return;
+        }
+
+        // the state of the encoder as it is now: what was bound for earlier kernels stays bound, as in Metal
+        id<MTLIndirectComputeCommand> cmd = [rec->icb indirectComputeCommandAtIndex:rec->n++];
+
+        [cmd setComputePipelineState:encoder->pso];
+        for (int i = 0; i < encoder->n_bind; ++i) {
+            if (encoder->bind[i].buf != nil) {
+                id<MTLBuffer> buf = nil;
+                size_t offs = 0;
+                if (!ggml_metal_recording_window(rec, encoder->bind[i].buf, encoder->bind[i].offs, &buf, &offs)) {
+                    rec->failed = true;
+                    return;
+                }
+                [cmd setKernelBuffer:buf offset:offs atIndex:i];
+                ggml_metal_recording_use(rec, buf);
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (encoder->tg_size[i] > 0) {
+                [cmd setThreadgroupMemoryLength:encoder->tg_size[i] atIndex:i];
+            }
+        }
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+
+        // the barrier of a command holds it until the commands before it are done
+        if (encoder->barrier) {
+            [cmd setBarrier];
+        } else {
+            [cmd clearBarrier];
+        }
+        encoder->barrier = false;
+        return;
+    }
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
+    if (encoder->rec) {
+        encoder->barrier = true;
+        return;
+    }
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
+    if (encoder->rec) {
+        return;
+    }
     [encoder->obj endEncoding];
 }
 
@@ -2197,6 +2489,20 @@ static void ggml_metal_buffer_rset_free(ggml_metal_buffer_t buf) {
 #endif
 }
 
+// the most bytes of host memory to put in one Metal buffer. the device takes far more, but an indirect command
+// keeps a buffer offset right only below 2 GiB (see ggml_metal_recording), so a graph can only be executed from a
+// recording without detours if every tensor is at less than that in its buffer. memory beyond it gets several
+// buffers, each a view of 2 GiB, as memory beyond the limit of the device always did.
+// GGML_METAL_MAX_BUFFER_GIB overrides the 2 (0: the limit of the device only)
+static size_t ggml_metal_buffer_view_max(const struct ggml_metal_device_props * props_dev) {
+    static int64_t gib = -1;
+    if (gib < 0) {
+        gib = getenv("GGML_METAL_MAX_BUFFER_GIB") ? atoi(getenv("GGML_METAL_MAX_BUFFER_GIB")) : 2;
+    }
+    const size_t cap = gib > 0 ? (size_t) gib << 30 : props_dev->max_buffer_size;
+    return cap < props_dev->max_buffer_size ? cap : props_dev->max_buffer_size;
+}
+
 static void * ggml_metal_host_malloc(size_t n) {
     void * data = NULL;
 
@@ -2245,7 +2551,32 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
         res->buffers[0].metal = nil;
 
         if (size_aligned > 0) {
-            if (props_dev->use_shared_buffers && shared) {
+            const size_t size_view = ggml_metal_buffer_view_max(props_dev);
+
+            if (props_dev->use_shared_buffers && shared && size_aligned > size_view &&
+                (size_aligned + size_view/2 - 1)/(size_view/2) <= GGML_METAL_MAX_BUFFERS) {
+                // views of size_view, one every half of that: a tensor of up to half a view is whole in one of them
+                res->n_buffers = 0;
+                for (size_t i = 0; i < size_aligned; i += size_view/2) {
+                    const size_t size_i = i + size_view <= size_aligned ? size_view : size_aligned - i;
+
+                    res->buffers[res->n_buffers].data  = (uint8_t *) res->all_data + i;
+                    res->buffers[res->n_buffers].size  = size_i;
+                    res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:(uint8_t *) res->all_data + i
+                                                                              length:size_i
+                                                                             options:MTLResourceStorageModeShared
+                                                                         deallocator:nil];
+                    if (res->buffers[res->n_buffers].metal == nil) {
+                        res->buffers[0].metal = nil;
+                        break;
+                    }
+                    ++res->n_buffers;
+
+                    if (i + size_view >= size_aligned) {
+                        break;
+                    }
+                }
+            } else if (props_dev->use_shared_buffers && shared) {
                 res->buffers[0].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:res->all_data
                                                                   length:size_aligned
                                                                  options:MTLResourceStorageModeShared
@@ -2255,7 +2586,9 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
             }
         }
 
-        res->buffers[0].data = res->all_data;
+        if (res->n_buffers == 1) {
+            res->buffers[0].data = res->all_data;
+        }
     }
 
     if (size_aligned > 0 && (res->all_data == NULL || res->buffers[0].metal == nil)) {
@@ -2308,8 +2641,14 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
 
+    // the largest view: the limit of the device, or less when the largest tensor leaves room for the overlap
+    size_t size_max = props_dev->max_buffer_size;
+    if (max_tensor_size + 2*size_page < ggml_metal_buffer_view_max(props_dev)/2) {
+        size_max = ggml_metal_buffer_view_max(props_dev);
+    }
+
     // the buffer fits into the max buffer size allowed by the device
-    if (size_aligned <= props_dev->max_buffer_size) {
+    if (size_aligned <= size_max) {
         res->buffers[res->n_buffers].data  = ptr;
         res->buffers[res->n_buffers].size  = size;
         res->buffers[res->n_buffers].metal = nil;
@@ -2331,8 +2670,8 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         // this overlap between the views will guarantee that the tensor with the maximum size will fully fit into
         // one of the views
         const size_t size_ovlp = ((max_tensor_size + size_page - 1) / size_page + 1) * size_page; // round-up 2 pages just in case
-        const size_t size_step = props_dev->max_buffer_size - size_ovlp;
-        const size_t size_view = props_dev->max_buffer_size;
+        const size_t size_step = size_max - size_ovlp;
+        const size_t size_view = size_max;
 
         for (size_t i = 0; i < size; i += size_step) {
             const size_t size_step_aligned = (i + size_view <= size) ? size_view : (size_aligned - i);
