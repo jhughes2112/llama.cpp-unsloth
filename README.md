@@ -1,3 +1,67 @@
+# Inkling 2 Mini on a Mac: 37 → 112 tok/sec
+
+![Inkling 2 Mini on a Mac, decode speed commit by commit](media/inkling2-mac.gif)
+
+This branch (`metal-inkling2-fuse`) is Unsloth's llama.cpp release `b12588-mix-c0c3de8` with the Metal backend reworked
+for [Inkling 2 Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF). On an M5 Ultra, one stream of `UD-Q4_K_XL`
+decodes at 112 tok/sec, where the release it started from does 37. The model's output is unchanged within rounding
+(KL divergence 0.0009 against the untouched build, the same as that build against itself with fusion off).
+
+Where the speed came from: the model's small ops are fused into single Metal kernels (7,177 → 1,466 kernels a token),
+the graph is ordered by depth so independent branches run side by side, memory barriers are only placed where ranges
+really overlap, and the command buffer for the next token is encoded while the GPU runs the current one.
+
+### Build
+
+```bash
+git clone -b metal-inkling2-fuse https://github.com/jhughes2112/llama.cpp-unsloth
+cd llama.cpp-unsloth
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+Needs macOS on Apple Silicon, Xcode command line tools and CMake. Do not clone under `/tmp`: the web UI packaging step
+of the server build fails there.
+
+### Get the model
+
+```bash
+pip install -U huggingface_hub
+hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-Q4_K_XL.gguf mmproj-BF16.gguf \
+    --revision 29eac40 --local-dir models
+```
+
+17.6 GB of weights plus the 0.6 GB image projector. The revision is pinned because this release reads the GGUF layout
+of that upload.
+
+### Run
+
+```bash
+# measure decode speed
+build/bin/llama-bench -m models/Inkling-2-Mini-UD-Q4_K_XL.gguf -p 0 -n 400 -r 3
+
+# chat in the terminal
+build/bin/llama-cli -m models/Inkling-2-Mini-UD-Q4_K_XL.gguf -ngl 99 -fa on --jinja
+
+# OpenAI-compatible server with image input, at http://127.0.0.1:8080
+GGML_METAL_N_CB=6 build/bin/llama-server -m models/Inkling-2-Mini-UD-Q4_K_XL.gguf \
+    --mmproj models/mmproj-BF16.gguf -c 32768 -ngl 99 -fa on --jinja
+```
+
+### Good to know
+
+- 112 tok/sec is an M5 Ultra at an empty context; it is 106 at 4K tokens of context and 93 at 32K. Smaller Apple
+  chips will be slower. Prompt reading is about 1,900 tok/sec.
+- Only the Metal backend changed. CUDA, Vulkan and CPU run as in the Unsloth release.
+- Leave the K/V cache at its default (F16). `-ctk q8_0 -ctv q8_0` halves cache memory at long contexts but needs
+  `LLAMA_ATTN_ROT_DISABLE=1` to stay on the fast path and costs a little quality.
+- `GGML_METAL_PROFILE=1` prints GPU time, kernels and serial steps a token. `GGML_METAL_FUSION_DISABLE=1` runs
+  without the fused kernels, for comparison.
+- The base is a frozen release, so this branch does not follow upstream llama.cpp.
+- `media/make_inkling2_gif.py` draws the chart above from the numbers in the commit messages.
+
+---
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
