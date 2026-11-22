@@ -13,6 +13,7 @@
 #import <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <os/lock.h>
 
 // GGML_METAL_PROFILE=1: sum the GPU execution time of every command buffer, printed when a context is freed.
 // against the wall time of a decode it tells GPU work from waiting (encoding, scheduling, idle gaps)
@@ -27,6 +28,8 @@ static _Atomic int64_t g_profile_n_graphs = 0;
 static _Atomic int64_t g_profile_bucket_nodes [GGML_METAL_PROFILE_BUCKETS];
 static _Atomic int64_t g_profile_bucket_graphs[GGML_METAL_PROFILE_BUCKETS];
 static _Atomic int64_t g_profile_bucket_gpu_ns[GGML_METAL_PROFILE_BUCKETS];
+static _Atomic int64_t g_profile_gap_graph_ns = 0;
+static _Atomic int64_t g_profile_gap_cb_ns    = 0;
 
 static int ggml_metal_profile_bucket(int n_nodes) {
     for (int i = 0; i < GGML_METAL_PROFILE_BUCKETS; ++i) {
@@ -57,6 +60,20 @@ static void ggml_metal_profile_cmd_buf_graph(id<MTLCommandBuffer> cmd_buf, int n
     }
     [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
         atomic_fetch_add(&g_profile_bucket_gpu_ns[b], (int64_t) (([cb GPUEndTime] - [cb GPUStartTime])*1e9));
+
+        // the time the GPU sat idle before this command buffer: between two graphs (the CPU work of a decode) or
+        // inside one (the encoder of the next command buffer was not done)
+        static double end_prev = 0.0;
+        static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+        os_unfair_lock_lock(&lock);
+        const double gap = end_prev > 0.0 ? [cb GPUStartTime] - end_prev : 0.0;
+        if ([cb GPUEndTime] > end_prev) {
+            end_prev = [cb GPUEndTime];
+        }
+        os_unfair_lock_unlock(&lock);
+        if (gap > 0.0 && gap < 1.0) {
+            atomic_fetch_add(first ? &g_profile_gap_graph_ns : &g_profile_gap_cb_ns, (int64_t) (gap*1e9));
+        }
     }];
 }
 
@@ -290,6 +307,8 @@ void ggml_metal_free(ggml_metal_t ctx) {
                         g_profile_bucket_gpu_ns[i]/1e6, g_profile_bucket_gpu_ns[i]/1e6/g_profile_bucket_graphs[i]);
             }
         }
+        fprintf(stderr, "ggml_metal_free: profile: GPU idle between graphs %.1f ms, between the command buffers of a graph %.1f ms\n",
+                g_profile_gap_graph_ns/1e6, g_profile_gap_cb_ns/1e6);
         int64_t barriers, depth, kernels;
         ggml_metal_op_profile_get(&barriers, &depth, &kernels);
         fprintf(stderr, "ggml_metal_free: profile: %lld kernels, %lld barriers, depth %lld (summed over encoders)" "\n", (long long) kernels, (long long) barriers, (long long) depth);
