@@ -105,6 +105,9 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
 // could be fused on a device with props, chaining patterns back-to-back. returns at least 1.
 int ggml_metal_fusion_max(const struct ggml_cgraph * gf, int idx);
 
+// optimize phase: the nodes of the one fusion starting at idx, not chained with the fusions after it. returns at least 1.
+int ggml_metal_fusion_one(const struct ggml_cgraph * gf, int idx);
+
 #ifdef __cplusplus
 }
 #endif

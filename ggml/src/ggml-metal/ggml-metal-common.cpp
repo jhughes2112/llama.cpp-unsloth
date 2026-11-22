@@ -211,6 +211,19 @@ static bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
 }
 
 static ggml_mem_range ggml_mem_range_from_tensor(const ggml_tensor * tensor, ggml_mem_range_type pt) {
+    // an allocated view takes the bytes it spans, so that views of disjoint parts of one tensor (the cells of a
+    // recurrent state, the halves of a merged gate_up row) do not conflict; otherwise the base tensor
+    if (tensor->view_src && tensor->view_src->buffer && tensor->data) {
+        const ggml_tensor * base = tensor->view_src;
+        const uint64_t p0 = (uint64_t) tensor->data;
+        const uint64_t p1 = p0 + ggml_nbytes(tensor);
+        const uint64_t b0 = (uint64_t) base->data;
+        const uint64_t b1 = b0 + ggml_backend_buft_get_alloc_size(base->buffer->buft, base);
+        if (p0 >= b0 && p1 <= b1) {
+            return { /*.pb =*/ (uint64_t) base->buffer, /*.p0 =*/ p0, /*.p1 =*/ p1, /*.pt =*/ pt };
+        }
+    }
+
     // always use the base tensor
     tensor = tensor->view_src ? tensor->view_src : tensor;
 
@@ -676,30 +689,33 @@ static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_
             floor = lvl;
         } else {
             for (const ggml_tensor * t : ts) {
+                // a view inside the group reads nothing itself: what is read through it is a source of a kernel
+                if (ggml_op_is_empty(t->op)) {
+                    continue;
+                }
                 for (int j = 0; j < GGML_MAX_SRC; ++j) {
                     const ggml_tensor * src = t->src[j];
                     if (src && !node.is_output(src)) {
                         lvl = std::max(lvl, after(src, false));
                     }
                 }
-                if (!ggml_op_is_empty(t->op)) {
-                    lvl = std::max(lvl, after(t, true));
-                }
+                lvl = std::max(lvl, after(t, true));
             }
             lvl++;
         }
 
         if (!all_empty) {
             for (const ggml_tensor * t : ts) {
+                if (ggml_op_is_empty(t->op)) {
+                    continue;
+                }
                 for (int j = 0; j < GGML_MAX_SRC; ++j) {
                     const ggml_tensor * src = t->src[j];
                     if (src && !node.is_output(src)) {
                         record(src, false, lvl);
                     }
                 }
-                if (!ggml_op_is_empty(t->op)) {
-                    record(t, true, lvl);
-                }
+                record(t, true, lvl);
             }
         }
 
@@ -753,6 +769,16 @@ void ggml_graph_optimize_alloc_deps(
 
             ggml_tensor * until = gf->nodes[j];
 
+            // what the kernels of the level write stays too: a fused kernel does not write its intermediates, but they
+            // are allocated, and a later kernel of the level given their memory would conflict with them on paper
+            if (getenv("GGML_METAL_LEVEL_KEEP_OUTPUTS_DISABLE") == nullptr) {
+                for (int k = i; k < j; ++k) {
+                    if (!ggml_op_is_empty(gf->nodes[k]->op)) {
+                        add_alloc_dep(user_data, gf->nodes[k], until);
+                    }
+                }
+            }
+
             for (int k = i; k <= j; ++k) {
                 for (int s = 0; s < GGML_MAX_SRC; ++s) {
                     ggml_tensor * src = gf->nodes[k]->src[s];
@@ -788,7 +814,10 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
             /*.fused =*/ {},
         };
 
-        const int f = ggml_metal_fusion_max(gf, i);
+        // the order by depth takes each fusion alone; the lookahead keeps the chained groups it was written for
+        static const bool one = getenv("GGML_METAL_REORDER") == nullptr || strcmp(getenv("GGML_METAL_REORDER"), "lookahead") != 0;
+
+        const int f = one ? ggml_metal_fusion_one(gf, i) : ggml_metal_fusion_max(gf, i);
 
         // add the fused tensors into the node info so we can unfuse them later
         for (int k = 1; k < f; k++) {

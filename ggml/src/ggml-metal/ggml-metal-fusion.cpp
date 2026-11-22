@@ -2012,7 +2012,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
 // could be fused, chaining patterns back-to-back. matching runs on the same filtered (view
 // transparent) node sequence that the compute phase uses, so the returned count is the raw index
 // span from idx to the last matched node (intermediate views are packed along).
-int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
+static int ggml_metal_fusion_span(const ggml_cgraph * gf, int idx, int n_patterns_max) {
     // a view node cannot start a pattern - pack it alone
     if (ggml_op_is_empty(gf->nodes[idx]->op)) {
         return 1;
@@ -2034,7 +2034,9 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
     int total = 0;
     int i_f = 0;
 
-    while (i_f < n_idxs && total < GGML_METAL_FUSION_MAX) {
+    int n_patterns = 0;
+
+    while (i_f < n_idxs && total < GGML_METAL_FUSION_MAX && n_patterns < n_patterns_max) {
         int len = 1;
         const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
         if (!fusion || total + len > GGML_METAL_FUSION_MAX) {
@@ -2043,6 +2045,7 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
 
         total += len;
         i_f += len;
+        n_patterns++;
     }
 
     if (i_f == 0) {
@@ -2051,4 +2054,15 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
 
     // map the matched non-empty nodes back to the raw index span (views are included)
     return std::min(GGML_METAL_FUSION_MAX, idxs[i_f - 1] - idx + 1);
+}
+
+int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
+    return ggml_metal_fusion_span(gf, idx, GGML_METAL_FUSION_MAX);
+}
+
+// the nodes of the one fusion that starts at idx (a raw sequential graph index), views included. returns at least 1.
+// fusions that follow one another need not stay together: packed as one group, the kernels of two independent
+// branches would be ordered as if the second waited for the first
+int ggml_metal_fusion_one(const ggml_cgraph * gf, int idx) {
+    return ggml_metal_fusion_span(gf, idx, 1);
 }
