@@ -1390,6 +1390,156 @@ static bool ggml_metal_fusion_check_gated_mix(
 
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
 }
+// the loop controller of Inkling 2, per token: h = D [x/rms(x); m/rms(m)], y = (s*tanh(F h) + b)*x + tanh(G h)*m.
+// two kernels, each one step for the GPU. (measured: all of it with the norm behind it in one threadgroup a token,
+// with threadgroup barriers between the steps, took 50 us a call - a threadgroup does not spread over the GPU.)
+//
+// CONCAT RMS_NORM [RESHAPE] MUL_MAT: h, one threadgroup a row of D, which also sums the squares. unsafe = true
+static bool ggml_metal_fusion_check_ctrl_down(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * cat  = nodes[0];
+    const ggml_tensor * rms  = nodes[1];
+    const ggml_tensor * down = nodes[2];
+
+    const ggml_tensor * h2 = gf->nodes[raw0 + 2]; // the normalized pair as one column a token
+
+    if (ggml_get_op_params_i32(cat, 0) != 1 || rms->src[0] != cat || h2->view_src != rms || down->src[1] != h2) {
+        return false;
+    }
+
+    const ggml_tensor * x = cat->src[0];
+    const ggml_tensor * m = cat->src[1];
+    const ggml_tensor * D = down->src[0];
+
+    const int64_t n_embd = cat->ne[0];
+
+    for (const ggml_tensor * t : { x, m }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] != n_embd || t->ne[1] != 1 || t->ne[2] != cat->ne[2] || t->ne[3] != 1) {
+            return false;
+        }
+    }
+
+    if (D->type != GGML_TYPE_F32 || !ggml_is_contiguous(D) || D->data == nullptr || D->ne[0] != 2*n_embd ||
+        ggml_nelements(D) != D->ne[0]*D->ne[1] || cat->ne[1] != 2 || cat->ne[3] != 1 ||
+        down->type != GGML_TYPE_F32 || down->ne[0] != D->ne[1] || down->ne[1] != cat->ne[2] || ggml_nelements(down) != down->ne[0]*down->ne[1]) {
+        return false;
+    }
+
+    for (int j = 0; j < n; ++j) {
+        if (nodes[j]->view_src != nullptr) {
+            return false;
+        }
+    }
+
+    const int outputs[1] = { raw0 + n_raw - 1 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
+}
+// MUL_MAT MUL_MAT TANH SCALE MUL TANH MUL ADD: y, one thread an element. unsafe = true
+static bool ggml_metal_fusion_check_ctrl_out(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * tf  = nodes[2];
+    const ggml_tensor * sc  = nodes[3];
+    const ggml_tensor * m1  = nodes[4];
+    const ggml_tensor * tg  = nodes[5];
+    const ggml_tensor * m2  = nodes[6];
+    const ggml_tensor * add = nodes[7];
+
+    if (ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH ||
+        sc->src[0] != tf || m1->src[0] != sc || m2->src[0] != tg || add->src[0] != m1 || add->src[1] != m2) {
+        return false;
+    }
+
+    const ggml_tensor * f = tf->src[0];
+    const ggml_tensor * g = tg->src[0];
+    const ggml_tensor * x = m1->src[1];
+    const ggml_tensor * m = m2->src[1];
+
+    if (!((f == nodes[0] && g == nodes[1]) || (f == nodes[1] && g == nodes[0])) || f->src[1] != g->src[1]) {
+        return false;
+    }
+
+    const ggml_tensor * F = f->src[0];
+    const ggml_tensor * G = g->src[0];
+    const ggml_tensor * h = f->src[1];
+
+    const int64_t n_embd = add->ne[0];
+    const int64_t n_rank = h->ne[0];
+
+    for (const ggml_tensor * t : { x, m, add }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, add) || !ggml_is_contiguous(t) || t->ne[2] != 1 || t->ne[3] != 1) {
+            return false;
+        }
+    }
+
+    for (const ggml_tensor * t : { F, G }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->data == nullptr || t->ne[0] != n_rank || t->ne[1] != n_embd ||
+            ggml_nelements(t) != n_rank*n_embd) {
+            return false;
+        }
+    }
+
+    if (h->type != GGML_TYPE_F32 || !ggml_is_contiguous(h) || h->ne[1] != add->ne[1] || ggml_nelements(h) != n_rank*add->ne[1] ||
+        n_rank > 1024) {
+        return false;
+    }
+
+    for (int j = 0; j < n; ++j) {
+        if (nodes[j]->view_src != nullptr) {
+            return false;
+        }
+    }
+
+    const int outputs[1] = { raw0 + n_raw - 1 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
+}
 // PAD MUL_MAT [RESHAPE] SUB [PERMUTE] CONT GET_ROWS [RESHAPE PERMUTE] CONT ADD CPY: the per-head attention mask of
 // Inkling 2 with its relative-position bias,
 //   m[kv, t, h] = f16(sum_r bias[r, pos[kv, t]]*R[r, h, t] - sink[h, t] + mask[kv, t])
@@ -1548,6 +1698,10 @@ static const std::vector<ggml_op> ops_short_conv = {
 static const std::vector<ggml_op> ops_gated_mix = {
     GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD
 };
+static const std::vector<ggml_op> ops_ctrl_down = { GGML_OP_CONCAT, GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_ctrl_out = {
+    GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD
+};
 static const std::vector<ggml_op> ops_rel_bias = {
     GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
     GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY
@@ -1620,6 +1774,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv,   {1}, true, ggml_metal_fusion_check_short_conv },
     { GGML_METAL_FUSION_SHORT_CONV_RS, ops_short_conv_rs, {1}, true, ggml_metal_fusion_check_short_conv_rs },
     { GGML_METAL_FUSION_GATED_MIX,    ops_gated_mix,    {}, true, ggml_metal_fusion_check_gated_mix },
+    { GGML_METAL_FUSION_CTRL_DOWN,    ops_ctrl_down,    {}, true, ggml_metal_fusion_check_ctrl_down },
+    { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
 
     { GGML_METAL_FUSION_DEPTH_MIX, ggml_metal_fusion_ops_depth_mix(0), {}, true, ggml_metal_fusion_check_depth_mix },

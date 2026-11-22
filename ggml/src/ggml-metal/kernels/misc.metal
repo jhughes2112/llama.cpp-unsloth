@@ -777,6 +777,94 @@ kernel void kernel_gated_mix_f32(
 
     dst[gid] = (args.s*precise::tanh(f[gid]) + args.b)*x[gid] + precise::tanh(g[gid])*m[gid];
 }
+// loop controller, the projection to its rank: h[r] = D[r] . [x/rms(x); m/rms(m)], one threadgroup a row and token.
+// every threadgroup sums the squares of x and m again, in the loop of its products
+kernel void kernel_ctrl_down_f32(
+        constant ggml_metal_kargs_ctrl & args,
+        device const float * x,
+        device const float * m,
+        device const float * D,
+        device       float * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const int n   = args.n_embd;
+    const int nsg = ntg.x/N_SIMDWIDTH;
+
+    device const float * xs = x + (ulong) tgpig.y*n;
+    device const float * ms = m + (ulong) tgpig.y*n;
+    device const float * Dr = D + (ulong) tgpig.x*2*n;
+
+    float px = 0.0f;
+    float pm = 0.0f;
+    float sx = 0.0f;
+    float sm = 0.0f;
+    for (int i = tpitg.x; i < n; i += ntg.x) {
+        px += Dr[i]*xs[i];
+        pm += Dr[n + i]*ms[i];
+        sx += xs[i]*xs[i];
+        sm += ms[i]*ms[i];
+    }
+    px = simd_sum(px);
+    pm = simd_sum(pm);
+    sx = simd_sum(sx);
+    sm = simd_sum(sm);
+
+    if (tiisg == 0) {
+        shmem[4*sgitg + 0] = px;
+        shmem[4*sgitg + 1] = pm;
+        shmem[4*sgitg + 2] = sx;
+        shmem[4*sgitg + 3] = sm;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tpitg.x == 0) {
+        px = pm = sx = sm = 0.0f;
+        for (int i = 0; i < nsg; ++i) {
+            px += shmem[4*i + 0];
+            pm += shmem[4*i + 1];
+            sx += shmem[4*i + 2];
+            sm += shmem[4*i + 3];
+        }
+
+        dst[(ulong) tgpig.y*args.n_rank + tgpig.x] = px/sqrt(sx/n + args.eps) + pm/sqrt(sm/n + args.eps);
+    }
+}
+// loop controller, both gates and the output: y = (s*tanh(F h) + b)*x + tanh(G h)*m, one thread an element.
+// dst may be x or m in place
+kernel void kernel_ctrl_out_f32(
+        constant ggml_metal_kargs_ctrl & args,
+        device const float * x,
+        device const float * m,
+        device const float * h,
+        device const float * F,
+        device const float * G,
+        device       float * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int i = gid.x;
+    if (i >= args.n_embd) {
+        return;
+    }
+
+    const ulong e = (ulong) gid.y*args.n_embd + i;
+
+    device const float * hs = h + (ulong) gid.y*args.n_rank;
+    device const float * Fi = F + (ulong) i*args.n_rank;
+    device const float * Gi = G + (ulong) i*args.n_rank;
+
+    float f = 0.0f;
+    float g = 0.0f;
+    for (int r = 0; r < args.n_rank; ++r) {
+        f += Fi[r]*hs[r];
+        g += Gi[r]*hs[r];
+    }
+
+    dst[e] = (args.s*precise::tanh(f) + args.b)*x[e] + precise::tanh(g)*m[e];
+}
 // the per-head attention mask with the relative-position bias, one thread per mask element:
 //   m[kv, t, h] = sum_r bias[r, pos[kv, t]]*R[r, h, t] - sink[h, t] + mask[kv, t], no bias at pos == nc
 kernel void kernel_rel_bias_f32_f16(

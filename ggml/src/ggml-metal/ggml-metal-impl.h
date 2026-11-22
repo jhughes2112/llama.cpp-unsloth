@@ -795,6 +795,14 @@ typedef struct {
 } ggml_metal_kargs_gated_mix;
 
 typedef struct {
+    int32_t n_embd;
+    int32_t n_rank;
+    float   eps; // of the rms norm of the two inputs
+    float   s;   // forget gate scale and bias
+    float   b;
+} ggml_metal_kargs_ctrl;
+
+typedef struct {
     int32_t nr;   // rows of the bias table (the relative features)
     int32_t nc;   // its columns, without the zero one
     int32_t n_kv;

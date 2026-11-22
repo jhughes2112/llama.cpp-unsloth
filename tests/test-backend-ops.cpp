@@ -5057,6 +5057,61 @@ struct test_inkling2_gated_mix : public test_case {
         return out;
     }
 };
+// a whole loop controller of Inkling 2 and the norm behind it, in the node order of the model.
+// the Metal backend runs the whole run of nodes as one kernel
+struct test_inkling2_control : public test_case {
+    const int64_t n_embd;
+    const int64_t n_rank;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_CONTROL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_rank, n_tokens);
+    }
+
+    test_inkling2_control(int64_t n_embd = 2304, int64_t n_rank = 64, int64_t n_tokens = 1)
+        : n_embd(n_embd), n_rank(n_rank), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in[2];
+        for (int i = 0; i < 2; ++i) {
+            in[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(in[i], "in");
+            in[i] = ggml_scale(ctx, in[i], 1.0f + i);
+            ggml_build_forward_expand(gf, in[i]);
+        }
+        ggml_tensor * down   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_embd, n_rank);
+        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rank, n_embd);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rank, n_embd);
+        ggml_tensor * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(down, "down");
+        ggml_set_name(gain, "gain");
+        ggml_set_name(forget, "forget");
+        ggml_set_name(weight, "weight");
+
+        ggml_tensor * h = ggml_concat(ctx, ggml_reshape_3d(ctx, in[0], n_embd, 1, n_tokens), ggml_reshape_3d(ctx, in[1], n_embd, 1, n_tokens), 1);
+        h = ggml_reshape_2d(ctx, ggml_rms_norm(ctx, h, 1e-6f), 2*n_embd, n_tokens);
+        h = ggml_mul_mat(ctx, down, h);
+        ggml_tensor * g = ggml_mul_mat(ctx, gain,   h);
+        ggml_tensor * f = ggml_mul_mat(ctx, forget, h);
+        ggml_build_forward_expand(gf, f);
+        ggml_build_forward_expand(gf, g);
+
+        ggml_tensor * out = ggml_add(ctx,
+                ggml_mul(ctx, ggml_scale_bias(ctx, ggml_tanh(ctx, f), -1.0f, 1.0f), in[0]),
+                ggml_mul(ctx, ggml_tanh(ctx, g), in[1]));
+        out = ggml_mul(ctx, ggml_rms_norm(ctx, out, 1e-5f), weight);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
 // the per-head attention mask of Inkling 2 with its relative-position bias: project r on the padded bias table, take
 // the sink logit off, gather by distance, add the causal mask and cast to F16 for flash attention.
 // the Metal backend runs the whole run of nodes as one kernel
@@ -11412,6 +11467,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling2_depth_mix(  17, n_blocks, 2,  5));
     }
     // Inkling 2 loop controller output
+    test_cases.emplace_back(new test_inkling2_control(2304,  64,  1));
+    test_cases.emplace_back(new test_inkling2_control(2304,  64,  5));
+    test_cases.emplace_back(new test_inkling2_control(4096, 256,  2));
+    test_cases.emplace_back(new test_inkling2_control( 300,  16,  3));
+    test_cases.emplace_back(new test_inkling2_control(   7,   2,  3));
     test_cases.emplace_back(new test_inkling2_gated_mix(2304,   1));
     test_cases.emplace_back(new test_inkling2_gated_mix(2304,  33));
     test_cases.emplace_back(new test_inkling2_gated_mix( 300, 512));

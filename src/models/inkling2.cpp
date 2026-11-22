@@ -234,7 +234,9 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
 }
 
 // loop message controller: (1 - tanh(F h))*cur + tanh(G h)*message, h = D [rms(cur); rms(message)]; module: q, k, v, mlp
-ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const llama_layer & layer, int module) {
+// *normed is the result after the RMS norm with the weight norm_w, which every caller applies next
+ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const llama_layer & layer, int module,
+        ggml_tensor * norm_w, int il, ggml_tensor ** normed) {
     ggml_tensor * h = ggml_concat(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), ggml_reshape_3d(ctx0, message, n_embd, 1, n_tokens), 1);
     h = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, 1e-6f), 2*n_embd, n_tokens);
     h = build_lora_mm(layer.loop_down[module], h);
@@ -248,7 +250,11 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     gain   = ggml_tanh(ctx0, gain);
     forget = ggml_tanh(ctx0, forget);
 
-    return ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, forget, -1.0f, 1.0f), cur), ggml_mul(ctx0, gain, message));
+    ggml_tensor * out = ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, forget, -1.0f, 1.0f), cur), ggml_mul(ctx0, gain, message));
+    // the norm right behind (order only): the controller and its norm are one run of nodes that backends can fuse
+    *normed = build_norm(out, norm_w, nullptr, LLM_NORM_RMS, il);
+    ggml_build_forward_order(gf, *normed);
+    return out;
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
@@ -443,15 +449,18 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
         if (messages[0]) {
             // the messages enter before the input norms, so SWA layers normalize three inputs
+            ggml_tensor * const norms[3] = {
+                is_swa ? layer.attn_norm : layer.attn_q_inp_norm,
+                is_swa ? layer.attn_norm : layer.attn_k_inp_norm,
+                is_swa ? layer.attn_norm : layer.attn_v_inp_norm,
+            };
             for (int j = 0; j < 3; ++j) {
-                inputs[j] = control(inputs[j], messages[j], layer, j);
-            }
-            cb(inputs[0], "loop_q_inp", il);
-        }
-
-        if (is_swa && messages[0]) {
-            for (int j = 0; j < 3; ++j) {
-                inputs[j] = build_norm(inputs[j], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+                ggml_tensor * normed = nullptr;
+                ggml_tensor * out = control(inputs[j], messages[j], layer, j, norms[j], il, &normed);
+                if (j == 0) {
+                    cb(out, "loop_q_inp", il);
+                }
+                inputs[j] = normed;
             }
         } else if (is_swa) {
             inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -633,10 +642,12 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         // MoE
         cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
         if (messages[3]) {
-            cur = control(cur, messages[3], layer, 3);
-            cb(cur, "loop_ffn_inp", il);
+            ggml_tensor * normed = nullptr;
+            cb(control(cur, messages[3], layer, 3, layer.ffn_norm, il, &normed), "loop_ffn_inp", il);
+            cur = normed;
+        } else {
+            cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         }
-        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
         cur = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
