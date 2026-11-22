@@ -852,26 +852,6 @@ typedef struct {
 } ggml_metal_kargs_depth_mix;
 
 typedef struct {
-    int32_t  n_embd;
-    int32_t  n_states;
-    int32_t  nq;
-    int32_t  n_tokens;
-    float    eps;      // of the rms norm
-    float    scale;    // of the softmax
-    int32_t  has_norm; // an rms norm with a weight on the result (one query)
-    float    eps_out;
-    int32_t  nc;       // taps of the convolution
-    int32_t  n_t;      // tokens per sequence
-    int32_t  has_res;  // a residual is added to the convolution
-    float    cs;       // output scale and bias of the convolution
-    float    cb;
-    int32_t  pad;
-    uint64_t nb_past2; // sequence strides of the stored window and of the state cell
-    uint64_t nb_cell1;
-    uint64_t offs[8];  // of each state in the source buffer (the first is the layer output and not read)
-} ggml_metal_kargs_conv_mix;
-
-typedef struct {
     int64_t n; // elements
     float   s; // forget gate scale and bias
     float   b;

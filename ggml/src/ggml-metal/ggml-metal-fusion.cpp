@@ -2099,86 +2099,6 @@ static bool ggml_metal_fusion_check_reduce_conv(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 4);
 }
 
-// SHORT_CONV [+ residual ADD] [RESHAPE x (k + 1)] DEPTH_MIX [+ norm]: the attention over depth of a layer output that
-// is a short convolution (with the residual of the layer). the kernel of the mix computes the convolution for the
-// values it reads (a few a thread), writes them and the state, and mixes: one step instead of two
-static bool ggml_metal_fusion_check_conv_mix(
-        const ggml_metal_fusion       * fusion,
-        const ggml_tensor * const     * nodes,
-        const ggml_cgraph             * gf,
-        const int                     * node_idxs,
-              int                       idx,
-              ggml_metal_fusion_mode    mode) {
-    const int n     = (int) fusion->ops.size();
-    const int n_raw = (int) fusion->ops_all.size();
-
-    const bool with_norm = fusion->id == GGML_METAL_FUSION_CONV_MIX_NORM;
-    const bool with_res  = fusion->ops_all[8] == GGML_OP_ADD;
-
-    const int n_conv     = with_res ? 6 : 5;      // ops of the convolution
-    const int n_conv_raw = with_res ? 9 : 8;
-    const int k          = n - n_conv - 6 - (with_norm ? 2 : 0);
-
-    const int raw0 = node_idxs[idx];
-    if (k < 0 || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1 ||
-        node_idxs[idx + n_conv] != raw0 + n_conv_raw + k + 1) {
-        return false;
-    }
-
-    int raw_idxs[GGML_METAL_FUSION_MAX];
-    for (int i = 0; i < n_raw; ++i) {
-        raw_idxs[i] = raw0 + i;
-        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
-            return false;
-        }
-    }
-
-    const ggml_metal_fusion * conv_f = ggml_metal_fusion_find(GGML_METAL_FUSION_SHORT_CONV, n_conv);
-    const ggml_metal_fusion * mix_f  = ggml_metal_fusion_find(with_norm ? GGML_METAL_FUSION_DEPTH_MIX_NORM : GGML_METAL_FUSION_DEPTH_MIX, n - n_conv);
-    if (conv_f == nullptr || mix_f == nullptr ||
-        !conv_f->check(conv_f, nodes, gf, node_idxs, idx, mode) ||
-        !mix_f->check(mix_f, nodes + n_conv, gf, node_idxs, idx + n_conv, mode)) {
-        return false;
-    }
-
-    // the state under the mix is the output of the convolution, reshaped; a thread keeps up to 4 values of it
-    const ggml_tensor * out  = nodes[n_conv - 1];
-    const ggml_tensor * resh = gf->nodes[raw0 + n_conv_raw + k];
-    const ggml_tensor * top  = nodes[n_conv]; // the first concatenation, or the norm of the states
-    if (resh->view_src != out || (k > 0 ? top->src[1] : top->src[0]) != resh || out->ne[0] > 4096) {
-        return false;
-    }
-
-    // outputs: the mix, the layer output, the state store and its cell view; the reshapes of the blocks are views of inputs
-    int outputs[GGML_METAL_FUSION_MAX];
-    int n_outputs = 0;
-    outputs[n_outputs++] = raw0 + n_raw - 1;
-    outputs[n_outputs++] = raw0 + n_conv_raw - 1;
-    outputs[n_outputs++] = raw0 + 3;
-    outputs[n_outputs++] = raw0 + 2;
-    for (int i = 0; i < k; ++i) {
-        outputs[n_outputs++] = raw0 + n_conv_raw + i;
-    }
-
-    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, n_outputs);
-}
-
-static std::vector<ggml_op> ggml_metal_fusion_ops_conv_mix(int k, bool res, bool norm) {
-    std::vector<ggml_op> ops = {
-        GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
-    };
-    if (res) {
-        ops.push_back(GGML_OP_ADD);
-    }
-    for (int i = 0; i < k + 1; ++i) {
-        ops.push_back(GGML_OP_RESHAPE);
-    }
-    for (ggml_op op : norm ? ggml_metal_fusion_ops_depth_mix_norm(k) : ggml_metal_fusion_ops_depth_mix(k)) {
-        ops.push_back(op);
-    }
-    return ops;
-}
-
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -2376,38 +2296,6 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
     { GGML_METAL_FUSION_CLIP_REL_BIAS, ops_clip_rel_bias, {}, true, ggml_metal_fusion_check_clip_rel_bias },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(0, false, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(0, false, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(0, true, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(0, true, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(1, false, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(1, false, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(1, true, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(1, true, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(2, false, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(2, false, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(2, true, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(2, true, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(3, false, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(3, false, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(3, true, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(3, true, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(4, false, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(4, false, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(4, true, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(4, true, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(5, false, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(5, false, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(5, true, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(5, true, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(6, false, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(6, false, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(6, true, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(6, true, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(7, false, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(7, false, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX,      ggml_metal_fusion_ops_conv_mix(7, true, false), {1}, true, ggml_metal_fusion_check_conv_mix },
-    { GGML_METAL_FUSION_CONV_MIX_NORM, ggml_metal_fusion_ops_conv_mix(7, true, true),  {1}, true, ggml_metal_fusion_check_conv_mix },
     { GGML_METAL_FUSION_REDUCE_CONV, ops_reduce_conv, {12}, true, ggml_metal_fusion_check_reduce_conv },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_v_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
