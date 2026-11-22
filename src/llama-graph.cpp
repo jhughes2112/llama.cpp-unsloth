@@ -4616,6 +4616,9 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     // right after the bias (order only), so that the bias and its mask are one run of nodes that backends can fuse
     ggml_build_forward_order(gf, kq_mask);
+    // the query behind its mask and right in front of the attention (order only): if it is not in the graph yet, its
+    // last steps (a clip, a scale) are then a run with the attention that reads it
+    ggml_build_forward_order(gf, q_cur);
     cb(kq_mask, "kq_mask_rel_pos", il);
 
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);

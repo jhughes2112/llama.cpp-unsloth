@@ -2554,6 +2554,10 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_gather_flash_attn(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_QCLIP_GATHER_FA) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_qclip_gather_flash_attn(ctx, idx, n);
+        }
     }
 
     ggml_metal_library_t lib = ctx->lib;
@@ -4728,10 +4732,6 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_rel_bias_impl(ctx, idx, n, true);
         }
-        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_QCLIP_GATHER_FA) {
-            ctx->count_fusions(fusion);
-            return ggml_metal_op_qclip_gather_flash_attn(ctx, idx, n);
-        }
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CLIP_REL_TABLE) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_clip_rel_table(ctx, idx, n);
@@ -6548,15 +6548,16 @@ int ggml_metal_op_gather_flash_attn(ggml_metal_op_t ctx, int idx, int n) {
     return n;
 }
 
-// QCLIP_GATHER_FA: the clip of the query (MUL by its weight, the 8 nodes of the L2 clip, a MUL by a factor a token in
-// the full-attention layers) in front of a GATHER_FA run. the attention kernel clips the query as it loads it
+// QCLIP_GATHER_FA: a GATHER_FA run with the clip of the query between the mask and the attention (MUL by its weight,
+// the 8 nodes of the L2 clip, a MUL by a factor a token in the full-attention layers). the attention kernel clips the
+// query as it loads it
 int ggml_metal_op_qclip_gather_flash_attn(ggml_metal_op_t ctx, int idx, int n) {
     const int o = n - 16; // 1 with the factor a token
 
-    const ggml_tensor * mul0  = ctx->node(idx + 0);
-    const ggml_tensor * cont1 = ctx->node(idx + 9 + o);
-    const ggml_tensor * rows  = ctx->node(idx + 9 + o + 1);
-    const ggml_tensor * add   = ctx->node(idx + 9 + o + 3);
+    const ggml_tensor * cont1 = ctx->node(idx + 0);
+    const ggml_tensor * rows  = ctx->node(idx + 1);
+    const ggml_tensor * add   = ctx->node(idx + 3);
+    const ggml_tensor * mul0  = ctx->node(idx + 5);
 
     ggml_metal_op_fused_concurrency(ctx, idx, n);
 
@@ -6567,13 +6568,13 @@ int ggml_metal_op_qclip_gather_flash_attn(ggml_metal_op_t ctx, int idx, int n) {
         /*.gate_mul =*/ ctx->node(idx + n - 1),
         /*.q_in     =*/ mul0->src[0],
         /*.q_w      =*/ mul0->src[1],
-        /*.q_tau    =*/ o ? ctx->node(idx + 9)->src[1] : nullptr,
-        /*.q_scale  =*/ ctx->node(idx + 4),
-        /*.q_fill   =*/ ctx->node(idx + 5),
-        /*.q_clamp  =*/ ctx->node(idx + 7),
+        /*.q_tau    =*/ o ? ctx->node(idx + 14)->src[1] : nullptr,
+        /*.q_scale  =*/ ctx->node(idx + 9),
+        /*.q_fill   =*/ ctx->node(idx + 10),
+        /*.q_clamp  =*/ ctx->node(idx + 12),
     };
 
-    ggml_metal_op_flash_attn_ext_impl(ctx, idx + 9 + o + 5, &relb);
+    ggml_metal_op_flash_attn_ext_impl(ctx, idx + 14 + o, &relb);
 
     return n;
 }

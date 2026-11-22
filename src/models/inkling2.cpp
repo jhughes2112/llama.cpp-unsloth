@@ -607,12 +607,6 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
                 // per-query sink t: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s)))
                 table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-
-                // the table, then the clip of the query right in front of the attention (order only): backends can
-                // clip the query inside the attention that reads it
-                ggml_build_forward_order(gf, table);
-                ggml_build_forward_order(gf, Qcur);
-
                 table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
                 {

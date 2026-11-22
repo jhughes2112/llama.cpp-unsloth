@@ -2229,24 +2229,26 @@ static bool ggml_metal_fusion_check_fa_gate(
 // CLIP_REL_TABLE) spread over every key and head, plus the mask of the keys: the attention kernel looks the bias of
 // a key up itself, and the mask per head (n_kv x n_head, the one buffer of a layer that grows with the context) is
 // never built. unsafe = true
-static bool ggml_metal_fusion_check_gather_fa(
+static bool ggml_metal_fusion_check_gather_fa_impl(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
         const ggml_cgraph             * gf,
         const int                     * node_idxs,
               int                       idx,
-              ggml_metal_fusion_mode    mode) {
+              ggml_metal_fusion_mode    mode,
+              int                       nq,    // nodes of the clip of the query between the mask and the attention
+              int                       nqr) { // the same, the views counted
     const int n     = (int) fusion->ops.size();
     const int n_raw = (int) fusion->ops_all.size();
 
     static const bool off = getenv("GGML_METAL_NO_REL_FA") != nullptr;
 
     // the views of Q, K and V between the mask and the attention, those that were not in the graph before
-    const int n_views = n_raw - 10;
+    const int n_views = n_raw - 10 - nqr;
 
     const int raw0 = node_idxs[idx];
-    if (off || n != 7 || raw0 < 1 || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1 ||
-        node_idxs[idx + 5] != raw0 + 7 + n_views) {
+    if (off || n != 7 + nq || raw0 < 1 || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1 ||
+        node_idxs[idx + 5 + nq] != raw0 + 7 + nqr + n_views) {
         return false;
     }
 
@@ -2263,7 +2265,7 @@ static bool ggml_metal_fusion_check_gather_fa(
     const ggml_tensor * cont2 = nodes[2];
     const ggml_tensor * add   = nodes[3];
     const ggml_tensor * mask  = nodes[4]; // the mask per head, F16 [n_kv, n_tokens, n_head]
-    const ggml_tensor * fa    = nodes[5];
+    const ggml_tensor * fa    = nodes[5 + nq];
 
     const ggml_tensor * perm1 = cont1->src[0];
     const ggml_tensor * perm2 = gf->nodes[raw0 + 3];
@@ -2278,7 +2280,7 @@ static bool ggml_metal_fusion_check_gather_fa(
     }
 
     const ggml_metal_fusion * fa_f = ggml_metal_fusion_find(GGML_METAL_FUSION_FA_GATE, 2);
-    if (fa_f == nullptr || !fa_f->check(fa_f, nodes + 5, gf, node_idxs, idx + 5, mode)) {
+    if (fa_f == nullptr || !fa_f->check(fa_f, nodes + 5 + nq, gf, node_idxs, idx + 5 + nq, mode)) {
         return false;
     }
 
@@ -2321,15 +2323,28 @@ static bool ggml_metal_fusion_check_gather_fa(
 
     // outputs: the gated attention; the views of Q, K and V are views of inputs; and the mask, for its use of itself (it
     // stays allocated, and is never written)
-    int outputs[8];
+    int outputs[12];
     int n_outputs = 0;
     outputs[n_outputs++] = raw0 + n_raw - 1;
     outputs[n_outputs++] = raw0 + 6;
     for (int i = 0; i < n_views; ++i) {
-        outputs[n_outputs++] = raw0 + 7 + i;
+        outputs[n_outputs++] = raw0 + 7 + nqr + i;
+    }
+    if (nqr > nq) {
+        outputs[n_outputs++] = raw0 + 7; // the view of the unclipped query
     }
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, n_outputs);
+}
+
+static bool ggml_metal_fusion_check_gather_fa(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    return ggml_metal_fusion_check_gather_fa_impl(fusion, nodes, gf, node_idxs, idx, mode, 0, 0);
 }
 
 static std::vector<ggml_op> ggml_metal_fusion_ops_gather_fa(int n_pairs) {
@@ -2346,18 +2361,24 @@ static std::vector<ggml_op> ggml_metal_fusion_ops_gather_fa(int n_pairs) {
     return ops;
 }
 
-// L2_CLIP (with its weight) [MUL] [PERMUTE] GATHER_FA: the clip of the query of an Inkling 2 layer (in the
-// full-attention layers times a factor a token) right in front of the attention that reads it. the attention kernel
-// loads the unclipped query and clips it, a head a threadgroup, so the clipped query is neither computed nor stored
+// GATHER_FA with the clip of the query between the mask and the attention: [RESHAPE] L2_CLIP (with its weight) [MUL].
+// the attention builder orders the clip there, and the attention kernel loads the unclipped query and clips it, a
+// head a threadgroup (in the full-attention layers times a factor a token): the clipped query is neither computed
+// nor stored
 static std::vector<ggml_op> ggml_metal_fusion_ops_qclip_gather_fa(int tau, int n_pairs) {
     std::vector<ggml_op> ops = {
+        GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY,
+        GGML_OP_RESHAPE,
         GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
     };
     if (tau) {
         ops.push_back(GGML_OP_MUL);
     }
-    ops.push_back(GGML_OP_PERMUTE); // of the bias table
-    for (ggml_op op : ggml_metal_fusion_ops_gather_fa(n_pairs)) {
+    for (int i = 0; i < n_pairs; ++i) {
+        ops.push_back(GGML_OP_VIEW);
+        ops.push_back(GGML_OP_PERMUTE);
+    }
+    for (ggml_op op : { GGML_OP_FLASH_ATTN_EXT, GGML_OP_RESHAPE, GGML_OP_MUL }) {
         ops.push_back(op);
     }
     return ops;
@@ -2370,78 +2391,50 @@ static bool ggml_metal_fusion_check_qclip_gather_fa(
         const int                     * node_idxs,
               int                       idx,
               ggml_metal_fusion_mode    mode) {
-    const int n     = (int) fusion->ops.size();
-    const int n_raw = (int) fusion->ops_all.size();
+    const int n = (int) fusion->ops.size();
 
     static const bool off = getenv("GGML_METAL_NO_QCLIP_FA") != nullptr;
 
-    // 9 nodes of the clip, the factor a token, 7 of the attention
-    const int o    = n - 16;
-    const int nq   = 9 + o;
-    const int raw0 = node_idxs[idx];
+    // 5 nodes of the mask, 9 of the clip, the factor a token, the attention and its gate
+    const int o  = n - 16;
+    const int nq = 9 + o;
 
-    if (off || (o != 0 && o != 1) || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1 ||
-        node_idxs[idx + nq - 1] != raw0 + nq - 1 || node_idxs[idx + nq] != raw0 + nq + 1) {
+    if (off || (o != 0 && o != 1)) {
         return false;
     }
 
-    int raw_idxs[GGML_METAL_FUSION_MAX];
-    for (int i = 0; i < n_raw; ++i) {
-        raw_idxs[i] = raw0 + i;
-        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
-            return false;
-        }
-    }
+    const ggml_tensor * const * qn = nodes + 5;
 
-    if (!ggml_metal_fusion_l2_clip_core(nodes, 9)) {
+    if (!ggml_metal_fusion_l2_clip_core(qn, 9)) {
         return false;
     }
 
-    const ggml_tensor * in   = nodes[0]->src[0];
-    const ggml_tensor * w    = nodes[0]->src[1];
-    const ggml_tensor * qcur = nodes[nq - 1];
+    const ggml_tensor * in   = qn[0]->src[0];
+    const ggml_tensor * w    = qn[0]->src[1];
+    const ggml_tensor * qcur = qn[nq - 1];
+    const ggml_tensor * fa   = nodes[5 + nq];
+    const ggml_tensor * q    = fa->src[0];
 
     if (in->ne[3] != 1 || w->ne[0] != in->ne[0] || w->ne[1] != in->ne[1] || w->ne[2] != 1 || w->ne[3] != 1 || in->ne[0] % 4 != 0) {
         return false;
     }
 
     if (o) {
-        const ggml_tensor * tmul = nodes[9];
+        const ggml_tensor * tmul = qn[9];
         const ggml_tensor * tau  = tmul->src[1];
-        if (tmul->src[0] != nodes[8] || tmul->view_src != nullptr || tmul->type != GGML_TYPE_F32 || !ggml_are_same_shape(tmul, nodes[8]) ||
+        if (tmul->src[0] != qn[8] || tmul->view_src != nullptr || tmul->type != GGML_TYPE_F32 || !ggml_are_same_shape(tmul, qn[8]) ||
             tau->type != GGML_TYPE_F32 || !ggml_is_contiguous(tau) || tau->ne[0] != 1 || tau->ne[1] != 1 || tau->ne[2] != tmul->ne[2] || tau->ne[3] != 1) {
             return false;
         }
     }
 
-    // the attention behind, with its lookup of the bias
-    const ggml_metal_fusion * gather = ggml_metal_fusion_find_raw(GGML_METAL_FUSION_GATHER_FA, n_raw - nq - 1);
-    if (gather == nullptr || !gather->check(gather, nodes + nq, gf, node_idxs, idx + nq, mode)) {
-        return false;
-    }
-
-    // it reads the clipped query through a view made in the run, and nothing else reads that query
-    const ggml_tensor * fa = nodes[nq + 5];
-    const ggml_tensor * q  = fa->src[0];
+    // the attention reads the clipped query, through a view made in the run
     if (q->view_src != qcur || q->ne[0] != in->ne[0] || q->ne[2] != in->ne[1] || q->ne[1] != in->ne[2] || q->ne[3] != 1) {
         return false;
     }
 
-    int n_readers = 0;
-    for (int i = nq; i < n_raw; ++i) {
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (gf->nodes[raw0 + i]->src[j] == qcur) {
-                n_readers++;
-            }
-        }
-    }
-    if (n_readers != 1 || ggml_node_get_use_count(gf, raw0 + nq - 1) != 1) {
-        return false;
-    }
-
-    const int outputs[1] = { raw0 + nq - 1 };
-
-    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, nq, fusion->ops_all.data(), outputs, 1);
+    // the rest is a GATHER_FA run; that the clipped query has no other reader is part of its check of the whole run
+    return ggml_metal_fusion_check_gather_fa_impl(fusion, nodes, gf, node_idxs, idx, mode, nq, nq + 1);
 }
 
 // L2_CLIP (with its weight) PAD MUL_MAT [RESHAPE] SUB: the relative-position bias table of a query,
@@ -2811,10 +2804,11 @@ static bool ggml_metal_fusion_gather_fa_follows(const ggml_cgraph * gf, const gg
             continue;
         }
 
-        const ggml_tensor * nodes[7];
-        int idxs[7];
+        // 7 nodes, and up to 10 of the clip of the query in between (QCLIP_GATHER_FA)
+        const ggml_tensor * nodes[17];
+        int idxs[17];
         int n = 0;
-        for (int i = i0; i < gf->n_nodes && n < 7; ++i) {
+        for (int i = i0; i < gf->n_nodes && n < 17; ++i) {
             if (!ggml_op_is_empty(gf->nodes[i]->op)) {
                 nodes[n] = gf->nodes[i];
                 idxs[n]  = i;
@@ -2826,7 +2820,8 @@ static bool ggml_metal_fusion_gather_fa_follows(const ggml_cgraph * gf, const gg
         }
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
-            if (fusion.id == GGML_METAL_FUSION_GATHER_FA && fusion.check(&fusion, nodes, gf, idxs, 0, mode)) {
+            if ((fusion.id == GGML_METAL_FUSION_GATHER_FA || fusion.id == GGML_METAL_FUSION_QCLIP_GATHER_FA) &&
+                (int) fusion.ops.size() <= n && fusion.check(&fusion, nodes, gf, idxs, 0, mode)) {
                 return true;
             }
         }
