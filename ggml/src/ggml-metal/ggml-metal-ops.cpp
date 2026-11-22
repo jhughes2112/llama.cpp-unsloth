@@ -2547,6 +2547,15 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
 int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
+    if (op->op == GGML_OP_CONT && ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GATHER_FA) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_gather_flash_attn(ctx, idx, n);
+        }
+    }
+
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -3781,13 +3790,31 @@ bool ggml_metal_op_flash_attn_ext_reduces(const ggml_tensor * op) {
         !ggml_metal_op_flash_attn_ext_use_tensor(op, true) && ggml_metal_op_flash_attn_ext_use_vec(op);
 }
 
+// a fused GATHER_FA run: the attention looks the relative-position bias of a key up itself, in a table by distance,
+// instead of reading it from a mask per head
+struct ggml_metal_fa_relb {
+    const ggml_tensor * table; // [nc + 1, n_head, n_tokens]
+    const ggml_tensor * pos;   // distance of each key [n_kv, n_tokens]
+    const ggml_tensor * mask;  // F32 mask of the keys [n_kv, n_tokens]
+    const ggml_tensor * gate_mul;
+};
+
+static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const ggml_metal_fa_relb * relb);
+
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+    return ggml_metal_op_flash_attn_ext_impl(ctx, idx, nullptr);
+}
+
+static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const ggml_metal_fa_relb * relb) {
     ggml_tensor * op = ctx->node(idx);
 
     // FA_GATE: the MUL behind the attention by a gate, applied by the reduce kernel
     int n_gate = 1;
     const ggml_tensor * gate_mul = nullptr;
-    if (ctx->use_fusion()) {
+    if (relb) {
+        gate_mul = relb->gate_mul;
+        n_gate   = 2;
+    } else if (ctx->use_fusion()) {
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_gate);
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_FA_GATE) {
             gate_mul = ctx->node(idx + 1);
@@ -4546,9 +4573,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
             /*.n_kv_max_padded =*/ n_kv_max_padded,
+            /*.rel_nc1       =*/ relb ? (int32_t) relb->table->ne[0] : 0,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20, relb != nullptr);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4560,6 +4588,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
         ggml_metal_encoder_set_buffer  (enc, use_sparse ? bid_idx : (has_rows ? ggml_metal_get_buffer_id(kv_rows) : bid_src0), 8);
+        if (relb) {
+            // the mask per head is not computed: the kernel takes the table and the distances it is made of
+            GGML_ASSERT(!use_sparse && !has_rows && !has_kvpad && nwg > 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(relb->mask),  4);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(relb->table), 9);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(relb->pos),   10);
+        } else {
+            ggml_metal_encoder_set_buffer(enc, bid_src0, 9);
+            ggml_metal_encoder_set_buffer(enc, bid_src0, 10);
+        }
 
         const size_t smem = fa_vec_smem(nsg, nqptg);
 
@@ -4647,6 +4685,10 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CLIP_REL_BIAS) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_rel_bias_impl(ctx, idx, n, true);
+        }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CLIP_REL_TABLE) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_clip_rel_table(ctx, idx, n);
         }
         // MoE output reduction: experts * weights -> weighted sum
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_MOE_REDUCE) {
@@ -6385,6 +6427,74 @@ int ggml_metal_op_rel_bias_impl(ggml_metal_op_t ctx, int idx, int n, bool clip) 
 
     return n;
 }
+// Dispatch the relative-position bias table of a query from the matched clip + pad mul_mat sub run.
+int ggml_metal_op_clip_rel_table(ggml_metal_op_t ctx, int idx, int n) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * mul0  = ctx->node(idx + 0);
+    const ggml_tensor * scale = ctx->node(idx + 4);
+    const ggml_tensor * fill  = ctx->node(idx + 5);
+    const ggml_tensor * clamp = ctx->node(idx + 7);
+    const ggml_tensor * pad   = ctx->node(idx + 9);
+    ggml_tensor *       dst   = ctx->node(idx + n - 1);
+
+    const ggml_tensor * bias = pad->src[0];
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n);
+
+    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_clip_rel_table_f32");
+
+    ggml_metal_kargs_rel_bias args = {
+        /*.nr       =*/ (int32_t) bias->ne[0],
+        /*.nc       =*/ (int32_t) bias->ne[1],
+        /*.n_kv     =*/ 0,
+        /*.n_tokens =*/ (int32_t) dst->ne[2],
+        /*.n_head   =*/ (int32_t) dst->ne[1],
+        /*.has_clip =*/ 1,
+        /*.s        =*/ ggml_get_op_params_f32(scale, 0),
+        /*.b        =*/ ggml_get_op_params_f32(scale, 1),
+        /*.c        =*/ ggml_get_op_params_f32(fill,  0),
+        /*.lo       =*/ ggml_get_op_params_f32(clamp, 0),
+        /*.hi       =*/ ggml_get_op_params_f32(clamp, 1),
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias),         1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul0->src[0]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst->src[1]),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul0->src[1]), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),          5);
+
+    const int nth = 64;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.nc + 1 + nth - 1)/nth, args.n_tokens, args.n_head, nth, 1, 1);
+
+    return n;
+}
+
+// Dispatch a gated attention that looks its relative-position bias up in the table, from the matched cont get_rows cont
+// add cpy + flash_attn_ext + mul run: the mask per head is never built.
+int ggml_metal_op_gather_flash_attn(ggml_metal_op_t ctx, int idx, int n) {
+    const ggml_tensor * cont1 = ctx->node(idx + 0);
+    const ggml_tensor * rows  = ctx->node(idx + 1);
+    const ggml_tensor * add   = ctx->node(idx + 3);
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n);
+
+    const ggml_metal_fa_relb relb = {
+        /*.table    =*/ cont1->src[0]->view_src,
+        /*.pos      =*/ rows->src[1],
+        /*.mask     =*/ add->src[1],
+        /*.gate_mul =*/ ctx->node(idx + n - 1),
+    };
+
+    ggml_metal_op_flash_attn_ext_impl(ctx, idx + 5, &relb);
+
+    return n;
+}
+
 // Dispatch the fused short convolution with rollback slots from the matched concat set_rows ssm_conv add scale run.
 int ggml_metal_op_short_conv_rs(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_library_t lib = ctx->lib;

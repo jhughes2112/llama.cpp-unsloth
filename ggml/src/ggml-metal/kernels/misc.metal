@@ -1098,6 +1098,43 @@ kernel void kernel_reduce_conv_f32(
         q[j] = h[j];
     }
 }
+// the relative-position bias table of a query, one thread an entry:
+//   dst[p, h, t] = sum_r bias[r, p]*R[r, h, t] - sink[h, t], R the clipped features of the head (each thread clips them
+//   again, a few values), and no bias in the last row p == nc. the attention looks its mask up here by distance
+kernel void kernel_clip_rel_table_f32(
+        constant ggml_metal_kargs_rel_bias & args,
+        device const float * bias,
+        device const float * R,
+        device const float * sink,
+        device const float * w,
+        device       float * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int p  = gid.x;
+    const int it = gid.y;
+    const int ih = gid.z;
+    if (p > args.nc) {
+        return;
+    }
+
+    float sumf = 0.0f;
+
+    if (p < args.nc) {
+        device const float * b  = bias + (ulong) p*args.nr;
+        device const float * r  = R + ((ulong) it*args.n_head + ih)*args.nr;
+        device const float * wh = w + (ulong) ih*args.nr;
+
+        float ss = 0.0f;
+        for (int i = 0; i < args.nr; ++i) {
+            const float x = r[i]*wh[i];
+            ss   += x*x;
+            sumf += b[i]*x;
+        }
+
+        sumf *= clamp(args.c/(args.s*sqrt(ss) + args.b), args.lo, args.hi);
+    }
+
+    dst[((ulong) it*args.n_head + ih)*(args.nc + 1) + p] = sumf - sink[it*args.n_head + ih];
+}
 // K or V of a layer from its projection to the KV cache, one threadgroup a head and sequence, one thread a channel:
 // the short convolution of kernel_short_conv_f32, then the L2 clip or the RMS norm of the head, and the result goes
 // to the cache row of its token. the sum of squares of a head is reduced through shmem for each token

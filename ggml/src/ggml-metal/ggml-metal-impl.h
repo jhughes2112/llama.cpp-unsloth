@@ -509,6 +509,7 @@ typedef struct {
     int32_t  n_head_log2;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
+    int32_t  rel_nc1; // has_relb: rows of the bias table of a head
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {

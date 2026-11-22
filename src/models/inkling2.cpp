@@ -597,7 +597,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 }
             } else {
                 // the inputs of the bias first (order only), so that its nodes are one run that backends can fuse
-                // (the sinks before the clip of Rcur, which then runs right into the bias)
+                // (the query first and the sinks before the clip of Rcur: the bias then runs from that clip right into the
+                // attention that reads it)
+                ggml_build_forward_order(gf, Qcur);
                 ggml_build_forward_order(gf, sinks);
                 ggml_build_forward_order(gf, Rcur);
 

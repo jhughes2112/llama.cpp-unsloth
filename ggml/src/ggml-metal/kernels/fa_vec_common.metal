@@ -14,6 +14,9 @@ constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
+// the mask of a key is looked up here in a relative-position bias table instead of read from a mask per head:
+//   m[kv, t, h] = reltab[pos[kv, t], h, t] + mask[kv, t]. `mask` is then the F32 mask of the keys, the same for all heads
+constant bool    FC_flash_attn_ext_vec_has_relb   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -44,6 +47,8 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * pad,
         device       char * dst,
         device const char * idx,
+        device const float * reltab,
+        device const int   * relpos,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -257,6 +262,19 @@ kernel void kernel_flash_attn_ext_vec(
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                         if ((iq1*Q + qq) < args.ne01) {
                             sm[qq*C + tiisg] = pm[qq][ic + tiisg];
+                        } else {
+                            sm[qq*C + tiisg] = -MAXHALF;
+                        }
+                    }
+                } else if (FC_flash_attn_ext_vec_has_relb) {
+                    FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                        if ((iq1*Q + qq) < args.ne01) {
+                            const int   it = iq1*Q + qq;
+                            const ulong kv = (ulong) it*args.ne11 + ic + tiisg;
+
+                            const float b = reltab[((ulong) it*args.ne02 + iq2)*args.rel_nc1 + relpos[kv]];
+
+                            sm[qq*C + tiisg] = (half) max(b + ((device const float *) mask)[kv], (float) -MAXHALF);
                         } else {
                             sm[qq*C + tiisg] = -MAXHALF;
                         }

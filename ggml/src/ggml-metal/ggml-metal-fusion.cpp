@@ -1926,6 +1926,8 @@ static bool ggml_metal_fusion_check_rel_bias(
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 2);
 }
+static bool ggml_metal_fusion_gather_fa_follows(const ggml_cgraph * gf, int raw, ggml_metal_fusion_mode mode);
+
 // L2_CLIP (with its weight) + REL_BIAS: the clip of the relative features of a query and the bias mask made of them.
 // a thread of the mask clips its head again (16 features), so the two are one step
 static bool ggml_metal_fusion_check_clip_rel_bias(
@@ -1954,6 +1956,11 @@ static bool ggml_metal_fusion_check_clip_rel_bias(
     }
 
     if (!ggml_metal_fusion_l2_clip_core(nodes, 9) || !ggml_metal_fusion_rel_bias_core(nodes + 9, gf, raw0 + 9)) {
+        return false;
+    }
+
+    // the attention behind looks the bias up in the table itself: CLIP_REL_TABLE makes the table
+    if (ggml_metal_fusion_gather_fa_follows(gf, raw0 + 13, mode)) {
         return false;
     }
 
@@ -2211,6 +2218,207 @@ static bool ggml_metal_fusion_check_fa_gate(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
 }
 
+// CONT GET_ROWS [RESHAPE PERMUTE] CONT ADD CPY [VIEW PERMUTE x 0..3] FA_GATE: the mask per head of an attention with a
+// relative-position bias, and the attention that reads it. the mask is the bias table of the query (a row a distance,
+// CLIP_REL_TABLE) spread over every key and head, plus the mask of the keys: the attention kernel looks the bias of
+// a key up itself, and the mask per head (n_kv x n_head, the one buffer of a layer that grows with the context) is
+// never built. unsafe = true
+static bool ggml_metal_fusion_check_gather_fa(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    static const bool off = getenv("GGML_METAL_NO_REL_FA") != nullptr;
+
+    // the views of Q, K and V between the mask and the attention, those that were not in the graph before
+    const int n_views = n_raw - 10;
+
+    const int raw0 = node_idxs[idx];
+    if (off || n != 7 || raw0 < 1 || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1 ||
+        node_idxs[idx + 5] != raw0 + 7 + n_views) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * cont1 = nodes[0];
+    const ggml_tensor * rows  = nodes[1];
+    const ggml_tensor * cont2 = nodes[2];
+    const ggml_tensor * add   = nodes[3];
+    const ggml_tensor * mask  = nodes[4]; // the mask per head, F16 [n_kv, n_tokens, n_head]
+    const ggml_tensor * fa    = nodes[5];
+
+    const ggml_tensor * perm1 = cont1->src[0];
+    const ggml_tensor * perm2 = gf->nodes[raw0 + 3];
+    const ggml_tensor * table = perm1->view_src;
+    const ggml_tensor * pos   = rows->src[1];
+    const ggml_tensor * maskf = add->src[1];
+
+    if (perm1->op != GGML_OP_PERMUTE || table == nullptr || table->view_src != nullptr ||
+        rows->src[0] != cont1 || perm2->view_src != rows || cont2->src[0] != perm2 || add->src[0] != cont2 || mask->src[0] != add ||
+        fa->src[3] != mask) {
+        return false;
+    }
+
+    const ggml_metal_fusion * fa_f = ggml_metal_fusion_find(GGML_METAL_FUSION_FA_GATE, 2);
+    if (fa_f == nullptr || !fa_f->check(fa_f, nodes + 5, gf, node_idxs, idx + 5, mode)) {
+        return false;
+    }
+
+    const ggml_tensor * q = fa->src[0];
+    const ggml_tensor * k = fa->src[1];
+
+    const int64_t nc1  = table->ne[0];
+    const int64_t H    = table->ne[1];
+    const int64_t T    = table->ne[2];
+    const int64_t n_kv = mask->ne[0];
+
+    for (const ggml_tensor * t : { table, cont1, rows, cont2, add, maskf }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
+    // one stream, whole blocks of keys
+    if (!ggml_is_contiguous(table) || table->ne[3] != 1 ||
+        cont1->ne[0] != H || cont1->ne[1] != nc1 || cont1->ne[2] != T || cont1->ne[3] != 1 ||
+        pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(pos) || pos->ne[0] != n_kv || pos->ne[1] != T || pos->ne[2] != 1 || pos->ne[3] != 1 ||
+        !ggml_is_contiguous(maskf) || maskf->ne[0] != n_kv || maskf->ne[1] != T || maskf->ne[2] != 1 || maskf->ne[3] != 1 ||
+        mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) || mask->ne[1] != T || mask->ne[2] != H || mask->ne[3] != 1 ||
+        !ggml_are_same_shape(cont2, mask) || !ggml_are_same_shape(add, mask) ||
+        q->ne[1] != T || q->ne[2] != H || q->ne[3] != 1 || k->ne[1] != n_kv || k->ne[3] != 1 || n_kv % 32 != 0) {
+        return false;
+    }
+
+    for (const ggml_tensor * t : { cont1, rows, cont2, add, mask }) {
+        if (t->view_src != nullptr) {
+            return false;
+        }
+    }
+
+    // the cast that makes the mask names itself as its second source, so the mask counts one use more than its readers:
+    // itself and the attention, nothing else
+    if (mask->src[1] != mask || ggml_node_get_use_count(gf, raw0 + 6) != 2) {
+        return false;
+    }
+
+    // outputs: the gated attention; the views of Q, K and V are views of inputs; and the mask, for its use of itself (it
+    // stays allocated, and is never written)
+    int outputs[8];
+    int n_outputs = 0;
+    outputs[n_outputs++] = raw0 + n_raw - 1;
+    outputs[n_outputs++] = raw0 + 6;
+    for (int i = 0; i < n_views; ++i) {
+        outputs[n_outputs++] = raw0 + 7 + i;
+    }
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, n_outputs);
+}
+
+static std::vector<ggml_op> ggml_metal_fusion_ops_gather_fa(int n_pairs) {
+    std::vector<ggml_op> ops = {
+        GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY
+    };
+    for (int i = 0; i < n_pairs; ++i) {
+        ops.push_back(GGML_OP_VIEW);
+        ops.push_back(GGML_OP_PERMUTE);
+    }
+    for (ggml_op op : { GGML_OP_FLASH_ATTN_EXT, GGML_OP_RESHAPE, GGML_OP_MUL }) {
+        ops.push_back(op);
+    }
+    return ops;
+}
+
+// L2_CLIP (with its weight) PAD MUL_MAT [RESHAPE] SUB: the relative-position bias table of a query,
+//   t[p, h] = sum_r bias[r, p]*R[r, h] - sink[h], no bias in the padded last row, R the clipped features.
+// taken when the attention behind looks the bias up in it (GATHER_FA): the rest of REL_BIAS is then not computed
+static bool ggml_metal_fusion_check_clip_rel_table(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (n != 12 || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    if (!ggml_metal_fusion_l2_clip_core(nodes, 9) || !ggml_metal_fusion_gather_fa_follows(gf, raw0 + n_raw, mode)) {
+        return false;
+    }
+
+    const ggml_tensor * pad    = nodes[9];
+    const ggml_tensor * mm     = nodes[10];
+    const ggml_tensor * sub    = nodes[11];
+    const ggml_tensor * sink_r = gf->nodes[raw0 + 11]; // sinks as [1, H, T]
+
+    const ggml_tensor * in   = nodes[0]->src[0];
+    const ggml_tensor * w    = nodes[0]->src[1];
+    const ggml_tensor * bias = pad->src[0];
+    const ggml_tensor * R    = mm->src[1];
+
+    if (mm->src[0] != pad || R != nodes[8] || sub->src[0] != mm || sub->src[1] != sink_r) {
+        return false;
+    }
+
+    for (const ggml_tensor * t : { pad, mm, sub, bias, sink_r }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
+    const int64_t nr = bias->ne[0];
+    const int64_t nc = bias->ne[1];
+    const int64_t H  = R->ne[1];
+    const int64_t T  = R->ne[2];
+
+    // no padding on the left, one zero column on the right
+    for (int i = 0; i < 8; i += 2) {
+        if (ggml_get_op_params_i32(pad, i) != 0) {
+            return false;
+        }
+    }
+
+    if (!ggml_is_contiguous(bias) || bias->ne[2] != 1 || bias->ne[3] != 1 ||
+        pad->ne[0] != nr || pad->ne[1] != nc + 1 || pad->ne[2] != 1 || pad->ne[3] != 1 ||
+        R->ne[0] != nr || R->ne[3] != 1 || !ggml_are_same_shape(in, R) ||
+        w->ne[0] != nr || w->ne[1] != H || w->ne[2] != 1 || w->ne[3] != 1 || nr > 64 ||
+        mm->ne[0] != nc + 1 || mm->ne[1] != H || mm->ne[2] != T || mm->ne[3] != 1 ||
+        !ggml_is_contiguous(sink_r) || sink_r->ne[0] != 1 || sink_r->ne[1] != H || sink_r->ne[2] != T || sink_r->ne[3] != 1 ||
+        !ggml_are_same_shape(sub, mm) || !ggml_is_contiguous(sub) ||
+        pad->view_src != nullptr || mm->view_src != nullptr || sub->view_src != nullptr) {
+        return false;
+    }
+
+    // outputs: the table; the reshape of the sinks is a view of an input
+    const int outputs[2] = { raw0 + n_raw - 1, raw0 + 11 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 2);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -2317,6 +2525,10 @@ static const std::vector<ggml_op> ops_reduce_conv = {
 };
 static const std::vector<ggml_op> ops_softcap = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_CONT };
 static const std::vector<ggml_op> ops_fa_gate = { GGML_OP_FLASH_ATTN_EXT, GGML_OP_RESHAPE, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_clip_rel_table = {
+    GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
+    GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB
+};
 static const std::vector<ggml_op> ops_clip_rel_bias = {
     GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
     GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
@@ -2411,6 +2623,11 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
     { GGML_METAL_FUSION_CLIP_REL_BIAS, ops_clip_rel_bias, {}, true, ggml_metal_fusion_check_clip_rel_bias },
     { GGML_METAL_FUSION_FA_GATE, ops_fa_gate, {}, true, ggml_metal_fusion_check_fa_gate },
+    { GGML_METAL_FUSION_CLIP_REL_TABLE, ops_clip_rel_table, {}, true, ggml_metal_fusion_check_clip_rel_table },
+    { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(0), {}, true, ggml_metal_fusion_check_gather_fa },
+    { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(1), {}, true, ggml_metal_fusion_check_gather_fa },
+    { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(2), {}, true, ggml_metal_fusion_check_gather_fa },
+    { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(3), {}, true, ggml_metal_fusion_check_gather_fa },
     { GGML_METAL_FUSION_SOFTCAP, ops_softcap, {}, true, ggml_metal_fusion_check_softcap },
     { GGML_METAL_FUSION_REDUCE_CONV, ops_reduce_conv, {12}, true, ggml_metal_fusion_check_reduce_conv },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
@@ -2442,6 +2659,30 @@ static const ggml_metal_fusion * ggml_metal_fusion_find(ggml_metal_fusion_id id,
         }
     }
     return nullptr;
+}
+
+// true if the nodes from raw on (the views between them aside) are a GATHER_FA run
+static bool ggml_metal_fusion_gather_fa_follows(const ggml_cgraph * gf, int raw, ggml_metal_fusion_mode mode) {
+    const ggml_tensor * nodes[7];
+    int idxs[7];
+    int n = 0;
+    for (int i = raw; i < gf->n_nodes && n < 7; ++i) {
+        if (!ggml_op_is_empty(gf->nodes[i]->op)) {
+            nodes[n] = gf->nodes[i];
+            idxs[n]  = i;
+            n++;
+        }
+    }
+    if (n < 7) {
+        return false;
+    }
+
+    for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+        if (fusion.id == GGML_METAL_FUSION_GATHER_FA && fusion.check(&fusion, nodes, gf, idxs, 0, mode)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---- alloc deps -----------------------------------------------------------
