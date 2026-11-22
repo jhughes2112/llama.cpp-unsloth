@@ -4862,6 +4862,7 @@ struct test_inkling2_short_conv : public test_case {
     const int64_t n_channels;
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
+    const int64_t n_slots; // rollback slots of the state, 0 for a plain copy of the last columns
 
     ggml_tensor * cpy_node = nullptr;
 
@@ -4874,11 +4875,11 @@ struct test_inkling2_short_conv : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_conv, n_channels, n_seq_tokens, n_seqs);
+        return VARS_TO_STR5(n_conv, n_channels, n_seq_tokens, n_seqs, n_slots);
     }
 
-    test_inkling2_short_conv(int64_t n_conv = 4, int64_t n_channels = 2304, int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
-        : n_conv(n_conv), n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+    test_inkling2_short_conv(int64_t n_conv = 4, int64_t n_channels = 2304, int64_t n_seq_tokens = 1, int64_t n_seqs = 1, int64_t n_slots = 0)
+        : n_conv(n_conv), n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), n_slots(n_slots) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_tokens = n_seq_tokens*n_seqs;
@@ -4892,7 +4893,8 @@ struct test_inkling2_short_conv : public test_case {
         ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv, n_channels);
         ggml_set_name(weight, "weight");
 
-        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (n_conv - 1)*n_channels, n_seqs);
+        // with rollback slots the state has a row per slot and sequence
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (n_conv - 1)*n_channels, n_seqs*std::max<int64_t>(n_slots, 1));
         ggml_set_name(state, "state");
 
         // some op first, as the projection in the model, so that the output can be allocated in place
@@ -4901,10 +4903,31 @@ struct test_inkling2_short_conv : public test_case {
         ggml_tensor * x = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_channels, n_seq_tokens, n_seqs));
         x = ggml_concat(ctx, past, x, 0);
 
+        if (n_slots > 0) {
+            // as llm_graph_context::build_conv_state_store with n_rs_seq = n_slots - 1
+            const int64_t K  = n_slots;
+            const int64_t Kw = std::min(n_seq_tokens, K);
+
+            ggml_tensor * s_slot_rev = ggml_arange(ctx, 0.0f, (float) K, 1.0f);
+            s_slot_rev = ggml_scale_bias(ctx, s_slot_rev, -1.0f, (float) (K - 1));
+            s_slot_rev = ggml_cast(ctx, s_slot_rev, GGML_TYPE_I32);
+            ggml_build_forward_expand(gf, s_slot_rev);
+
+            ggml_tensor * slot_order = ggml_view_1d(ctx, s_slot_rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
+
+            ggml_tensor * windows = ggml_view_4d(ctx, x, n_conv - 1, Kw, n_channels, n_seqs,
+                    ggml_element_size(x), x->nb[1], x->nb[2], ggml_row_size(x->type, n_seq_tokens - (Kw - 1)));
+
+            ggml_tensor * slots = ggml_view_4d(ctx, state, n_conv - 1, K, n_channels, n_seqs,
+                    (size_t) n_seqs*state->nb[1], ggml_row_size(state->type, n_conv - 1), state->nb[1], 0);
+
+            cpy_node = ggml_set_rows(ctx, slots, windows, slot_order);
+        } else {
         ggml_tensor * last = ggml_view_3d(ctx, x, n_conv - 1, n_channels, n_seqs, x->nb[1], x->nb[2], ggml_row_size(x->type, n_seq_tokens));
         ggml_tensor * cell = ggml_view_2d(ctx, state, (n_conv - 1)*n_channels, n_seqs, state->nb[1], 0);
 
         cpy_node = ggml_cpy(ctx, last, cell);
+        }
         ggml_set_name(cpy_node, "state_cpy");
         ggml_build_forward_expand(gf, cpy_node);
 
@@ -4915,6 +4938,16 @@ struct test_inkling2_short_conv : public test_case {
         ggml_build_forward_expand(gf, out);
 
         return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // the inputs only: the slot order of the rollback variant is computed
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "past" || name == "cur" || name == "weight" || name == "state" || name == "dynamic") {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 // attention over depth of Inkling 2: the earlier block outputs and cur, normalized, mixed by learned queries:
@@ -11365,6 +11398,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_inkling2_short_conv(2, 7, 5, 2));
     test_cases.emplace_back(new test_inkling2_short_conv(8, 5, 3, 1));
+    for (int64_t n_seq_tokens : {1, 2, 3, 4, 7}) {
+        for (int64_t n_slots : {1, 2, 4}) {
+            test_cases.emplace_back(new test_inkling2_short_conv(4, 2304, n_seq_tokens, 1, n_slots));
+            test_cases.emplace_back(new test_inkling2_short_conv(4,   96, n_seq_tokens, 3, n_slots));
+        }
+    }
     // Inkling 2 attention over depth
     for (int64_t n_blocks : {0, 1, 2, 4, 7}) {
         test_cases.emplace_back(new test_inkling2_depth_mix(2304, n_blocks, 1,  1));

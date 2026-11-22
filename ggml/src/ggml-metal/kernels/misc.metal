@@ -810,6 +810,61 @@ kernel void kernel_rel_bias_f32_f16(
 
     dst[((ulong) ih*args.n_tokens + it)*args.n_kv + kv] = half(sumf - sink[it*args.n_head + ih] + mask[it*args.n_kv + kv]);
 }
+// the short causal convolution of kernel_short_conv_f32 for a state with rollback slots: after token t the window
+// x[t + 1 .. t + nc - 1] goes to slot order[t - (n_t - Kw)], for the last Kw tokens
+kernel void kernel_short_conv_rs_f32(
+        constant ggml_metal_kargs_short_conv_rs & args,
+        device const char  * past,
+        device const float * cur,
+        device const float * w,
+        device const int   * order,
+        device       char  * slots,
+        device       float * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int c  = gid.x;
+    const int is = gid.y;
+    if (c >= args.C || is >= args.n_s) {
+        return;
+    }
+
+    const int nh = args.nc - 1;
+
+    float h[8];
+
+    device const float * p = (device const float *) (past + is*args.nb_past2) + c*nh;
+    for (int j = 0; j < nh; ++j) {
+        h[j] = p[j];
+    }
+
+    device const float * wc = w + c*args.nc;
+
+    const ulong base = (ulong) is*args.n_t*args.C + c;
+
+    for (int t = 0; t < args.n_t; ++t) {
+        const float xt = cur[base + (ulong) t*args.C];
+
+        float acc = 0.0f;
+        for (int j = 0; j < nh; ++j) {
+            acc += h[j]*wc[j];
+        }
+        acc += xt*wc[nh];
+
+        dst[base + (ulong) t*args.C] = args.s*(xt + acc) + args.b;
+
+        for (int j = 0; j < nh - 1; ++j) {
+            h[j] = h[j + 1];
+        }
+        h[nh - 1] = xt;
+
+        const int iw = t - (args.n_t - args.Kw);
+        if (iw >= 0) {
+            device float * q = (device float *) (slots + is*args.nb_slot3 + c*args.nb_slot2 + order[iw]*args.nb_slot1);
+            for (int j = 0; j < nh; ++j) {
+                q[j] = h[j];
+            }
+        }
+    }
+}
 template [[host_name("kernel_snake_f32")]]  kernel void kernel_snake<float>(constant ggml_metal_kargs_snake &, device const float *, device const float *, device const float *, device float *, uint, uint, uint);
 template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(constant ggml_metal_kargs_snake &, device const half *, device const float *, device const float *, device half *, uint, uint, uint);
 #if defined(GGML_METAL_HAS_BF16)

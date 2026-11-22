@@ -332,6 +332,9 @@ public:
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
+
+    // the rollback slot order {K-1, ..., 0} of build_conv_state_store, computed once per graph
+    ggml_tensor * s_slot_rev = nullptr; // I32 [K]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
     const llama_memory_recurrent_context * mctx;

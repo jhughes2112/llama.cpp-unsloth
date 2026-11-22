@@ -1237,6 +1237,113 @@ static std::vector<ggml_op> ggml_metal_fusion_ops_depth_mix(int k) {
     }
     return ops;
 }
+// CONCAT [VIEW VIEW VIEW] SET_ROWS SSM_CONV [RESHAPE] ADD SCALE: the short conv of SHORT_CONV whose state keeps rollback
+// slots: instead of one copy of the last columns of x, the last Kw windows of x, one column apart, go to the slots
+// named by an order tensor (window w is x[n_t - Kw + 1 + w ..], the newest last)
+static bool ggml_metal_fusion_check_short_conv_rs(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * cat   = nodes[0];
+    const ggml_tensor * set   = nodes[1];
+    const ggml_tensor * conv  = nodes[2];
+    const ggml_tensor * add   = nodes[3];
+    const ggml_tensor * scale = nodes[4];
+
+    const ggml_tensor * past  = cat->src[0];
+    const ggml_tensor * x0    = cat->src[1]; // cur as [n_t, C, n_s]
+    const ggml_tensor * wins  = set->src[0];
+    const ggml_tensor * order = set->src[1];
+    const ggml_tensor * w     = conv->src[1];
+    const ggml_tensor * cur   = add->src[0];
+    const ggml_tensor * out   = add->src[1]; // the conv output as [C, n_tokens]
+
+    if (ggml_get_op_params_i32(cat, 0) != 0 || conv->src[0] != cat || scale->src[0] != add ||
+        wins != gf->nodes[raw0 + 1] || order != gf->nodes[raw0 + 2] || set->src[2] != gf->nodes[raw0 + 3] || out != gf->nodes[raw0 + 6] ||
+        wins->view_src != cat || out->view_src != conv || cat->view_src != nullptr || conv->view_src != nullptr ||
+        add->view_src != nullptr || scale->view_src != nullptr || set->view_src == nullptr) {
+        return false;
+    }
+
+    for (const ggml_tensor * t : { cat, set, conv, add, scale, past, x0, wins, w, cur }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
+    const int64_t nc  = w->ne[0];
+    const int64_t C   = w->ne[1];
+    const int64_t n_t = conv->ne[1];
+    const int64_t n_s = conv->ne[2];
+    const int64_t Kw  = wins->ne[1];
+
+    if (nc < 2 || nc > GGML_METAL_SHORT_CONV_MAX || !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+
+    // past: [nc - 1, C, n_s], dense in each sequence
+    if (past->ne[0] != nc - 1 || past->ne[1] != C || past->ne[2] != n_s || past->ne[3] != 1 ||
+        past->nb[0] != sizeof(float) || past->nb[1] != (nc - 1)*sizeof(float)) {
+        return false;
+    }
+
+    // cur: [C, n_t*n_s] contiguous, x0 is its transposed view
+    const ggml_tensor * cur_root = cur->view_src ? cur->view_src : cur;
+    if (!ggml_is_contiguous(cur) || cur->ne[0] != C || cur->ne[1] != n_t*n_s || cur->ne[2] != 1 || cur->ne[3] != 1 ||
+        (x0->view_src ? x0->view_src : x0) != cur_root || x0->view_offs != cur->view_offs ||
+        x0->ne[0] != n_t || x0->ne[1] != C || x0->ne[2] != n_s || x0->ne[3] != 1 ||
+        x0->nb[0] != cur->nb[1] || x0->nb[1] != cur->nb[0]) {
+        return false;
+    }
+
+    // the windows: [nc - 1, Kw, C, n_s] over x, one column apart, ending with the last columns of x;
+    // the slots: [nc - 1, K, C, n_s] of the state, dense in a channel
+    if (Kw < 1 || Kw > n_t || wins->ne[0] != nc - 1 || wins->ne[2] != C || wins->ne[3] != n_s ||
+        wins->nb[0] != sizeof(float) || wins->nb[1] != sizeof(float) || wins->nb[2] != cat->nb[1] || wins->nb[3] != cat->nb[2] ||
+        wins->view_offs != (size_t) (n_t - (Kw - 1))*sizeof(float) ||
+        order->type != GGML_TYPE_I32 || order->ne[0] != Kw || order->ne[1] != 1 || order->ne[2] != 1 || order->ne[3] != 1 ||
+        order->nb[0] != sizeof(int32_t) ||
+        set->ne[0] != nc - 1 || set->ne[1] < Kw || set->ne[2] != C || set->ne[3] != n_s ||
+        set->nb[0] != sizeof(float) || set->nb[2] != (nc - 1)*sizeof(float)) {
+        return false;
+    }
+
+    if (!ggml_are_same_shape(add, cur) || !ggml_are_same_shape(scale, cur) || !ggml_are_same_shape(out, cur) ||
+        !ggml_is_contiguous(scale)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        // the kernel writes straight to the state; it walks the tokens of a channel in order (see SHORT_CONV)
+        if (set->data == nullptr || n_t < 1 || n_t > 16) {
+            return false;
+        }
+    }
+
+    // outputs: the result and the state store; the slot order and the slots are views of inputs
+    const int outputs[4] = { raw0 + n_raw - 1, raw0 + 4, raw0 + 3, raw0 + 2 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 4);
+}
 // TANH SCALE MUL TANH MUL ADD: y = (s*tanh(f) + b)*x + tanh(g)*m, the output of an Inkling 2 loop controller
 // (forget and gain gates on the layer input and the cross-pass message). two branches: unsafe = true
 static bool ggml_metal_fusion_check_gated_mix(
@@ -1445,6 +1552,9 @@ static const std::vector<ggml_op> ops_rel_bias = {
     GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
     GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY
 };
+static const std::vector<ggml_op> ops_short_conv_rs = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
+};
 static const std::vector<ggml_op> ops_l2_clip = {
     GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
 };
@@ -1508,6 +1618,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SITU,         ops_situ,         {}, true, ggml_metal_fusion_check_situ },
     { GGML_METAL_FUSION_EXPERT_SCALE, ops_expert_scale, {}, true, ggml_metal_fusion_check_expert_scale },
     { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv,   {1}, true, ggml_metal_fusion_check_short_conv },
+    { GGML_METAL_FUSION_SHORT_CONV_RS, ops_short_conv_rs, {1}, true, ggml_metal_fusion_check_short_conv_rs },
     { GGML_METAL_FUSION_GATED_MIX,    ops_gated_mix,    {}, true, ggml_metal_fusion_check_gated_mix },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
 
