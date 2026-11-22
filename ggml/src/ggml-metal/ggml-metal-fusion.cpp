@@ -1965,7 +1965,7 @@ static bool ggml_metal_fusion_check_clip_rel_bias(
     }
 
     // the attention behind looks the bias up in the table itself: CLIP_REL_TABLE makes the table
-    if (ggml_metal_fusion_gather_fa_follows(gf, gf->nodes[raw0 + 12], raw0 + 13, mode)) {
+    if (getenv("GGML_METAL_REL_TABLE_ALWAYS") != nullptr || ggml_metal_fusion_gather_fa_follows(gf, gf->nodes[raw0 + 12], raw0 + 13, mode)) {
         return false;
     }
 
@@ -2371,7 +2371,9 @@ static bool ggml_metal_fusion_check_clip_rel_table(
         }
     }
 
-    if (!ggml_metal_fusion_l2_clip_core(nodes, 9) || !ggml_metal_fusion_gather_fa_follows(gf, gf->nodes[raw0 + n_raw - 1], raw0 + n_raw, mode)) {
+    static const bool always = getenv("GGML_METAL_REL_TABLE_ALWAYS") != nullptr; // for tests of the table alone
+
+    if (!ggml_metal_fusion_l2_clip_core(nodes, 9) || (!always && !ggml_metal_fusion_gather_fa_follows(gf, gf->nodes[raw0 + n_raw - 1], raw0 + n_raw, mode))) {
         return false;
     }
 

@@ -5139,6 +5139,8 @@ struct test_inkling2_rel_bias : public test_case {
     const int64_t n_head;
     const int64_t n_kv;
     const int64_t n_tokens;
+    const bool    clip;    // the features go through the weighted L2 clip first, as in the model
+    const float   r_scale;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5150,11 +5152,11 @@ struct test_inkling2_rel_bias : public test_case {
     double max_nmse_err() override { return 1e-6; } // F16 output
 
     std::string vars() override {
-        return VARS_TO_STR5(n_relative, n_extent, n_head, n_kv, n_tokens);
+        return VARS_TO_STR7(n_relative, n_extent, n_head, n_kv, n_tokens, clip, r_scale);
     }
 
-    test_inkling2_rel_bias(int64_t n_relative = 16, int64_t n_extent = 1024, int64_t n_head = 24, int64_t n_kv = 256, int64_t n_tokens = 1)
-        : n_relative(n_relative), n_extent(n_extent), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens) {}
+    test_inkling2_rel_bias(int64_t n_relative = 16, int64_t n_extent = 1024, int64_t n_head = 24, int64_t n_kv = 256, int64_t n_tokens = 1, bool clip = false, float r_scale = 1.5f)
+        : n_relative(n_relative), n_extent(n_extent), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens), clip(clip), r_scale(r_scale) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_relative, n_extent);
@@ -5173,12 +5175,22 @@ struct test_inkling2_rel_bias : public test_case {
         ggml_set_name(mask, "mask");
 
         // the inputs first, as in the model
-        Rcur  = ggml_scale(ctx, Rcur, 1.5f);
+        Rcur  = ggml_scale(ctx, Rcur, r_scale);
         sinks = ggml_scale(ctx, sinks, 0.5f);
         mask  = ggml_scale(ctx, mask, 2.0f);
         ggml_build_forward_expand(gf, Rcur);
         ggml_build_forward_expand(gf, sinks);
         ggml_build_forward_expand(gf, mask);
+
+        if (clip) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_relative, n_head);
+            ggml_set_name(w, "w");
+
+            Rcur = ggml_mul(ctx, Rcur, w);
+            ggml_tensor * norm = ggml_scale_bias(ctx, ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, Rcur))), 1.0f, 1e-6f);
+            Rcur = ggml_mul(ctx, Rcur, ggml_clamp(ctx, ggml_div(ctx, ggml_fill(ctx, norm, 8.0f), norm), 0.0f, 1.0f));
+            ggml_build_forward_expand(gf, Rcur); // the clip before the pad, as the model orders it
+        }
 
         ggml_tensor * table = ggml_mul_mat(ctx, ggml_pad(ctx, bias, 0, 1, 0, 0), Rcur);
         table = ggml_sub(ctx, table, ggml_reshape_3d(ctx, sinks, 1, n_head, n_tokens));
@@ -11533,6 +11545,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2_rel_bias(16, 1024, 24, 256,  4));
     test_cases.emplace_back(new test_inkling2_rel_bias(16,   64, 24, 100, 31));
     test_cases.emplace_back(new test_inkling2_rel_bias( 5,    9,  3,   7,  2));
+    test_cases.emplace_back(new test_inkling2_rel_bias(16, 1024, 24, 256, 1, true, 0.5f));
+    test_cases.emplace_back(new test_inkling2_rel_bias(16, 1024, 24, 256, 1, true, 4.0f));
+    test_cases.emplace_back(new test_inkling2_rel_bias(16, 1024, 24, 256, 1, true, 40.0f));
+    test_cases.emplace_back(new test_inkling2_rel_bias(16, 1024, 24, 512, 4, true, 0.5f));
+    test_cases.emplace_back(new test_inkling2_rel_bias(16, 1024, 24, 512, 4, true, 4.0f));
+    test_cases.emplace_back(new test_inkling2_rel_bias(16, 1024, 24, 512, 4, true, 40.0f));
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block
