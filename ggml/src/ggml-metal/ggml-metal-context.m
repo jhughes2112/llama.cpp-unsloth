@@ -97,7 +97,7 @@ static void ggml_metal_profile_cmd_buf(id<MTLCommandBuffer> cmd_buf) {
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 // max number of MTLCommandBuffer used to submit a graph for processing
-#define GGML_METAL_MAX_COMMAND_BUFFERS 8
+#define GGML_METAL_MAX_COMMAND_BUFFERS 32
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
@@ -578,7 +578,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     }
 
     // number of nodes encoded by the main thread (empirically determined)
-    const int n_main = MAX(64, 0.1*gf->n_nodes);
+    // GGML_METAL_N_MAIN: that number instead (a small first command buffer gets the GPU going sooner)
+    static int n_main_env = -1;
+    if (n_main_env < 0) {
+        n_main_env = getenv("GGML_METAL_N_MAIN") ? atoi(getenv("GGML_METAL_N_MAIN")) : 0;
+    }
+    const int n_main = n_main_env > 0 ? n_main_env : MAX(64, 0.1*gf->n_nodes);
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;

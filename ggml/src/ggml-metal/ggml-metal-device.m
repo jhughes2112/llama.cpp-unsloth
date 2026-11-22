@@ -670,7 +670,12 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
     return res;
 }
 
+// bumped when a library is freed: see ggml_metal_library_get_pipeline
+static _Atomic uint64_t g_pipeline_cache_gen = 1;
+
 void ggml_metal_library_free(ggml_metal_library_t lib) {
+    atomic_fetch_add(&g_pipeline_cache_gen, 1);
+
     if (!lib) {
         return;
     }
@@ -700,9 +705,23 @@ ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib) {
     return lib->dev;
 }
 
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_metal_library_t lib, const char * name) {
-    [lib->lock lock];
+// every kernel that is encoded looks its pipeline up by name. the library lock made that the point where the encoder
+// threads of a graph wait for one another, so each thread keeps the pipelines it has found. a pipeline stays valid
+// while its library lives; the generation drops the caches when a library is freed
+#define GGML_METAL_PIPELINE_CACHE_SIZE 512
+#define GGML_METAL_PIPELINE_CACHE_NAME 120
 
+struct ggml_metal_pipeline_cache_entry {
+    uint64_t hash;
+    uint64_t gen;
+    ggml_metal_library_t lib;
+    ggml_metal_pipeline_t pipeline;
+    char name[GGML_METAL_PIPELINE_CACHE_NAME];
+};
+
+static __thread struct ggml_metal_pipeline_cache_entry t_pipeline_cache[GGML_METAL_PIPELINE_CACHE_SIZE];
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_metal_library_t lib, const char * name) {
     struct ggml_metal_pipeline_with_params res = {
         /*.pipeline =*/ nil,
         /*.nsg      =*/ 0,
@@ -713,9 +732,34 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
         /*.cnt      =*/ false,
     };
 
+    uint64_t hash = 1469598103934665603ull;
+    size_t len = 0;
+    for (; name[len] != 0; ++len) {
+        hash = (hash ^ (uint8_t) name[len])*1099511628211ull;
+    }
+
+    const uint64_t gen = atomic_load(&g_pipeline_cache_gen);
+
+    struct ggml_metal_pipeline_cache_entry * entry = &t_pipeline_cache[hash % GGML_METAL_PIPELINE_CACHE_SIZE];
+
+    if (entry->hash == hash && entry->gen == gen && entry->lib == lib && strcmp(entry->name, name) == 0) {
+        res.pipeline = entry->pipeline;
+        return res;
+    }
+
+    [lib->lock lock];
+
     res.pipeline = ggml_metal_pipelines_get(lib->pipelines, name);
 
     [lib->lock unlock];
+
+    if (res.pipeline != nil && len < GGML_METAL_PIPELINE_CACHE_NAME) {
+        entry->hash     = hash;
+        entry->gen      = gen;
+        entry->lib      = lib;
+        entry->pipeline = res.pipeline;
+        memcpy(entry->name, name, len + 1);
+    }
 
     return res;
 }
