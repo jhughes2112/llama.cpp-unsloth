@@ -15,6 +15,9 @@ NOTES = {0: "Unsloth release", 5: "fused kernels", 10: "graph ordered by depth",
          15: "commands pre-encoded"}
 CX0, CX1, CY0, CY1, VMAX = 90, 1110, 318, 590, 120.0
 INK, DIM, LINE = (255, 255, 255), (176, 208, 255), (140, 228, 255)
+GOLD = (255, 214, 96)
+MID = ((255, 255, 255), (255, 240, 200))
+COOL, HOT = ((225, 246, 255), (110, 205, 255)), ((255, 244, 150), (255, 138, 44))   # counter, top and bottom
 
 def font(size, bold=False):
     path = "/System/Library/Fonts/HelveticaNeue.ttc"
@@ -52,6 +55,8 @@ def frame(t):
     glow = Image.new("RGB", (W, H))   # everything that blooms
     g = ImageDraw.Draw(glow)
     dim = Image.new("RGB", (W, H))    # crisp only
+    soft = Image.new("RGB", (W, H))   # title: a dark halo and little bloom, to stay readable
+    st = ImageDraw.Draw(soft)
     d = ImageDraw.Draw(dim)
 
     u = min(max((t - T_DRAW0) / (T_DRAW1 - T_DRAW0), 0.0), 1.0)
@@ -84,21 +89,32 @@ def frame(t):
             a = min((pos - i) / 0.6, 1.0) if i else 1.0
             d.text((px(i) + 12, py(PTS[i]) + 16), s, font=F_NOTE, fill=tuple(int(c * a) for c in INK))
 
-    g.text((70, 40), "Inkling 2 Mini", font=F_TITLE, fill=INK)
-    g.text((72, 138), "on a Mac", font=F_SUB, fill=LINE)
+    st.text((70, 40), "Inkling 2 Mini", font=F_TITLE, fill=INK)
+    st.text((72, 138), "on a ", font=F_SUB, fill=(200, 222, 255))
+    st.text((72 + F_SUB.getlength("on a "), 138), "Mac", font=F_SUB, fill=GOLD)
     d.text((72, 204), "M5 Ultra  ·  llama.cpp + Metal  ·  UD-Q4_K_XL", font=F_SMALL, fill=DIM)
-    g.text((936, 44), str(int(round(val))), font=F_NUM, fill=INK, anchor="ra")
-    g.text((946, 132), "tok/sec", font=F_UNIT, fill=LINE)
+    heat = (val - PTS[0]) / (PTS[-1] - PTS[0])   # the counter warms from ice blue to gold over orange
+    lo, hi, h = (COOL, MID, heat * 2) if heat < 0.5 else (MID, HOT, heat * 2 - 1)   # through white, not through grey
+    top = np.array(lo[0], np.float32) + (np.array(hi[0], np.float32) - lo[0]) * h
+    bot = np.array(lo[1], np.float32) + (np.array(hi[1], np.float32) - lo[1]) * h
+    ramp = np.clip((np.arange(H, dtype=np.float32) - 70) / 135, 0, 1)[:, None, None]
+    ramp = np.broadcast_to(top + (bot - top) * ramp, (H, W, 3)).astype(np.uint8)
+    mask = Image.new("L", (W, H))
+    ImageDraw.Draw(mask).text((936, 44), str(int(round(val))), font=F_NUM, fill=255, anchor="ra")
+    glow.paste(Image.fromarray(ramp), mask=mask)
+    g.text((946, 132), "tok/sec", font=F_UNIT, fill=INK)
     b = min(max((t - T_DRAW1 - 0.1) / 0.5, 0.0), 1.0)
     if b > 0:
-        g.text((946, 76), "3× faster", font=F_BADGE, fill=tuple(int(c * b) for c in (255, 226, 130)))
+        g.text((946, 76), "3× faster", font=F_BADGE, fill=tuple(int(c * b) for c in (130, 255, 190)))
 
     pulse = 1.0 + 0.5 * np.exp(-((t - T_DRAW1 - 0.25) / 0.35) ** 2)
     ga = np.asarray(glow, np.float32)
     bloom = (np.asarray(glow.filter(ImageFilter.GaussianBlur(7)), np.float32) * 0.75
              + np.asarray(glow.filter(ImageFilter.GaussianBlur(26)), np.float32) * 0.85) * pulse
-    out = BG + area[..., None] * np.array(LINE, np.float32) + bloom * np.array([0.55, 0.85, 1.0], np.float32)
-    for layer in (np.asarray(dim, np.float32), ga):
+    halo = np.asarray(soft.convert("L").filter(ImageFilter.GaussianBlur(12)), np.float32)[..., None] / 255
+    out = (BG + area[..., None] * np.array(LINE, np.float32)) * (1 - 0.55 * np.clip(halo * 1.6, 0, 1))
+    out += bloom * 0.9 + np.asarray(soft.filter(ImageFilter.GaussianBlur(5)), np.float32) * 0.3
+    for layer in (np.asarray(dim, np.float32), np.asarray(soft, np.float32), ga):
         a = layer.max(axis=2, keepdims=True) / 255
         out = out * (1 - a) + layer
     return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
