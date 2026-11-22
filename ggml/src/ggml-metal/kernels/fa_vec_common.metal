@@ -17,6 +17,8 @@ constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_A
 // the mask of a key is looked up here in a relative-position bias table instead of read from a mask per head:
 //   m[kv, t, h] = reltab[pos[kv, t], h, t] + mask[kv, t]. `mask` is then the F32 mask of the keys, the same for all heads
 constant bool    FC_flash_attn_ext_vec_has_relb   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
+// one workgroup writes the result itself: with a gate of its shape it writes the gated result (FA_GATE)
+constant bool    FC_flash_attn_ext_vec_has_gate   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 8)]];
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -49,6 +51,7 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * idx,
         device const float * reltab,
         device const int   * relpos,
+        device const char  * gate,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -666,8 +669,15 @@ kernel void kernel_flash_attn_ext_vec(
             const float Sval = NWG == 1 ? (ss[2*qq + 0] == 0.0f ? 0.0f : 1.0f/ss[2*qq + 0]) : 1.0f;
 
             // interleave the workgroup data
-            for (short i = tiisg; i < DV4; i += NW) {
-                dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[qq*DV4 + i]*Sval;
+            if (FC_flash_attn_ext_vec_has_gate) {
+                device const float4 * gate4 = (device const float4 *) gate + rid*DV4;
+                for (short i = tiisg; i < DV4; i += NW) {
+                    dst4[rid*DV4 + i] = (float4) so4[qq*DV4 + i]*Sval*gate4[i];
+                }
+            } else {
+                for (short i = tiisg; i < DV4; i += NW) {
+                    dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[qq*DV4 + i]*Sval;
+                }
             }
 
             // store S and M

@@ -4521,12 +4521,22 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
                 }
             }
         } else {
-            // (one workgroup would write the result itself, with no temporary and no reduce kernel behind it, but
-            // measured slower for one token of Inkling 2 Mini at a short context: 8.83 against 8.72 ms)
-            nwg = 32;
-            nsg = 1;
-            while (2*nwg*nsg*ncpsg < ne11_attn && nsg < 4) {
-                nsg *= 2;
+            // up to GGML_METAL_FA_NWG1_MAX keys one workgroup writes the result itself: no temporary and no reduce
+            // kernel behind it. it is then as wide as it can be, up to GGML_METAL_FA_NSG_MAX simdgroups a head
+            static const int nwg1_max = getenv("GGML_METAL_FA_NWG1_MAX") ? atoi(getenv("GGML_METAL_FA_NWG1_MAX")) : 2048;
+            static const int nsg_max  = getenv("GGML_METAL_FA_NSG_MAX")  ? atoi(getenv("GGML_METAL_FA_NSG_MAX"))  : 32;
+            if (ne11_attn <= nwg1_max) {
+                nwg = 1;
+                nsg = 1;
+                while (nsg*ncpsg < ne11_attn && nsg < nsg_max && fa_vec_smem(2*nsg, nqptg) <= props_dev->max_theadgroup_memory_size) {
+                    nsg *= 2;
+                }
+            } else {
+                nwg = 32;
+                nsg = 1;
+                while (2*nwg*nsg*ncpsg < ne11_attn && nsg < 4) {
+                    nsg *= 2;
+                }
             }
         }
 
@@ -4576,7 +4586,7 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
             /*.rel_nc1       =*/ relb ? (int32_t) relb->table->ne[0] : 0,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20, relb != nullptr);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20, relb != nullptr, gate_mul != nullptr && nwg == 1);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4590,7 +4600,7 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
         ggml_metal_encoder_set_buffer  (enc, use_sparse ? bid_idx : (has_rows ? ggml_metal_get_buffer_id(kv_rows) : bid_src0), 8);
         if (relb) {
             // the mask per head is not computed: the kernel takes the table and the distances it is made of
-            GGML_ASSERT(!use_sparse && !has_rows && !has_kvpad && nwg > 1);
+            GGML_ASSERT(!use_sparse && !has_rows && !has_kvpad);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(relb->mask),  4);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(relb->table), 9);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(relb->pos),   10);
@@ -4603,14 +4613,24 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
 
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
+        // FA_GATE: the other operand of the MUL behind the attention, the first is a reshape of the attention output
+        const ggml_tensor * gate = !gate_mul ? nullptr :
+            (gate_mul->src[0]->view_src == op || gate_mul->src[0] == op) ? gate_mul->src[1] : gate_mul->src[0];
+
+        ggml_metal_encoder_set_buffer(enc, gate && nwg == 1 ? ggml_metal_get_buffer_id(gate) : bid_src0, 11);
+
         if (nwg == 1) {
-            // using 1 workgroup -> write the result directly into dst
+            // using 1 workgroup -> write the result directly into dst, gated if there is a gate
             ggml_metal_encoder_set_buffer(enc, bid_pad, 6);
-            ggml_metal_encoder_set_buffer(enc, bid_dst, 7);
+            ggml_metal_encoder_set_buffer(enc, gate_mul ? ggml_metal_get_buffer_id(gate_mul) : bid_dst, 7);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
+
+            if (gate_mul) {
+                return n_gate;
+            }
         } else {
             // sanity checks
             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
@@ -4636,10 +4656,6 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
                     nrows,
                     gate_mul ? 1 : 0,
                 };
-
-                // the other operand of the MUL: the first is a reshape of the attention output
-                const ggml_tensor * gate = !gate_mul ? nullptr :
-                    (gate_mul->src[0]->view_src == op || gate_mul->src[0] == op) ? gate_mul->src[1] : gate_mul->src[0];
 
                 auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
 
