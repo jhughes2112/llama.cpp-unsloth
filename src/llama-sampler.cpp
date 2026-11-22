@@ -6,6 +6,10 @@
 
 #include "ggml-cpp.h"
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include <array>
 #include <algorithm>
 #include <cassert>
@@ -1173,6 +1177,67 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
         cur_p->data[0].p = 1.0f;
         return;
     }
+
+#if defined(__APPLE__)
+    // a full vocabulary (no top-k before this sampler) is 200K logits a token. the loops below take about 0.4 ms for
+    // it (an exponential, a double addition and a double division an element); the same with the vector routines of
+    // Accelerate, on the logits where they are. sums are per block of 256 in float, the blocks added in double;
+    // the draw is the same one, found by block first
+    if (cur_p->size >= 1024) {
+        static_assert(sizeof(llama_token_data) == 3*sizeof(float), "the stride of the vector routines");
+
+        static thread_local std::vector<float>  buf;
+        static thread_local std::vector<double> blocks;
+
+        const size_t n  = cur_p->size;
+        const size_t nb = 256;
+
+        buf.resize(n);
+        blocks.resize((n + nb - 1)/nb);
+
+        float max_l = 0.0f;
+        vDSP_maxv(&cur_p->data[0].logit, 3, &max_l, n);
+
+        const float neg = -max_l;
+        vDSP_vsadd(&cur_p->data[0].logit, 3, &neg, buf.data(), 1, n);
+
+        const int n_i = (int) n;
+        vvexpf(buf.data(), buf.data(), &n_i);
+
+        double sum_cum = 0.0;
+        for (size_t b = 0; b < blocks.size(); ++b) {
+            float sum_b = 0.0f;
+            vDSP_sve(buf.data() + b*nb, 1, &sum_b, std::min(nb, n - b*nb));
+            blocks[b] = sum_b;
+            sum_cum  += sum_b;
+        }
+
+        const double rnd     = dist(ctx->rng);
+        const double sum_tgt = sum_cum*rnd;
+
+        double sum_run = 0.0;
+        size_t b = 0;
+        while (b + 1 < blocks.size() && sum_run + blocks[b] < sum_tgt) {
+            sum_run += blocks[b];
+            b++;
+        }
+
+        size_t sel = std::min(n, (b + 1)*nb) - 1;
+        for (size_t i = b*nb; i < std::min(n, (b + 1)*nb); ++i) {
+            sum_run += buf[i];
+            if (sum_run >= sum_tgt) {
+                sel = i;
+                break;
+            }
+        }
+        cur_p->selected = sel;
+
+        const float inv = (float) (1.0/sum_cum);
+        vDSP_vsmul(buf.data(), 1, &inv, &cur_p->data[0].p, 3, n);
+
+        return;
+    }
+#endif
 
     // max logit for numerical stability
     float max_l = cur_p->data[0].logit;

@@ -72,6 +72,11 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 find_package(Threads REQUIRED)
 target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
 
+if (APPLE)
+    # vvexpf for the softmax of the dist sampler
+    target_link_libraries(llama PRIVATE "-framework Accelerate")
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
