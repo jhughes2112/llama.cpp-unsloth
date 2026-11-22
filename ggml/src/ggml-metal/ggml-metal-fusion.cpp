@@ -1143,11 +1143,14 @@ static bool ggml_metal_fusion_check_short_conv(
         }
     }
 
+    // with dynamic taps, one (CONT MUL ADD) per lag sits between the convolution and the residual ADD
+    const bool dyn = fusion->id == GGML_METAL_FUSION_SHORT_CONV_DYN;
+
     const ggml_tensor * cat   = nodes[0];
     const ggml_tensor * cpy   = nodes[1];
     const ggml_tensor * conv  = nodes[2];
-    const ggml_tensor * add   = nodes[3];
-    const ggml_tensor * scale = nodes[4];
+    const ggml_tensor * add   = nodes[dyn ? n - 2 : 3];
+    const ggml_tensor * scale = nodes[dyn ? n - 1 : 4];
 
     const ggml_tensor * past = cat->src[0];
     const ggml_tensor * x0   = cat->src[1]; // cur as [n_t, C, n_s]
@@ -1155,7 +1158,7 @@ static bool ggml_metal_fusion_check_short_conv(
     const ggml_tensor * cell = cpy->src[1];
     const ggml_tensor * w    = conv->src[1];
     const ggml_tensor * cur  = add->src[0];
-    const ggml_tensor * out  = add->src[1]; // the conv output as [C, n_tokens]
+    const ggml_tensor * out  = dyn ? gf->nodes[raw0 + 5] : add->src[1]; // the conv output as [C, n_tokens]
 
     if (ggml_get_op_params_i32(cat, 0) != 0 || conv->src[0] != cat || scale->src[0] != add ||
         last != gf->nodes[raw0 + 1] || cell != gf->nodes[raw0 + 2] || out != gf->nodes[raw0 + 5] ||
@@ -1216,9 +1219,80 @@ static bool ggml_metal_fusion_check_short_conv(
         }
     }
 
+    int outputs[GGML_METAL_FUSION_MAX];
+    int n_outputs = 0;
+
     // outputs: the result, the state store and its cell view
+    outputs[n_outputs++] = raw0 + n_raw - 1;
+    outputs[n_outputs++] = raw0 + 3;
+    outputs[n_outputs++] = raw0 + 2;
+
+    if (dyn) {
+        // lag l adds x[t + nc - 1 - l, c]*tap[l, head(c), t] to the running sum
+        const int nc_d = (n - 5)/3;
+        if (nc != nc_d) {
+            return false;
+        }
+
+        const ggml_tensor * taps = nullptr; // [nc*H, n_tokens]
+        const ggml_tensor * run  = out;
+
+        for (int l = 0; l < nc_d; ++l) {
+            const ggml_tensor * cont = nodes[3 + 3*l];
+            const ggml_tensor * mul  = nodes[4 + 3*l];
+            const ggml_tensor * sum  = nodes[5 + 3*l];
+
+            // the window: x shifted by nc - 1 - l, transposed and copied to [C, n_t, n_s]
+            const ggml_tensor * tr = cont->src[0];
+            const ggml_tensor * wv = tr->op == GGML_OP_TRANSPOSE ? tr->src[0] : nullptr;
+            if (wv == nullptr || wv->op != GGML_OP_VIEW || wv->view_src != cat || wv->view_offs != (size_t) (nc - 1 - l)*sizeof(float) ||
+                wv->ne[0] != n_t || wv->ne[1] != C || wv->ne[2] != n_s || wv->nb[1] != cat->nb[1] || wv->nb[2] != cat->nb[2] ||
+                cont->ne[0] != C || cont->ne[1] != n_t || cont->ne[2] != n_s || cont->view_src != nullptr) {
+                return false;
+            }
+
+            // the tap of this lag: [1, H, n_tokens], one value a head, a view of the taps
+            const ggml_tensor * win = mul->src[0];
+            const ggml_tensor * tap = mul->src[1];
+            if (win->view_src != cont || tap->op != GGML_OP_VIEW || tap->view_src == nullptr || (taps != nullptr && tap->view_src != taps)) {
+                return false;
+            }
+            taps = tap->view_src;
+
+            const int64_t H = tap->ne[1];
+            if (taps->type != GGML_TYPE_F32 || !ggml_is_contiguous(taps) || taps->view_src != nullptr ||
+                taps->ne[0] != nc*H || taps->ne[1] != n_t*n_s || taps->ne[2] != 1 || taps->ne[3] != 1 ||
+                H < 1 || C % H != 0 ||
+                tap->ne[0] != 1 || tap->ne[2] != n_t*n_s || tap->ne[3] != 1 || tap->view_offs != (size_t) l*sizeof(float) ||
+                tap->nb[1] != (size_t) nc*sizeof(float) || tap->nb[2] != (size_t) nc*H*sizeof(float) ||
+                win->ne[0] != C/H || win->ne[1] != H || win->ne[2] != n_t*n_s || win->ne[3] != 1 ||
+                !ggml_are_same_shape(mul, win) || mul->view_src != nullptr) {
+                return false;
+            }
+
+            const ggml_tensor * term = sum->src[1];
+            if (sum->src[0] != run || term->view_src != mul || !ggml_are_same_shape(term, cur) || !ggml_are_same_shape(sum, cur) ||
+                sum->view_src != nullptr || cont->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || sum->type != GGML_TYPE_F32) {
+                return false;
+            }
+            run = sum;
+        }
+
+        if (add->src[1] != run) {
+            return false;
+        }
+
+        // views of the taps (their reshape and one view a lag) are not computed by the run
+        for (int i = 0; i < n_raw; ++i) {
+            const ggml_tensor * t = gf->nodes[raw0 + i];
+            if (ggml_op_is_empty(t->op) && (t == taps || t->view_src == taps)) {
+                outputs[n_outputs++] = raw0 + i;
+            }
+        }
+    }
+
     // the variant with the residual ADD behind the scale: the kernel adds it to what it writes
-    if (n == 6) {
+    if (!dyn && n == 6) {
         const ggml_tensor * radd = nodes[5];
         const ggml_tensor * res  = radd->src[0] == scale ? radd->src[1] : radd->src[0];
         if ((radd->src[0] != scale && radd->src[1] != scale) || res == scale || radd->view_src != nullptr ||
@@ -1228,9 +1302,27 @@ static bool ggml_metal_fusion_check_short_conv(
         }
     }
 
-    const int outputs[3] = { raw0 + n_raw - 1, raw0 + 3, raw0 + 2 };
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, n_outputs);
+}
 
-    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 3);
+static std::vector<ggml_op> ggml_metal_fusion_ops_short_conv_dyn(int nc) {
+    std::vector<ggml_op> ops = {
+        GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE
+    };
+    for (int l = 0; l < nc; ++l) {
+        for (ggml_op op : { GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE }) {
+            ops.push_back(op);
+        }
+        if (l == 0) {
+            ops.push_back(GGML_OP_RESHAPE); // the taps as [nc, H, n_tokens]
+        }
+        for (ggml_op op : { GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD }) {
+            ops.push_back(op);
+        }
+    }
+    ops.push_back(GGML_OP_ADD);
+    ops.push_back(GGML_OP_SCALE);
+    return ops;
 }
 // CONCAT x k, RMS_NORM, [TRANSPOSE] CONT, REPEAT, MUL_MAT, SOFT_MAX, MUL_MAT: attention over depth,
 //   states = rms_norm(concat(blocks..., cur)), y = states^T * softmax(scale * states * queries)
@@ -1982,6 +2074,10 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_EXPERT_REDUCE, ops_expert_reduce_r, {}, true, ggml_metal_fusion_check_expert_reduce },
     { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv,   {1}, true, ggml_metal_fusion_check_short_conv },
     { GGML_METAL_FUSION_SHORT_CONV,   ops_short_conv_add, {1}, true, ggml_metal_fusion_check_short_conv },
+    { GGML_METAL_FUSION_SHORT_CONV_DYN, ggml_metal_fusion_ops_short_conv_dyn(2), {1}, true, ggml_metal_fusion_check_short_conv },
+    { GGML_METAL_FUSION_SHORT_CONV_DYN, ggml_metal_fusion_ops_short_conv_dyn(3), {1}, true, ggml_metal_fusion_check_short_conv },
+    { GGML_METAL_FUSION_SHORT_CONV_DYN, ggml_metal_fusion_ops_short_conv_dyn(4), {1}, true, ggml_metal_fusion_check_short_conv },
+    { GGML_METAL_FUSION_SHORT_CONV_DYN, ggml_metal_fusion_ops_short_conv_dyn(5), {1}, true, ggml_metal_fusion_check_short_conv },
     { GGML_METAL_FUSION_SHORT_CONV_RS, ops_short_conv_rs, {1}, true, ggml_metal_fusion_check_short_conv_rs },
     { GGML_METAL_FUSION_SHORT_CONV_RS, ops_short_conv_rs_add, {1}, true, ggml_metal_fusion_check_short_conv_rs },
     { GGML_METAL_FUSION_GATED_MIX,    ops_gated_mix,    {}, true, ggml_metal_fusion_check_gated_mix },

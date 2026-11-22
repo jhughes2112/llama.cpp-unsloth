@@ -996,6 +996,68 @@ kernel void kernel_rel_bias_f32_f16(
 
     dst[((ulong) ih*args.n_tokens + it)*args.n_kv + kv] = half(sumf - sink[it*args.n_head + ih] + mask[it*args.n_kv + kv]);
 }
+// kernel_short_conv_f32 with per-head, input-dependent taps on top of the weights:
+//   y[c, t] = s*(cur[c, t] + sum_j w[j, c]*x[t + j, c] + sum_l tap[l, head(c), t]*x[t + nc - 1 - l, c]) + b
+// the window lives in registers, so dst may be cur in place
+kernel void kernel_short_conv_dyn_f32(
+        constant ggml_metal_kargs_short_conv & args,
+        device const char  * past,
+        device const float * cur,
+        device const float * w,
+        device       char  * cell,
+        device       float * dst,
+        device const float * taps,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int c  = gid.x;
+    const int is = gid.y;
+    if (c >= args.C || is >= args.n_s) {
+        return;
+    }
+
+    const int nh = args.nc - 1;
+
+    float h[8];
+
+    device const float * p = (device const float *) (past + is*args.nb_past2) + c*nh;
+    for (int j = 0; j < nh; ++j) {
+        h[j] = p[j];
+    }
+
+    device const float * wc = w + c*args.nc;
+
+    const ulong tok0 = (ulong) is*args.n_t;
+
+    const int ih = c/(args.C/args.n_heads);
+
+    for (int t = 0; t < args.n_t; ++t) {
+        const float xt = cur[(tok0 + t)*args.C + c];
+
+        float acc = 0.0f;
+        for (int j = 0; j < nh; ++j) {
+            acc += h[j]*wc[j];
+        }
+        acc += xt*wc[nh];
+
+        device const float * tap = taps + ((tok0 + t)*args.n_heads + ih)*args.nc;
+
+        acc += xt*tap[0];
+        for (int l = 1; l < args.nc; ++l) {
+            acc += h[nh - l]*tap[l];
+        }
+
+        dst[(tok0 + t)*args.C + c] = args.s*(xt + acc) + args.b;
+
+        for (int j = 0; j < nh - 1; ++j) {
+            h[j] = h[j + 1];
+        }
+        h[nh - 1] = xt;
+    }
+
+    device float * q = (device float *) (cell + is*args.nb_cell1) + c*nh;
+    for (int j = 0; j < nh; ++j) {
+        q[j] = h[j];
+    }
+}
 // the short causal convolution of kernel_short_conv_f32 for a state with rollback slots: after token t the window
 // x[t + 1 .. t + nc - 1] goes to slot order[t - (n_t - Kw)], for the last Kw tokens
 kernel void kernel_short_conv_rs_f32(

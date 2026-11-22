@@ -20,7 +20,8 @@ struct ggml_metal_device_props;
 
 // the maximum number of nodes that can be fused in a single kernel
 // (also the maximum length of a packed fusion group during graph optimization)
-#define GGML_METAL_FUSION_MAX 24
+// (the dynamic short conv of Inkling 2 is 17 kernels over 41 raw nodes)
+#define GGML_METAL_FUSION_MAX 48
 
 typedef enum ggml_metal_fusion_mode {
     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
@@ -54,6 +55,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_EXPERT_SITU,  // EXPERT_SCALE + SITU (the scalar of each expert applied to gate and up inside the activation)
     GGML_METAL_FUSION_EXPERT_REDUCE, // EXPERT_SCALE + MOE_REDUCE (the scalar of each expert applied inside the weighted sum)
     GGML_METAL_FUSION_DEPTH_MIX_NORM, // DEPTH_MIX with one query + RMS_NORM + MUL (the norm behind the mix, in its kernel)
+    GGML_METAL_FUSION_SHORT_CONV_DYN, // SHORT_CONV + (CONT + MUL + ADD) per lag (input-dependent taps per head)
     GGML_METAL_FUSION_CTRL_DOWN,    // CONCAT + RMS_NORM + MUL_MAT (the normalized pair of a loop controller projected to its rank)
     GGML_METAL_FUSION_CTRL_OUT,     // MUL_MAT + MUL_MAT + GATED_MIX (both gates of a loop controller and its output)
 } ggml_metal_fusion_id;

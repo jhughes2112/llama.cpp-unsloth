@@ -272,6 +272,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
+    if (dynamic) {
+        // the taps first (order only), so that the convolution stays one run of nodes that backends can fuse
+        ggml_build_forward_order(gf, dynamic);
+    }
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -476,11 +480,22 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         // self-attention
         {
             ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
-            ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
-                    is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
-            ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
-                    is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, inputs[1]);
+            ggml_tensor * Vcur = build_lora_mm(layer.wv, inputs[2]);
             ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+            ggml_tensor * Ktap = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
+            ggml_tensor * Vtap = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+
+            // the projections of the layer input first (order only): they are independent, so a backend can run them
+            // together, and the two convolutions after them
+            for (ggml_tensor * t : {Qcur, Kcur, Vcur, Rcur, Ktap, Vtap}) {
+                if (t) {
+                    ggml_build_forward_order(gf, t);
+                }
+            }
+
+            Kcur = convolve(Kcur, layer.attn_k_conv, Ktap, state, history, recr, 0);
+            Vcur = convolve(Vcur, layer.attn_v_conv, Vtap, state, history, recr, n_embd_k_gqa);
 
             Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
             Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);

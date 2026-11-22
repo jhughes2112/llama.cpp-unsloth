@@ -785,7 +785,7 @@ typedef struct {
     float    s;        // output scale and bias
     float    b;
     int32_t  has_res;  // add the residual to the output
-    int32_t  pad;
+    int32_t  n_heads;  // of the dynamic taps (0: none)
 } ggml_metal_kargs_short_conv;
 
 typedef struct {

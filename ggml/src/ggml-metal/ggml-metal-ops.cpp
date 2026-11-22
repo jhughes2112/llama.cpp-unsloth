@@ -636,7 +636,8 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
     if (ctx->use_fusion()) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
-        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SHORT_CONV) {
+        if (fusion && (ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SHORT_CONV ||
+                       ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SHORT_CONV_DYN)) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_short_conv(ctx, idx, n);
         }
@@ -5835,12 +5836,18 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
     const ggml_tensor * cat   = ctx->node(idx + 0);
     const ggml_tensor * cpy   = ctx->node(idx + 1);
     const ggml_tensor * conv  = ctx->node(idx + 2);
-    const ggml_tensor * add   = ctx->node(idx + 3);
-    const ggml_tensor * scale = ctx->node(idx + 4);
+    // with dynamic taps: (cont mul add) per lag between the conv and the residual add, n = 5 + 3*nc
+    const bool dyn = n > 6;
+
+    const ggml_tensor * add   = ctx->node(idx + (dyn ? n - 2 : 3));
+    const ggml_tensor * scale = ctx->node(idx + (dyn ? n - 1 : 4));
     ggml_tensor *       dst   = ctx->node(idx + n - 1);
 
     // the residual of the variant with an ADD behind the scale
     const ggml_tensor * res = n == 6 ? (dst->src[0] == scale ? dst->src[1] : dst->src[0]) : nullptr;
+
+    const ggml_tensor * tap  = dyn ? ctx->node(idx + 4)->src[1] : nullptr;
+    const ggml_tensor * taps = tap ? tap->view_src : nullptr;
 
     const ggml_tensor * past = cat->src[0];
     const ggml_tensor * cell = cpy->src[1];
@@ -5849,7 +5856,8 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
 
     ggml_metal_op_fused_concurrency(ctx, idx, n);
 
-    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_short_conv_f32");
+    // two kernels: the plain one keeps its window in registers, which the code for the taps costs it
+    auto pipeline = ggml_metal_library_get_pipeline_named(lib, taps ? "kernel_short_conv_dyn_f32" : "kernel_short_conv_f32");
 
     ggml_metal_kargs_short_conv args = {
         /*.nc       =*/ (int32_t) w->ne[0],
@@ -5861,7 +5869,7 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
         /*.s        =*/ ggml_get_op_params_f32(scale, 0),
         /*.b        =*/ ggml_get_op_params_f32(scale, 1),
         /*.has_res  =*/ res ? 1 : 0,
-        /*.pad      =*/ 0,
+        /*.n_heads  =*/ tap ? (int32_t) tap->ne[1] : 0,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -5871,7 +5879,7 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),    3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell), 4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),  5);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res ? res : dst), 6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(taps ? taps : (res ? res : dst)), 6);
 
     const int nth = 64;
 
