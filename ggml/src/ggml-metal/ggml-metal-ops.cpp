@@ -4436,6 +4436,19 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
                           (int) ne00, (int) ne20,   // dk, dv (ne00 == dk for FA)
                           ne11, ne01);
 
+        {
+            // GGML_METAL_FA_NE: keys per simdgroup step of the vec kernel (1, 2 or 4), for tuning
+            static const int ne_env = getenv("GGML_METAL_FA_NE") ? atoi(getenv("GGML_METAL_FA_NE")) : 0;
+            if (ne_env > 0 && !use_sparse && (ne00/4) % (32/ne_env) == 0 && (ne20/4) % (32/ne_env) == 0) {
+                cfg.NE = (int8_t) ne_env;
+            }
+            // Q8_0 keys over a short cache: the baseline of one key a step is slow there (9.27 -> 8.83 ms a token)
+            if (ne_env == 0 && !use_sparse && op->src[1]->type == GGML_TYPE_Q8_0 && cfg.Q == 1 && cfg.NE == 1 &&
+                (ne00/4) % 8 == 0 && (ne20/4) % 8 == 0) {
+                cfg.NE = 4;
+            }
+        }
+
         int nqptg = cfg.Q; // queries per threadgroup
 
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!

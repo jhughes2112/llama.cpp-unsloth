@@ -1265,11 +1265,19 @@ kernel void kernel_kv_conv_store_f32(
             const float d    = amax/127.0f;
             const float id   = d > 0.0f ? 1.0f/d : 0.0f;
 
+            // every fourth thread stores the values of four (a store a byte was 4 us a kernel slower)
+            const float q0 = round(v*id);
+            const float q1 = simd_shuffle_down(q0, 1);
+            const float q2 = simd_shuffle_down(q0, 2);
+            const float q3 = simd_shuffle_down(q0, 3);
+
             device char * blk = row + (ulong) (c/32)*34;
             if (tiisg == 0) {
                 *((device half *) blk) = half(d);
             }
-            ((device char *) (blk + 2))[c%32] = (char) round(v*id);
+            if (tiisg%4 == 0) {
+                *((device packed_char4 *) (blk + 2 + tiisg)) = char4(int4(q0, q1, q2, q3));
+            }
         } else if (args.is_f16) {
             ((device half *) row)[c] = half(y*f);
         } else {
