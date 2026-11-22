@@ -1985,6 +1985,7 @@ static bool ggml_metal_fusion_check_clip_rel_bias(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 2);
 }
 static const ggml_metal_fusion * ggml_metal_fusion_find(ggml_metal_fusion_id id, int n_ops);
+static const ggml_metal_fusion * ggml_metal_fusion_find_raw(ggml_metal_fusion_id id, int n_raw);
 
 // SHORT_CONV [RESHAPE] (L2_CLIP | RMS_NORM) [VIEW] SET_ROWS: K or V of an Inkling 2 layer from its projection to the
 // KV cache: the short convolution over the stored window, the clip (K) or the RMS norm (V) of each head, and the
@@ -2345,6 +2346,104 @@ static std::vector<ggml_op> ggml_metal_fusion_ops_gather_fa(int n_pairs) {
     return ops;
 }
 
+// L2_CLIP (with its weight) [MUL] [PERMUTE] GATHER_FA: the clip of the query of an Inkling 2 layer (in the
+// full-attention layers times a factor a token) right in front of the attention that reads it. the attention kernel
+// loads the unclipped query and clips it, a head a threadgroup, so the clipped query is neither computed nor stored
+static std::vector<ggml_op> ggml_metal_fusion_ops_qclip_gather_fa(int tau, int n_pairs) {
+    std::vector<ggml_op> ops = {
+        GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL
+    };
+    if (tau) {
+        ops.push_back(GGML_OP_MUL);
+    }
+    ops.push_back(GGML_OP_PERMUTE); // of the bias table
+    for (ggml_op op : ggml_metal_fusion_ops_gather_fa(n_pairs)) {
+        ops.push_back(op);
+    }
+    return ops;
+}
+
+static bool ggml_metal_fusion_check_qclip_gather_fa(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    static const bool off = getenv("GGML_METAL_NO_QCLIP_FA") != nullptr;
+
+    // 9 nodes of the clip, the factor a token, 7 of the attention
+    const int o    = n - 16;
+    const int nq   = 9 + o;
+    const int raw0 = node_idxs[idx];
+
+    if (off || (o != 0 && o != 1) || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1 ||
+        node_idxs[idx + nq - 1] != raw0 + nq - 1 || node_idxs[idx + nq] != raw0 + nq + 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    if (!ggml_metal_fusion_l2_clip_core(nodes, 9)) {
+        return false;
+    }
+
+    const ggml_tensor * in   = nodes[0]->src[0];
+    const ggml_tensor * w    = nodes[0]->src[1];
+    const ggml_tensor * qcur = nodes[nq - 1];
+
+    if (in->ne[3] != 1 || w->ne[0] != in->ne[0] || w->ne[1] != in->ne[1] || w->ne[2] != 1 || w->ne[3] != 1 || in->ne[0] % 4 != 0) {
+        return false;
+    }
+
+    if (o) {
+        const ggml_tensor * tmul = nodes[9];
+        const ggml_tensor * tau  = tmul->src[1];
+        if (tmul->src[0] != nodes[8] || tmul->view_src != nullptr || tmul->type != GGML_TYPE_F32 || !ggml_are_same_shape(tmul, nodes[8]) ||
+            tau->type != GGML_TYPE_F32 || !ggml_is_contiguous(tau) || tau->ne[0] != 1 || tau->ne[1] != 1 || tau->ne[2] != tmul->ne[2] || tau->ne[3] != 1) {
+            return false;
+        }
+    }
+
+    // the attention behind, with its lookup of the bias
+    const ggml_metal_fusion * gather = ggml_metal_fusion_find_raw(GGML_METAL_FUSION_GATHER_FA, n_raw - nq - 1);
+    if (gather == nullptr || !gather->check(gather, nodes + nq, gf, node_idxs, idx + nq, mode)) {
+        return false;
+    }
+
+    // it reads the clipped query through a view made in the run, and nothing else reads that query
+    const ggml_tensor * fa = nodes[nq + 5];
+    const ggml_tensor * q  = fa->src[0];
+    if (q->view_src != qcur || q->ne[0] != in->ne[0] || q->ne[2] != in->ne[1] || q->ne[1] != in->ne[2] || q->ne[3] != 1) {
+        return false;
+    }
+
+    int n_readers = 0;
+    for (int i = nq; i < n_raw; ++i) {
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (gf->nodes[raw0 + i]->src[j] == qcur) {
+                n_readers++;
+            }
+        }
+    }
+    if (n_readers != 1 || ggml_node_get_use_count(gf, raw0 + nq - 1) != 1) {
+        return false;
+    }
+
+    const int outputs[1] = { raw0 + nq - 1 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, nq, fusion->ops_all.data(), outputs, 1);
+}
+
 // L2_CLIP (with its weight) PAD MUL_MAT [RESHAPE] SUB: the relative-position bias table of a query,
 //   t[p, h] = sum_r bias[r, p]*R[r, h] - sink[h], no bias in the padded last row, R the clipped features.
 // taken when the attention behind looks the bias up in it (GATHER_FA): the rest of REL_BIAS is then not computed
@@ -2631,6 +2730,14 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_CLIP_REL_BIAS, ops_clip_rel_bias, {}, true, ggml_metal_fusion_check_clip_rel_bias },
     { GGML_METAL_FUSION_FA_GATE, ops_fa_gate, {}, true, ggml_metal_fusion_check_fa_gate },
     { GGML_METAL_FUSION_CLIP_REL_TABLE, ops_clip_rel_table, {}, true, ggml_metal_fusion_check_clip_rel_table },
+    { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(0, 0), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
+    { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(0, 1), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
+    { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(0, 2), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
+    { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(0, 3), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
+    { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(1, 0), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
+    { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(1, 1), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
+    { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(1, 2), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
+    { GGML_METAL_FUSION_QCLIP_GATHER_FA, ggml_metal_fusion_ops_qclip_gather_fa(1, 3), {}, true, ggml_metal_fusion_check_qclip_gather_fa },
     { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(0), {}, true, ggml_metal_fusion_check_gather_fa },
     { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(1), {}, true, ggml_metal_fusion_check_gather_fa },
     { GGML_METAL_FUSION_GATHER_FA, ggml_metal_fusion_ops_gather_fa(2), {}, true, ggml_metal_fusion_check_gather_fa },
@@ -2659,6 +2766,16 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 };
 
 // the pattern of a fusion with this many (non-empty) ops
+// the pattern of a kind with that many nodes, the views counted
+static const ggml_metal_fusion * ggml_metal_fusion_find_raw(ggml_metal_fusion_id id, int n_raw) {
+    for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+        if (fusion.id == id && (int) fusion.ops_all.size() == n_raw) {
+            return &fusion;
+        }
+    }
+    return nullptr;
+}
+
 static const ggml_metal_fusion * ggml_metal_fusion_find(ggml_metal_fusion_id id, int n_ops) {
     for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
         if (fusion.id == id && (int) fusion.ops.size() == n_ops) {

@@ -19,6 +19,9 @@ constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_A
 constant bool    FC_flash_attn_ext_vec_has_relb   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
 // one workgroup writes the result itself: with a gate of its shape it writes the gated result (FA_GATE)
 constant bool    FC_flash_attn_ext_vec_has_gate   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 8)]];
+// the query comes unclipped: the kernel scales it by a weight a channel and clips the L2 norm of each head as it loads
+// it (QCLIP_GATHER_FA), so the clipped query is never stored
+constant bool    FC_flash_attn_ext_vec_has_qclip  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 9)]];
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -52,6 +55,8 @@ kernel void kernel_flash_attn_ext_vec(
         device const float * reltab,
         device const int   * relpos,
         device const char  * gate,
+        device const float * qw,
+        device const float * qtau,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -122,7 +127,28 @@ kernel void kernel_flash_attn_ext_vec(
         for (short qq = 0; qq < Q; ++qq) {
             const int iq1_q = iq1*Q + qq;
             device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
-            if (iq1_q < args.ne01) {
+            if (FC_flash_attn_ext_vec_has_qclip && iq1_q < args.ne01) {
+                device const float4 * w4 = (device const float4 *) (qw + (ulong) iq2*DK);
+
+                float ssq = 0.0f;
+                for (short i = tiisg; i < DK4; i += NW) {
+                    const float4 x = q4[i]*w4[i];
+                    ssq += dot(x, x);
+                }
+                ssq = simd_sum(ssq);
+
+                const float f = clamp(args.qc_c/(args.qc_s*sqrt(ssq) + args.qc_b), args.qc_lo, args.qc_hi);
+                const float t = args.has_qtau ? qtau[iq1_q] : 1.0f;
+
+                for (short i = tiisg; i < PK4; i += NW) {
+                    if (i < DK4) {
+                        const float4 x = (q4[i]*w4[i])*f;
+                        sq4[qq*PK4 + i] = (q4_t) (args.has_qtau ? x*t : x);
+                    } else {
+                        sq4[qq*PK4 + i] = (q4_t) 0.0f;
+                    }
+                }
+            } else if (iq1_q < args.ne01) {
                 for (short i = tiisg; i < PK4; i += NW) {
                     if (i < DK4) {
                         sq4[qq*PK4 + i] = (q4_t) q4[i];

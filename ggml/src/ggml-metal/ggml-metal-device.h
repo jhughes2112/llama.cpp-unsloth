@@ -268,7 +268,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t ns10,
         int32_t ns20,
         bool    has_relb,
-        bool    has_gate);
+        bool    has_gate,
+        bool    has_qclip);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,

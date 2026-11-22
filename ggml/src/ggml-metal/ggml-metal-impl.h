@@ -510,6 +510,12 @@ typedef struct {
     float    logit_softcap;
     int32_t  n_kv_max_padded;
     int32_t  rel_nc1; // has_relb: rows of the bias table of a head
+    float    qc_s;    // has_qclip: q*w*clamp(c/(s*|q*w| + b), lo, hi), a head a row
+    float    qc_b;
+    float    qc_c;
+    float    qc_lo;
+    float    qc_hi;
+    int32_t  has_qtau; // and times a factor a token
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {

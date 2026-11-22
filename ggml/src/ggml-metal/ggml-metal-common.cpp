@@ -652,6 +652,15 @@ static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_
         list.push_back({ beg, end, lvl, write });
     };
 
+    // a source of a kernel of the group that the group does not make itself: a tensor from outside, or a view made in
+    // the group of a tensor from outside (the bias table and the K/V cache an attention reads through its own views)
+    const auto external = [&](const node_info & node, const ggml_tensor * src) {
+        if (!node.is_output(src)) {
+            return true;
+        }
+        return ggml_op_is_empty(src->op) && src->view_src != nullptr && !node.is_output(src->view_src);
+    };
+
     int floor = 0; // groups after an op with unknown accesses stay after it
     int top   = 0;
 
@@ -696,7 +705,7 @@ static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_
                 }
                 for (int j = 0; j < GGML_MAX_SRC; ++j) {
                     const ggml_tensor * src = t->src[j];
-                    if (src && !node.is_output(src)) {
+                    if (src && external(node, src)) {
                         lvl = std::max(lvl, after(src, false));
                     }
                 }
@@ -712,7 +721,7 @@ static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_
                 }
                 for (int j = 0; j < GGML_MAX_SRC; ++j) {
                     const ggml_tensor * src = t->src[j];
-                    if (src && !node.is_output(src)) {
+                    if (src && external(node, src)) {
                         record(src, false, lvl);
                     }
                 }

@@ -3797,6 +3797,14 @@ struct ggml_metal_fa_relb {
     const ggml_tensor * pos;   // distance of each key [n_kv, n_tokens]
     const ggml_tensor * mask;  // F32 mask of the keys [n_kv, n_tokens]
     const ggml_tensor * gate_mul;
+
+    // QCLIP_GATHER_FA: the query before its clip, and the kernel clips it as it loads it
+    const ggml_tensor * q_in;    // [n_embd_head, n_head, n_tokens], nullptr without
+    const ggml_tensor * q_w;     // [n_embd_head, n_head]
+    const ggml_tensor * q_tau;   // [1, 1, n_tokens] or nullptr
+    const ggml_tensor * q_scale; // the nodes that hold the parameters of the clip
+    const ggml_tensor * q_fill;
+    const ggml_tensor * q_clamp;
 };
 
 static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const ggml_metal_fa_relb * relb);
@@ -4549,6 +4557,8 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
         const int32_t ns10 = nb11_attn/nb10_attn;
         const int32_t ns20 = nb21_attn/nb20_attn;
 
+        const bool qclip = relb != nullptr && relb->q_in != nullptr;
+
         ggml_metal_kargs_flash_attn_ext_vec args = {
             /*.ne01          =*/ ne01,
             /*.ne02          =*/ ne02,
@@ -4584,9 +4594,15 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
             /*.logit_softcap =*/ logit_softcap,
             /*.n_kv_max_padded =*/ n_kv_max_padded,
             /*.rel_nc1       =*/ relb ? (int32_t) relb->table->ne[0] : 0,
+            /*.qc_s          =*/ qclip ? ggml_get_op_params_f32(relb->q_scale, 0) : 0.0f,
+            /*.qc_b          =*/ qclip ? ggml_get_op_params_f32(relb->q_scale, 1) : 0.0f,
+            /*.qc_c          =*/ qclip ? ggml_get_op_params_f32(relb->q_fill,  0) : 0.0f,
+            /*.qc_lo         =*/ qclip ? ggml_get_op_params_f32(relb->q_clamp, 0) : 0.0f,
+            /*.qc_hi         =*/ qclip ? ggml_get_op_params_f32(relb->q_clamp, 1) : 0.0f,
+            /*.has_qtau      =*/ qclip && relb->q_tau ? 1 : 0,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20, relb != nullptr, gate_mul != nullptr && nwg == 1);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20, relb != nullptr, gate_mul != nullptr && nwg == 1, qclip);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4618,6 +4634,16 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
             (gate_mul->src[0]->view_src == op || gate_mul->src[0] == op) ? gate_mul->src[1] : gate_mul->src[0];
 
         ggml_metal_encoder_set_buffer(enc, gate && nwg == 1 ? ggml_metal_get_buffer_id(gate) : bid_src0, 11);
+
+        if (qclip) {
+            // the unclipped query has the layout of the clipped one, so the strides of the attention hold for it
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(relb->q_in), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(relb->q_w),  12);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(relb->q_tau ? relb->q_tau : relb->q_w), 13);
+        } else {
+            ggml_metal_encoder_set_buffer(enc, bid_src0, 12);
+            ggml_metal_encoder_set_buffer(enc, bid_src0, 13);
+        }
 
         if (nwg == 1) {
             // using 1 workgroup -> write the result directly into dst, gated if there is a gate
@@ -4701,6 +4727,10 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CLIP_REL_BIAS) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_rel_bias_impl(ctx, idx, n, true);
+        }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_QCLIP_GATHER_FA) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_qclip_gather_flash_attn(ctx, idx, n);
         }
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CLIP_REL_TABLE) {
             ctx->count_fusions(fusion);
@@ -6507,6 +6537,36 @@ int ggml_metal_op_gather_flash_attn(ggml_metal_op_t ctx, int idx, int n) {
     };
 
     ggml_metal_op_flash_attn_ext_impl(ctx, idx + 5, &relb);
+
+    return n;
+}
+
+// QCLIP_GATHER_FA: the clip of the query (MUL by its weight, the 8 nodes of the L2 clip, a MUL by a factor a token in
+// the full-attention layers) in front of a GATHER_FA run. the attention kernel clips the query as it loads it
+int ggml_metal_op_qclip_gather_flash_attn(ggml_metal_op_t ctx, int idx, int n) {
+    const int o = n - 16; // 1 with the factor a token
+
+    const ggml_tensor * mul0  = ctx->node(idx + 0);
+    const ggml_tensor * cont1 = ctx->node(idx + 9 + o);
+    const ggml_tensor * rows  = ctx->node(idx + 9 + o + 1);
+    const ggml_tensor * add   = ctx->node(idx + 9 + o + 3);
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n);
+
+    const ggml_metal_fa_relb relb = {
+        /*.table    =*/ cont1->src[0]->view_src,
+        /*.pos      =*/ rows->src[1],
+        /*.mask     =*/ add->src[1],
+        /*.gate_mul =*/ ctx->node(idx + n - 1),
+        /*.q_in     =*/ mul0->src[0],
+        /*.q_w      =*/ mul0->src[1],
+        /*.q_tau    =*/ o ? ctx->node(idx + 9)->src[1] : nullptr,
+        /*.q_scale  =*/ ctx->node(idx + 4),
+        /*.q_fill   =*/ ctx->node(idx + 5),
+        /*.q_clamp  =*/ ctx->node(idx + 7),
+    };
+
+    ggml_metal_op_flash_attn_ext_impl(ctx, idx + 9 + o + 5, &relb);
 
     return n;
 }

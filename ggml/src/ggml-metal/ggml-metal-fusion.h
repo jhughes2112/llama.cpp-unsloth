@@ -61,6 +61,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_REDUCE_CONV,  // EXPERT_REDUCE + SHORT_CONV with its residual (the MoE output through its convolution)
     GGML_METAL_FUSION_SOFTCAP,      // SCALE + TANH + SCALE + CONT (soft cap of the logits and the copy without the padding)
     GGML_METAL_FUSION_FA_GATE,      // FLASH_ATTN_EXT + MUL (a gate on the attention output, applied where the result is written)
+    GGML_METAL_FUSION_QCLIP_GATHER_FA, // the clip of the query + GATHER_FA (the attention kernel clips the query it loads)
     GGML_METAL_FUSION_CLIP_REL_TABLE, // L2_CLIP + PAD + MUL_MAT + SUB (the relative-position bias table of a query, by distance)
     GGML_METAL_FUSION_GATHER_FA,    // CONT + GET_ROWS + CONT + ADD + CPY + FA_GATE (the attention looks its bias up: no mask per head)
     GGML_METAL_FUSION_CTRL_DOWN,    // CONCAT + RMS_NORM + MUL_MAT (the normalized pair of a loop controller projected to its rank)
