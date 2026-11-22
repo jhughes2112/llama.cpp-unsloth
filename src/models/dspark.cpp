@@ -1086,7 +1086,35 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     }
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     res->t_embd = cur;
-    auto * base = build_lora_mm(target->output, cur, target->output_s);
+
+    // the heads run for the leading positions of each block that the batch asks logits for: the anchor and the drafts
+    // that will be read. the chain is causal over the positions (a position reads the state and the token of the one
+    // before it), and each position costs two projections on the vocabulary and its argmax, so the rest of the block,
+    // which the backbone above still needs as context, stops here
+    // the positions that are not asked for are returned as zeros, so the outputs keep the shape of the whole block
+    int64_t block_out = block;
+    if (params.gtype != LLM_GRAPH_TYPE_DRAFT_BACKBONE && block <= hparams.dflash_block_size && ubatch.output != nullptr) {
+        int64_t n_lead = 0;
+        while (n_lead < block && ubatch.output[n_lead] != 0) {
+            n_lead++;
+        }
+        bool leading = n_lead >= 2 && n_lead < block;
+        for (int64_t i = 0; i < n_tokens && leading; ++i) {
+            leading = (ubatch.output[i] != 0) == (i % block < n_lead);
+        }
+        if (leading) {
+            block_out = n_lead;
+        }
+    }
+
+    auto * cur_out = cur;
+    if (block_out < block) {
+        cur_out = ggml_reshape_3d(ctx0, cur, n_embd, block, nb);
+        cur_out = ggml_cont(ctx0, ggml_view_3d(ctx0, cur_out, n_embd, block_out, nb, cur_out->nb[1], cur_out->nb[2], 0));
+        cur_out = ggml_reshape_2d(ctx0, cur_out, n_embd, block_out*nb);
+    }
+
+    auto * base = build_lora_mm(target->output, cur_out, target->output_s);
     ggml_prec_set_acc(base, GGML_PREC_F32);
     if (params.gtype == LLM_GRAPH_TYPE_DRAFT_BACKBONE || block > hparams.dflash_block_size) {
         res->t_h_nextn = cur;
@@ -1095,16 +1123,17 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     }
     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
     auto * states = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
-    auto * logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, base->ne[0], nb, block*base->nb[1], 0));
-    const auto column = [&](ggml_tensor * t, int64_t i) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
+    auto * logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, base->ne[0], nb, block_out*base->nb[1], 0));
+    // column i of every block of t, whose blocks are n columns
+    const auto column = [&](ggml_tensor * t, int64_t i, int64_t n) {
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, n*t->nb[1], i*t->nb[1]));
     };
-    auto * context = column(f_rnn, 0);
+    auto * context = column(f_rnn, 0, block);
     auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
     tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     auto * prev = ids;
-    for (int64_t i = 1; i < block; ++i) {
-        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
+    for (int64_t i = 1; i < block_out; ++i) {
+        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i, block), column(base, i, block_out), context);
         states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
         logits = ggml_concat(ctx0, logits, col, 1);
         // Select the first maximum, independent of backend argmax tie order.
@@ -1114,6 +1143,10 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
     }
     const auto block_order = [&](ggml_tensor * t) {
+        if (block_out < block) {
+            // position-major here: the positions left out go after the ones computed
+            t = ggml_pad(ctx0, t, 0, nb*(block - block_out), 0, 0);
+        }
         t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, block);
         return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3)), t->ne[0], n_tokens);
     };

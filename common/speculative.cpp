@@ -1506,7 +1506,8 @@ public:
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                // the recurrent head is asked for the anchor and the drafts that are read below, not for the whole block
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !has_rnn_context || i <= n_draft);
                 if (has_rnn_context) {
                     // the context features of the committed anchor condition the recurrent head
                     const llama_pos pos = dp.pos0 - 1;
