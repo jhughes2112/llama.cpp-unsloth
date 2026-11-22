@@ -6425,7 +6425,6 @@ int ggml_metal_op_rel_bias_impl(ggml_metal_op_t ctx, int idx, int n, bool clip) 
         /*.c        =*/ clip ? ggml_get_op_params_f32(ctx->node(idx + 5), 0) : 0.0f,
         /*.lo       =*/ clip ? ggml_get_op_params_f32(ctx->node(idx + 6 + 1), 0) : 0.0f,
         /*.hi       =*/ clip ? ggml_get_op_params_f32(ctx->node(idx + 6 + 1), 1) : 0.0f,
-        /*.has_tau  =*/ 0,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -6453,11 +6452,7 @@ int ggml_metal_op_clip_rel_table(ggml_metal_op_t ctx, int idx, int n) {
     const ggml_tensor * scale = ctx->node(idx + 4);
     const ggml_tensor * fill  = ctx->node(idx + 5);
     const ggml_tensor * clamp = ctx->node(idx + 7);
-    // with a factor a token on the clipped features (a MUL behind the clip), 13 nodes
-    const int o = n - 12;
-
-    const ggml_tensor * pad   = ctx->node(idx + 9 + o);
-    const ggml_tensor * tau   = o ? ctx->node(idx + 9)->src[1] : nullptr;
+    const ggml_tensor * pad   = ctx->node(idx + 9);
     ggml_tensor *       dst   = ctx->node(idx + n - 1);
 
     const ggml_tensor * bias = pad->src[0];
@@ -6478,7 +6473,6 @@ int ggml_metal_op_clip_rel_table(ggml_metal_op_t ctx, int idx, int n) {
         /*.c        =*/ ggml_get_op_params_f32(fill,  0),
         /*.lo       =*/ ggml_get_op_params_f32(clamp, 0),
         /*.hi       =*/ ggml_get_op_params_f32(clamp, 1),
-        /*.has_tau  =*/ tau ? 1 : 0,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -6488,7 +6482,6 @@ int ggml_metal_op_clip_rel_table(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst->src[1]),  3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul0->src[1]), 4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),          5);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(tau ? tau : dst), 6);
 
     const int nth = 64;
 

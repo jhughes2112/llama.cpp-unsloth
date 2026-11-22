@@ -894,7 +894,6 @@ typedef struct {
     float   c;
     float   lo;
     float   hi;
-    int32_t has_tau;  // the clipped features times a factor a token
 } ggml_metal_kargs_rel_bias;
 
 typedef struct {
