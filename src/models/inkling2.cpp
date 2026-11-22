@@ -382,6 +382,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     ggml_tensor *              prelude_cur = nullptr;
     std::vector<ggml_tensor *> bank;
     ggml_tensor *              bank_last = nullptr;
+    ggml_tensor *              bank_attn = nullptr; // the messages of a pass, [n_embd, 2*n_loop_core, n_tokens]
+    ggml_tensor *              bank_kv   = nullptr;
+    ggml_tensor *              zero_sinks[2] = {nullptr, nullptr}; // by layer kind: one tensor for all the layers of a kind
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -401,21 +404,18 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     bank_last = cur;
                     blocks    = prelude_blocks;
                     cur       = prelude_cur;
+
+                    // the messages of all the core layers of this pass, from one mix each (as unslothai/llama.cpp#403):
+                    // the layers read the same bank, each with its rows of the queries
+                    bank_attn = mix(bank, bank_last, model.loop_res_query);
+                    bank_kv   = mix(bank, bank_last, model.loop_kv_res_query);
+                    ggml_build_forward_order(gf, bank_attn);
+                    ggml_build_forward_order(gf, bank_kv);
                 }
             }
 
             if (pass > 0) {
                 const int64_t row = 2*(ip - (int) hparams.loop_core_start);
-
-                ggml_tensor * q_attn = ggml_view_2d(ctx0, model.loop_res_query,    n_embd, 2, model.loop_res_query->nb[1],    row*model.loop_res_query->nb[1]);
-                ggml_tensor * q_kv   = ggml_view_2d(ctx0, model.loop_kv_res_query, n_embd, 2, model.loop_kv_res_query->nb[1], row*model.loop_kv_res_query->nb[1]);
-
-                // (the views of the queries first, order only: each mix is then one run of nodes that backends can fuse)
-                ggml_build_forward_order(gf, q_attn);
-                ggml_build_forward_order(gf, q_kv);
-                // rows: (attn, mlp) and (k, v)
-                ggml_tensor * m_attn = mix(bank, bank_last, q_attn);
-                ggml_tensor * m_kv   = mix(bank, bank_last, q_kv);
 
                 // column j of a mix, [n_embd, n_tokens]: one token is contiguous where it is, more are copied
                 const auto column = [&](ggml_tensor * m, int j) {
@@ -423,9 +423,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                         ggml_view_2d(ctx0, m, n_embd, 1, m->nb[1], j*m->nb[1]) :
                         ggml_cont(ctx0, ggml_view_2d(ctx0, m, n_embd, n_tokens, m->nb[2], j*m->nb[1]));
                 };
+                // rows: (attn, mlp) and (k, v)
                 for (int j = 0; j < 2; ++j) {
-                    messages[j == 0 ? 0 : 3] = column(m_attn, j);
-                    messages[j == 0 ? 1 : 2] = column(m_kv,   j);
+                    messages[j == 0 ? 0 : 3] = column(bank_attn, row + j);
+                    messages[j == 0 ? 1 : 2] = column(bank_kv,   row + j);
                 }
             }
         }
@@ -604,7 +605,13 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
                 table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
-                sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+                {
+                    ggml_tensor *& zero = zero_sinks[is_swa ? 1 : 0];
+                    if (zero == nullptr || zero->ne[0] != n_head) {
+                        zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+                    }
+                    sinks = zero;
+                }
 
                 // dense bias is n_kv x n_tokens x n_head: chunk query rows past the budget
                 const int64_t n_seq_tokens = n_tokens/n_stream;
