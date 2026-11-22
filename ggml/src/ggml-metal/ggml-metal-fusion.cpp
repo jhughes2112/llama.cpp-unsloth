@@ -877,17 +877,7 @@ static bool ggml_metal_fusion_check_mul_mat_add(
 // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: clip the L2 norm of each row,
 //   y = x*clamp(c/(s*sqrt(sum_row(x^2)) + b), lo, hi), with x = in*w when the leading MUL is part of the pattern.
 // not an elision chain (the row sum changes shape and x is read twice), so the structural checks live here (unsafe = true)
-static bool ggml_metal_fusion_check_l2_clip(
-        const ggml_metal_fusion       * fusion,
-        const ggml_tensor * const     * nodes,
-        const ggml_cgraph             * gf,
-        const int                     * node_idxs,
-              int                       idx,
-              ggml_metal_fusion_mode    mode) {
-    GGML_UNUSED(mode);
-
-    const int n = (int) fusion->ops.size();
-    const int o = n - 8; // 1 when the leading MUL is part of the pattern
+static bool ggml_metal_fusion_l2_clip_core(const ggml_tensor * const * nodes, int n) {    const int o = n - 8; // 1 when the leading MUL is part of the pattern
 
     const ggml_tensor * sqr   = nodes[o + 0];
     const ggml_tensor * sum   = nodes[o + 1];
@@ -928,6 +918,24 @@ static bool ggml_metal_fusion_check_l2_clip(
             !ggml_is_contiguous(in) || !ggml_is_contiguous(w)) {
             return false;
         }
+    }
+
+    return true;
+}
+
+static bool ggml_metal_fusion_check_l2_clip(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n = (int) fusion->ops.size();
+
+    if (!ggml_metal_fusion_l2_clip_core(nodes, n)) {
+        return false;
     }
 
     // every intermediate is read only inside the chain
@@ -1814,35 +1822,7 @@ static bool ggml_metal_fusion_check_ctrl_out(
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 1);
 }
-// PAD MUL_MAT [RESHAPE] SUB [PERMUTE] CONT GET_ROWS [RESHAPE PERMUTE] CONT ADD CPY: the per-head attention mask of
-// Inkling 2 with its relative-position bias,
-//   m[kv, t, h] = f16(sum_r bias[r, pos[kv, t]]*R[r, h, t] - sink[h, t] + mask[kv, t])
-// where the padded column of the bias table (pos == its width) is zero. views in the run: unsafe = true
-static bool ggml_metal_fusion_check_rel_bias(
-        const ggml_metal_fusion       * fusion,
-        const ggml_tensor * const     * nodes,
-        const ggml_cgraph             * gf,
-        const int                     * node_idxs,
-              int                       idx,
-              ggml_metal_fusion_mode    mode) {
-    GGML_UNUSED(mode);
-
-    const int n     = (int) fusion->ops.size();
-    const int n_raw = (int) fusion->ops_all.size();
-
-    const int raw0 = node_idxs[idx];
-    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
-        return false;
-    }
-
-    int raw_idxs[GGML_METAL_FUSION_MAX];
-    for (int i = 0; i < n_raw; ++i) {
-        raw_idxs[i] = raw0 + i;
-        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
-            return false;
-        }
-    }
-
+static bool ggml_metal_fusion_rel_bias_core(const ggml_tensor * const * nodes, const ggml_cgraph * gf, int raw0) {
     const ggml_tensor * pad   = nodes[0];
     const ggml_tensor * mm    = nodes[1];
     const ggml_tensor * sub   = nodes[2];
@@ -1905,8 +1885,90 @@ static bool ggml_metal_fusion_check_rel_bias(
         return false;
     }
 
+    return true;
+}
+
+// PAD MUL_MAT [RESHAPE] SUB [PERMUTE] CONT GET_ROWS [RESHAPE PERMUTE] CONT ADD CPY: the per-head attention mask of
+// Inkling 2 with its relative-position bias,
+//   m[kv, t, h] = f16(sum_r bias[r, pos[kv, t]]*R[r, h, t] - sink[h, t] + mask[kv, t])
+// where the padded column of the bias table (pos == its width) is zero. views in the run: unsafe = true
+static bool ggml_metal_fusion_check_rel_bias(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    if (!ggml_metal_fusion_rel_bias_core(nodes, gf, raw0)) {
+        return false;
+    }
+
     // outputs: the mask; the reshape of the sinks is a view of an input
     const int outputs[2] = { raw0 + n_raw - 1, raw0 + 2 };
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 2);
+}
+// L2_CLIP (with its weight) + REL_BIAS: the clip of the relative features of a query and the bias mask made of them.
+// a thread of the mask clips its head again (16 features), so the two are one step
+static bool ggml_metal_fusion_check_clip_rel_bias(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int n     = (int) fusion->ops.size();
+    const int n_raw = (int) fusion->ops_all.size();
+
+    const int raw0 = node_idxs[idx];
+    if (n != 17 || raw0 + n_raw > gf->n_nodes || node_idxs[idx + n - 1] != raw0 + n_raw - 1 || node_idxs[idx + 9] != raw0 + 9) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_raw; ++i) {
+        raw_idxs[i] = raw0 + i;
+        if (gf->nodes[raw0 + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    if (!ggml_metal_fusion_l2_clip_core(nodes, 9) || !ggml_metal_fusion_rel_bias_core(nodes + 9, gf, raw0 + 9)) {
+        return false;
+    }
+
+    const ggml_tensor * in = nodes[0]->src[0];
+    const ggml_tensor * w  = nodes[0]->src[1];
+    const ggml_tensor * R  = nodes[10]->src[1];
+
+    // the clipped features are what the bias reads; the clip weight is one row a head
+    if (R != nodes[8] || !ggml_are_same_shape(in, R) || w->ne[0] != R->ne[0] || w->ne[1] != R->ne[1] || w->ne[2] != 1 || w->ne[3] != 1 ||
+        R->ne[0] > 64) {
+        return false;
+    }
+
+    // outputs: the mask; the reshape of the sinks is a view of an input
+    const int outputs[2] = { raw0 + n_raw - 1, raw0 + 9 + 2 };
 
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 2);
 }
@@ -1997,6 +2059,11 @@ static const std::vector<ggml_op> ops_rel_bias = {
     GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
     GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY
 };
+static const std::vector<ggml_op> ops_clip_rel_bias = {
+    GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
+    GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
+    GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY
+};
 static const std::vector<ggml_op> ops_short_conv_rs = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
 };
@@ -2084,6 +2151,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_CTRL_DOWN,    ops_ctrl_down,    {}, true, ggml_metal_fusion_check_ctrl_down },
     { GGML_METAL_FUSION_CTRL_OUT,     ops_ctrl_out,     {}, true, ggml_metal_fusion_check_ctrl_out },
     { GGML_METAL_FUSION_REL_BIAS,     ops_rel_bias,     {}, true, ggml_metal_fusion_check_rel_bias },
+    { GGML_METAL_FUSION_CLIP_REL_BIAS, ops_clip_rel_bias, {}, true, ggml_metal_fusion_check_clip_rel_bias },
 
     { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(0), {}, true, ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(1), {}, true, ggml_metal_fusion_check_depth_mix },

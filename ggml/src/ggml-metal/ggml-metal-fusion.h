@@ -56,6 +56,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_EXPERT_REDUCE, // EXPERT_SCALE + MOE_REDUCE (the scalar of each expert applied inside the weighted sum)
     GGML_METAL_FUSION_DEPTH_MIX_NORM, // DEPTH_MIX with one query + RMS_NORM + MUL (the norm behind the mix, in its kernel)
     GGML_METAL_FUSION_SHORT_CONV_DYN, // SHORT_CONV + (CONT + MUL + ADD) per lag (input-dependent taps per head)
+    GGML_METAL_FUSION_CLIP_REL_BIAS, // L2_CLIP + REL_BIAS (the clip of the relative features inside the bias mask kernel)
     GGML_METAL_FUSION_CTRL_DOWN,    // CONCAT + RMS_NORM + MUL_MAT (the normalized pair of a loop controller projected to its rank)
     GGML_METAL_FUSION_CTRL_OUT,     // MUL_MAT + MUL_MAT + GATED_MIX (both gates of a loop controller and its output)
 } ggml_metal_fusion_id;

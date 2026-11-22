@@ -835,6 +835,12 @@ typedef struct {
     int32_t n_kv;
     int32_t n_tokens;
     int32_t n_head;
+    int32_t has_clip; // clip the features of a head first: r*w*clamp(c/(s*|r*w| + b), lo, hi)
+    float   s;
+    float   b;
+    float   c;
+    float   lo;
+    float   hi;
 } ggml_metal_kargs_rel_bias;
 
 typedef struct {

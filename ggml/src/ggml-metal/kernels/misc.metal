@@ -973,6 +973,7 @@ kernel void kernel_rel_bias_f32_f16(
         device const int   * pos,
         device const float * mask,
         device       half  * dst,
+        device const float * w,
         uint3 gid [[thread_position_in_grid]]) {
     const int kv = gid.x;
     const int it = gid.y;
@@ -989,8 +990,22 @@ kernel void kernel_rel_bias_f32_f16(
         device const float * b = bias + (ulong) p*args.nr;
         device const float * r = R + ((ulong) it*args.n_head + ih)*args.nr;
 
-        for (int i = 0; i < args.nr; ++i) {
-            sumf += b[i]*r[i];
+        if (args.has_clip) {
+            // the features of the head are not clipped yet: each thread clips them (a few values) for itself
+            device const float * wh = w + (ulong) ih*args.nr;
+
+            float ss = 0.0f;
+            for (int i = 0; i < args.nr; ++i) {
+                const float x = r[i]*wh[i];
+                ss   += x*x;
+                sumf += b[i]*x;
+            }
+
+            sumf *= clamp(args.c/(args.s*sqrt(ss) + args.b), args.lo, args.hi);
+        } else {
+            for (int i = 0; i < args.nr; ++i) {
+                sumf += b[i]*r[i];
+            }
         }
     }
 

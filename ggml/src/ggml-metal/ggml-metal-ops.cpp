@@ -4518,6 +4518,10 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_l2_clip(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CLIP_REL_BIAS) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_rel_bias_impl(ctx, idx, n, true);
+        }
         // MoE output reduction: experts * weights -> weighted sum
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_MOE_REDUCE) {
             ctx->count_fusions(fusion);
@@ -6071,15 +6075,26 @@ int ggml_metal_op_ctrl_out(ggml_metal_op_t ctx, int idx, int n) {
 
 // Dispatch the fused relative-position bias mask from the matched pad mul_mat sub cont get_rows cont add cpy run.
 int ggml_metal_op_rel_bias(ggml_metal_op_t ctx, int idx, int n) {
+    return ggml_metal_op_rel_bias_impl(ctx, idx, n, false);
+}
+
+// clip: the run starts with the L2 clip (and weight) of the relative features, 9 nodes
+int ggml_metal_op_rel_bias_impl(ggml_metal_op_t ctx, int idx, int n, bool clip) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    const ggml_tensor * pad  = ctx->node(idx + 0);
-    const ggml_tensor * mm   = ctx->node(idx + 1);
-    const ggml_tensor * sub  = ctx->node(idx + 2);
-    const ggml_tensor * rows = ctx->node(idx + 4);
-    const ggml_tensor * add  = ctx->node(idx + 6);
+    const int o = clip ? 9 : 0;
+
+    const ggml_tensor * pad  = ctx->node(idx + o + 0);
+    const ggml_tensor * mm   = ctx->node(idx + o + 1);
+    const ggml_tensor * sub  = ctx->node(idx + o + 2);
+    const ggml_tensor * rows = ctx->node(idx + o + 4);
+    const ggml_tensor * add  = ctx->node(idx + o + 6);
     ggml_tensor *       dst  = ctx->node(idx + n - 1);
+
+    // the unclipped features and the clip weight
+    const ggml_tensor * R = clip ? ctx->node(idx)->src[0] : mm->src[1];
+    const ggml_tensor * w = clip ? ctx->node(idx)->src[1] : nullptr;
 
     const ggml_tensor * bias = pad->src[0];
 
@@ -6093,16 +6108,23 @@ int ggml_metal_op_rel_bias(ggml_metal_op_t ctx, int idx, int n) {
         /*.n_kv     =*/ (int32_t) dst->ne[0],
         /*.n_tokens =*/ (int32_t) dst->ne[1],
         /*.n_head   =*/ (int32_t) dst->ne[2],
+        /*.has_clip =*/ clip ? 1 : 0,
+        /*.s        =*/ clip ? ggml_get_op_params_f32(ctx->node(idx + 4), 0) : 0.0f,
+        /*.b        =*/ clip ? ggml_get_op_params_f32(ctx->node(idx + 4), 1) : 0.0f,
+        /*.c        =*/ clip ? ggml_get_op_params_f32(ctx->node(idx + 5), 0) : 0.0f,
+        /*.lo       =*/ clip ? ggml_get_op_params_f32(ctx->node(idx + 6 + 1), 0) : 0.0f,
+        /*.hi       =*/ clip ? ggml_get_op_params_f32(ctx->node(idx + 6 + 1), 1) : 0.0f,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias),         1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm->src[1]),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(R),            2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sub->src[1]),  3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rows->src[1]), 4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(add->src[1]),  5);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),          6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w ? w : R),    7);
 
     const int nth = 64;
 
