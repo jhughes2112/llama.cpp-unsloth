@@ -206,11 +206,11 @@ struct common_speculative_impl {
     // --spec-rows adaptive: whether its drafts are verified at all. a round costs the decode of a token, the pass of the
     // drafter and a part of a token a row, whatever is accepted, so a few rows never pay (measured on Inkling 2, M5
     // Ultra: a token 9.9 ms, a round of 1 row 18, of 2 rows 22, of 7 rows 31, and 6-9 ms more whenever the rows differ
-    // from the round before): a draft is verified in full or not at all. quick off, cautious on: it turns off when the
-    // tokens a round, averaged over the last few, fall under what a round costs, or three rounds in a row accept one
-    // row or none. off, nothing of it is verified: every sixteenth round it drafts in the shadow, and the draft is held
-    // against the tokens the target then produces by itself; it turns on after two such drafts in a row that would
-    // have paid
+    // from the round before): a draft is verified in full or not at all. it turns off when the decayed mean of its
+    // tokens a round falls a quarter token under what a round costs, or six rounds in a row accept one row or none.
+    // off, nothing of it is verified: every eighth round it drafts in the shadow, and the draft is held against the
+    // tokens the target then produces by itself; it turns on when the mean of at least two such drafts is a quarter
+    // token over what a round costs
     bool   row_on      = true;
     double row_tokens  = 0.0; // tokens a round, decayed (0: no round yet)
     int    row_bad     = 0;
@@ -228,11 +228,14 @@ struct common_speculative_impl {
 
     row_switch row_state() { return { row_on, row_tokens, row_bad, row_probes, row_idle }; }
 
-    // off: true when a shadow draft is due
+    // off: true when a shadow draft is due (every eighth round, every fourth for the first few after it went off)
     static bool row_shadow_due(row_switch st) {
-        return st.probes > 0 || ++st.idle % 16 == 0;
+        ++st.idle;
+        return st.idle % (st.idle <= 16 ? 4 : 8) == 0;
     }
 
+    // the accepted rows of a round vary a lot around their mean (0 to 7 around 3.5 on code), so both directions go by
+    // a decayed mean with a margin, not by single rounds: three poor rounds in a row happen in most requests
     static void row_update(row_switch st, size_t n_drafted, size_t n_accepted, double fixed) {
         if (n_drafted == 0) {
             return;
@@ -240,20 +243,24 @@ struct common_speculative_impl {
         const double tok  = 1.0 + (double) n_accepted;
         const double cost = row_breakeven(n_drafted, fixed);
         if (st.on) {
-            st.tokens = st.tokens > 0.0 ? 0.75*st.tokens + 0.25*tok : std::max(tok, cost + 0.5);
+            st.tokens = st.tokens > 0.0 ? 0.9*st.tokens + 0.1*tok : std::max(tok, cost + 1.0);
             st.bad    = n_accepted <= 1 ? st.bad + 1 : 0;
-            if (st.tokens < cost || st.bad >= 3) {
+            if (st.tokens < cost - 0.25 || st.bad >= 6) {
                 st.on     = false;
                 st.probes = 0;
                 st.idle   = 0;
                 st.bad    = 0;
+                st.tokens = 0.0;
             }
         } else {
-            st.probes = tok >= cost + 0.5 ? st.probes + 1 : 0;
-            if (st.probes >= 2) {
+            // shadow drafts: their mean, and on after at least two of them
+            st.tokens = st.probes > 0 ? 0.6*st.tokens + 0.4*tok : tok;
+            st.probes++;
+            if (st.probes >= 2 && st.tokens >= cost + 0.25) {
                 st.on     = true;
-                st.tokens = cost + 0.5;
+                st.tokens = cost + 1.0;
                 st.probes = 0;
+                st.bad    = 0;
             }
         }
     }
@@ -4003,6 +4010,15 @@ void common_speculative_draft(common_speculative * spec) {
             }
             row_shadow = true;
         }
+        // a shadow draft is the argmax of the drafter: it is held against tokens the target sampled without it, and a
+        // sampled draft would agree with those less often than a verify by rejection accepts it
+        std::vector<std::vector<std::vector<llama_token_data>> *> q_saved;
+        if (row_shadow) {
+            for (auto & dp : dparams) {
+                q_saved.push_back(dp.result_q);
+                dp.result_q = nullptr;
+            }
+        }
         if (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_STAT) {
             // the rows the model drafter after it would verify, if this one proposes nothing
             int32_t rival = 0;
@@ -4018,6 +4034,9 @@ void common_speculative_draft(common_speculative * spec) {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
+        }
+        for (size_t i = 0; i < q_saved.size(); ++i) {
+            dparams[i].result_q = q_saved[i];
         }
 
         int n_drafting = 0;
