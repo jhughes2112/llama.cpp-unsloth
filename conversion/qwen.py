@@ -917,6 +917,9 @@ class DFlashModel(Qwen3Model):
             self.gguf_writer.add_conv_group_size(int(dflash_config["conv_group_size"]))
             self.gguf_writer.add_selector_rank(int(dflash_config["selector_rank"]))
             self.gguf_writer.add_selector_top_k(int(dflash_config["selector_top_k"]))
+            # the selector of the Inkling 2 draft caps its scores after the correction, not the logits before it
+            if dflash_config.get("selector_softcap_mode") == "after_correction":
+                self.gguf_writer.add_bool("dflash.selector_softcap_after_correction", True)
 
         output_multiplier = dflash_config.get(
             "output_multiplier", self.hparams.get("output_multiplier")
@@ -941,7 +944,19 @@ class DFlashModel(Qwen3Model):
             self.gguf_writer.add_embedding_scale(float(embedding_scale))
 
         target_layer_ids = dflash_config.get("target_layer_ids", self.hparams.get("target_layer_ids", []))
-        if target_layer_ids:
+        inkling2 = False
+        if self.target_model_dir is not None:
+            target_hparams = ModelBase.load_hparams(self.target_model_dir, False)
+            inkling2 = get_model_architecture(target_hparams, ModelType.TEXT).startswith("Inkling2")
+            if inkling2:
+                # the candidates of the draft come from the tokens of the target, not from the padded rows of its head
+                text = target_hparams.get("text_config", target_hparams)
+                if (valid := text.get("unpadded_vocab_size")) is not None:
+                    self.gguf_writer.add_uint32("dflash.valid_vocab_size", int(valid))
+        if target_layer_ids and inkling2:
+            # Inkling 2 counts layer visits: id k is the input of visit k, the last id the final normed state
+            self.gguf_writer.add_target_layers(list(target_layer_ids))
+        elif target_layer_ids:
             extract_layer_ids = [i + 1 for i in target_layer_ids]
             self.gguf_writer.add_target_layers(extract_layer_ids)
 

@@ -110,7 +110,7 @@ def _set_inkling2_vocab(model: TextModel):
     model.gguf_writer.add_token_list(tokens)
     model.gguf_writer.add_token_types(types)
     special = gguf.SpecialVocab(model.dir_model, load_merges=True)
-    eos = model.hparams.get("eos_token_id", 200006)
+    eos = model.hparams.get("eos_token_id") or 200006  # a draft model states null and takes the vocabulary of its target
     special.special_token_ids["eos"] = eos
     special.special_token_ids["eot"] = eos
     special.add_special_token["bos"] = False

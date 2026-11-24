@@ -321,6 +321,8 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    bool     dflash_selector_softcap_after = false; // cap the selector scores after the correction (Inkling 2 draft)
+    uint32_t dflash_valid_vocab      = 0;           // candidates come from the first rows of the head only (0: all)
     uint32_t dspark_markov_rank      = 0;
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;

@@ -35,6 +35,8 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
+    ml.get_key(std::string("dflash.selector_softcap_after_correction"), hparams.dflash_selector_softcap_after, false);
+    ml.get_key(std::string("dflash.valid_vocab_size"),                  hparams.dflash_valid_vocab,            false);
 
     const bool has_markov   = ml.get_tensor_meta("markov_w1.weight")       != nullptr;
     const bool has_selector = ml.get_tensor_meta("selector_hidden.weight") != nullptr;
@@ -391,6 +393,13 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
+    // a target that norms its token embeddings (Inkling 2) trained its draft on the normed rows
+    if (!model.tok_embd && cparams.ctx_other != nullptr) {
+        const auto * target = llama_get_model(cparams.ctx_other);
+        if (target->tok_norm != nullptr) {
+            inpL = ggml_mul(ctx0, ggml_rms_norm(ctx0, inpL, target->hparams.f_norm_rms_eps), target->tok_norm);
+        }
+    }
     cb(inpL, "inp_noise_embd", -1);
 
     for (int il = 0; il < n_layer; ++il) {
@@ -505,10 +514,14 @@ ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
         if (hparams.f_logit_scale != 0.0f) {
             cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
         }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
+        if (hparams.f_final_logit_softcapping > 0.0f && !hparams.dflash_selector_softcap_after) {
             cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
             cur = ggml_tanh(ctx0, cur);
             cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+        }
+        // the padded rows of a borrowed head are not tokens: no candidate comes from them
+        if (hparams.dflash_valid_vocab > 0 && (int64_t) hparams.dflash_valid_vocab < cur->ne[0]) {
+            cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.dflash_valid_vocab, cur->ne[1], cur->nb[1], 0));
         }
     }
 
