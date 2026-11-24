@@ -203,69 +203,69 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    // the acceptance measured at each draft position, for the choice of how many rows to verify: position d was verified
-    // row_att[d - 1] times after the position before it was accepted, and accepted row_acc[d - 1] times of those. the
-    // counts decay, so the choice follows the text (a draft that was right on code is cut when prose begins)
-    std::vector<double> row_att;
-    std::vector<double> row_acc;
-    size_t n_row_rounds = 0;
+    // --spec-rows adaptive: whether its drafts are verified at all. a round costs the decode of a token, the pass of the
+    // drafter and a part of a token a row, whatever is accepted, so a few rows never pay (measured on Inkling 2, M5
+    // Ultra: a token 9.9 ms, a round of 1 row 18, of 2 rows 22, of 7 rows 31, and 6-9 ms more whenever the rows differ
+    // from the round before): a draft is verified in full or not at all. quick off, cautious on: it turns off when the
+    // tokens a round, averaged over the last few, fall under what a round costs, or three rounds in a row accept one
+    // row or none. off, nothing of it is verified: every sixteenth round it drafts in the shadow, and the draft is held
+    // against the tokens the target then produces by itself; it turns on after two such drafts in a row that would
+    // have paid
+    bool   row_on      = true;
+    double row_tokens  = 0.0; // tokens a round, decayed (0: no round yet)
+    int    row_bad     = 0;
+    int    row_probes  = 0;   // probes in a row that paid
+    size_t row_idle    = 0;
 
-    static constexpr double ROW_DECAY = 0.97;
-    static constexpr double ROW_PRIOR = 0.70; // of two rounds' weight
-
-    // the chance that position d (1-based) is accepted, the position before it accepted
-    static double row_chance(const std::vector<double> & att, const std::vector<double> & acc, size_t d, double prior) {
-        const double t = d <= att.size() ? att[d - 1] : 0.0;
-        const double a = d <= acc.size() ? acc[d - 1] : 0.0;
-        return (a + 2.0*prior)/(t + 2.0);
+    // what a round of n rows costs, in tokens decoded alone (fixed: the pass of a model drafter and a changed batch)
+    static double row_breakeven(size_t n_rows, double fixed) {
+        return 1.0 + fixed + 0.28*(double) n_rows;
     }
 
-    static void row_observe(std::vector<double> & att, std::vector<double> & acc, size_t n_drafted, size_t n_accepted) {
-        if (att.size() < n_drafted) {
-            att.resize(n_drafted, 0.0);
-            acc.resize(n_drafted, 0.0);
+    struct row_switch {
+        bool & on; double & tokens; int & bad; int & probes; size_t & idle;
+    };
+
+    row_switch row_state() { return { row_on, row_tokens, row_bad, row_probes, row_idle }; }
+
+    // off: true when a shadow draft is due
+    static bool row_shadow_due(row_switch st) {
+        return st.probes > 0 || ++st.idle % 16 == 0;
+    }
+
+    static void row_update(row_switch st, size_t n_drafted, size_t n_accepted, double fixed) {
+        if (n_drafted == 0) {
+            return;
         }
-        for (size_t i = 0; i < att.size(); ++i) {
-            att[i] *= ROW_DECAY;
-            acc[i] *= ROW_DECAY;
-        }
-        for (size_t d = 1; d <= std::min(n_drafted, n_accepted + 1); ++d) {
-            att[d - 1] += 1.0;
-            if (d <= n_accepted) {
-                acc[d - 1] += 1.0;
+        const double tok  = 1.0 + (double) n_accepted;
+        const double cost = row_breakeven(n_drafted, fixed);
+        if (st.on) {
+            st.tokens = st.tokens > 0.0 ? 0.75*st.tokens + 0.25*tok : std::max(tok, cost + 0.5);
+            st.bad    = n_accepted <= 1 ? st.bad + 1 : 0;
+            if (st.tokens < cost || st.bad >= 3) {
+                st.on     = false;
+                st.probes = 0;
+                st.idle   = 0;
+                st.bad    = 0;
+            }
+        } else {
+            st.probes = tok >= cost + 0.5 ? st.probes + 1 : 0;
+            if (st.probes >= 2) {
+                st.on     = true;
+                st.tokens = cost + 0.5;
+                st.probes = 0;
             }
         }
     }
 
-    // the rows of a draft of n to verify: the count with the most expected tokens a cost, where a round of d rows costs
-    // 1 + row_cost*d + fixed (in decodes of one token) and gives 1 + the expected accepted rows. 0: decode without a
-    // draft. `rate` returns that best expected rate
-    static size_t row_choose(const std::vector<double> & att, const std::vector<double> & acc, size_t n, double row_cost,
-                             double fixed, double prior, double * rate = nullptr) {
-        size_t best_n    = 0;
-        double best      = 1.0;
-        double expected  = 1.0;
-        double surviving = 1.0;
-        for (size_t d = 1; d <= n; ++d) {
-            surviving *= row_chance(att, acc, d, prior);
-            expected  += surviving;
-            const double r = expected/(1.0 + row_cost*(double) d + fixed);
-            if (r > best) {
-                best   = r;
-                best_n = d;
-            }
-        }
-        if (rate) {
-            *rate = best;
-        }
-        return best_n;
-    }
+    // the fixed part of its rounds for row_breakeven
+    virtual double row_fixed() const { return 0.5; }
 
     // true: the implementation chose the rows of its draft itself
     virtual bool chooses_rows() const { return false; }
 
-    // a verified round of any implementation: the rows it drafted and how many of them were accepted
-    virtual void observe_round(llama_seq_id /*seq_id*/, size_t /*n_drafted*/, size_t /*n_accepted*/, bool /*is_other*/) {}
+    // a verified round of its own: the rows it drafted and how many of them were accepted
+    virtual void observe_round(llama_seq_id /*seq_id*/, size_t /*n_drafted*/, size_t /*n_accepted*/) {}
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
@@ -3014,47 +3014,51 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 };
 
 // ngram-stat: proposes what followed the last tokens where they occurred before in the context (the prompt and the
-// output so far), and has it verified only as far as that has been paying. the longer the text before the match agrees,
-// the more likely the continuation; acceptance is measured per draft position in three classes of that length. it
-// proposes nothing where its expected tokens a cost are below what the other implementations have been getting, so a
-// model drafter keeps the rounds it is better at
+// output so far). the longer the text before the match agrees, the more likely the continuation: the rows it has
+// proposes are judged in three classes of that length, each on or off by the rule of row_on. a model drafter that is on
+// keeps the rounds a shorter agreement would take
 struct common_speculative_impl_ngram_stat : public common_speculative_impl {
     static constexpr int N_CLASS   = 3;
     static constexpr int N_BACK    = 64; // tokens compared before a match
     static constexpr int N_KEEP    = 8;  // occurrences kept a key
 
     const int32_t n_match;
-    const double  row_cost;
 
     struct seq_state {
         llama_tokens hist;
         std::unordered_map<uint64_t, std::vector<int32_t>> index; // hash of n_match tokens -> the positions they end at
         size_t n_indexed  = 0;
         int    cls_last   = -1; // class of the proposal in flight
+
+        // a proposal of a class that is off, held against what the target produces (see row_on)
+        llama_tokens shadow;
+        size_t       shadow_start = 0;
+        int          shadow_cls   = -1;
     };
 
     std::vector<seq_state> seqs;
 
-    std::vector<double> att[N_CLASS];
-    std::vector<double> acc[N_CLASS];
+    // a class is verified in full or not at all, as a model drafter is (row_on). a short agreement starts off
+    bool   cls_on    [N_CLASS] = { false, false, true };
+    double cls_tokens[N_CLASS] = { 0.0, 0.0, 0.0 };
+    int    cls_bad   [N_CLASS] = { 0, 0, 0 };
+    int    cls_probes[N_CLASS] = { 0, 0, 0 };
+    size_t cls_idle  [N_CLASS] = { 0, 0, 0 };
 
-    // expected tokens a cost that the other implementations realized lately
-    double rival = 1.0;
+    row_switch cls_state(int c) { return { cls_on[c], cls_tokens[c], cls_bad[c], cls_probes[c], cls_idle[c] }; }
 
-    size_t n_explore = 0;
+    double row_fixed() const override { return 0.3; }
 
-    static double class_prior(int cls) {
-        return cls == 0 ? 0.50 : cls == 1 ? 0.75 : 0.90;
-    }
+    // the rows the model drafter behind it would verify this round (0: none, or no such drafter); set by the driver
+    int32_t rival_rows = 0;
 
     common_speculative_impl_ngram_stat(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_STAT, n_seq, params.ngram_stat_n_max)
         , n_match(std::max(1, params.ngram_stat_n_match))
-        , row_cost(params.row_cost > 0.0f ? params.row_cost : 0.28)
         , seqs(n_seq)
     {
         SPC_TRC("%s", "adding speculative implementation 'ngram-stat'\n");
-        SPC_TRC("- n_match=%d, n_max=%d, row_cost=%.2f\n", n_match, n_max, row_cost);
+        SPC_TRC("- n_match=%d, n_max=%d\n", n_match, n_max);
     }
 
     bool chooses_rows() const override { return true; }
@@ -3123,6 +3127,25 @@ struct common_speculative_impl_ngram_stat : public common_speculative_impl {
 
             const auto & h = st.hist;
             const size_t last = h.size() - 1;
+
+            if (st.shadow_cls >= 0) {
+                size_t n_ok  = 0;
+                bool   ended = h.size() < st.shadow_start;
+                while (!ended && n_ok < st.shadow.size() && st.shadow_start + n_ok < h.size()) {
+                    if (h[st.shadow_start + n_ok] != st.shadow[n_ok]) {
+                        ended = true;
+                    } else {
+                        n_ok++;
+                    }
+                }
+                if (ended || n_ok == st.shadow.size()) {
+                    if (h.size() >= st.shadow_start) {
+                        row_update(cls_state(st.shadow_cls), st.shadow.size(), n_ok, row_fixed());
+                    }
+                    st.shadow_cls = -1;
+                }
+            }
+
             if (last + 1 < (size_t) n_match + 1) {
                 continue;
             }
@@ -3154,19 +3177,21 @@ struct common_speculative_impl_ngram_stat : public common_speculative_impl {
             }
             const int cls = match_class(best_back);
 
-            double rate = 1.0;
-            size_t n_rows = row_choose(att[cls], acc[cls], n, row_cost, 0.0, class_prior(cls), &rate);
-
-            // now and then a short proposal is verified whatever it is expected to give, or a class that fell behind
-            // could never come back
-            const bool explore = ++n_explore % 24 == 0;
-            if ((n_rows == 0 || rate < rival) && !explore) {
+            // a model drafter that is on keeps the rounds a shorter agreement would take
+            if (cls < 2 && rival_rows > 0) {
                 continue;
             }
-            if (n_rows == 0) {
-                n_rows = std::min(n, (size_t) 2);
+            if (n < 2) {
+                continue;
             }
-            if (n_rows == 0) {
+            const size_t n_rows = n;
+            if (!cls_on[cls]) {
+                // every proposal of a class that is off is a shadow: a lookup costs nothing
+                if (st.shadow_cls < 0) {
+                    st.shadow.assign(h.begin() + best_pos + 1, h.begin() + best_pos + 1 + n_rows);
+                    st.shadow_start = h.size();
+                    st.shadow_cls   = cls;
+                }
                 continue;
             }
 
@@ -3179,16 +3204,10 @@ struct common_speculative_impl_ngram_stat : public common_speculative_impl {
         // noop: observe_round has the rows too
     }
 
-    void observe_round(llama_seq_id seq_id, size_t n_drafted, size_t n_accepted, bool is_other) override {
-        if (is_other) {
-            // the fixed part stands for a model drafter's own pass
-            const double r = (1.0 + (double) n_accepted)/(1.0 + row_cost*(double) n_drafted + 0.3);
-            rival = 0.9*rival + 0.1*r;
-            return;
-        }
+    void observe_round(llama_seq_id seq_id, size_t n_drafted, size_t n_accepted) override {
         auto & st = seqs[seq_id];
-        if (st.cls_last >= 0 && n_drafted > 0) {
-            row_observe(att[st.cls_last], acc[st.cls_last], n_drafted, n_accepted);
+        if (st.cls_last >= 0) {
+            row_update(cls_state(st.cls_last), n_drafted, n_accepted, row_fixed());
         }
         st.cls_last = -1;
     }
@@ -3205,9 +3224,16 @@ struct common_speculative {
 
     std::vector<double> synth_probs;
 
-    // the cost of one more verified row (0: every drafted row is verified), and the rows of the draft in flight
-    double              row_cost = 0.0;
+    // --spec-rows adaptive, and the rows of the draft in flight
+    bool                rows_adaptive = false;
     std::vector<size_t> n_draft_last;
+
+    // the shadow draft in flight (see row_on): its tokens, where they begin in the history of its sequence
+    common_speculative_impl * shadow_impl  = nullptr;
+    llama_seq_id              shadow_seq   = -1;
+    llama_tokens              shadow;
+    size_t                    shadow_start = 0;
+    size_t              trace_acc = 0;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3832,7 +3858,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
     });
-    result->row_cost = params.row_cost;
+    result->rows_adaptive = params.rows_adaptive;
     result->n_draft_last.assign(n_seq, 0);
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
@@ -3929,16 +3955,63 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    // LLAMA_SPEC_TRACE=file: a line a draft call: ms since the call before (the round that ended), the rows that round
+    // verified and accepted, and the ms this call spent drafting
+    static FILE * trace = getenv("LLAMA_SPEC_TRACE") ? fopen(getenv("LLAMA_SPEC_TRACE"), "w") : nullptr;
+    static int64_t trace_t = 0;
+    static size_t  trace_rows = 0, trace_acc = 0;
+    const int64_t trace_now = ggml_time_us();
+    if (trace) {
+        if (!spec->n_draft_last.empty() && spec->n_draft_last[0] == 0 && trace_rows > 0) {
+            trace_acc = spec->trace_acc;
+        }
+        fprintf(trace, "%8.2f ms  rows %2zu  accepted %2zu\n", trace_t ? (trace_now - trace_t)/1000.0 : 0.0, trace_rows, trace_acc);
+        trace_rows = 0;
+        trace_acc  = 0;
+    }
+
+    // the shadow draft against what the target produced since: the rows that agree from its start are the rows a
+    // verify would have accepted (a little fewer than a sampled verify, which accepts by min(1, p/q))
+    if (spec->shadow_impl != nullptr && (size_t) spec->shadow_seq < dparams.size() && dparams[spec->shadow_seq].drafting) {
+        const auto & dp = dparams[spec->shadow_seq];
+        const size_t n_hist = dp.prompt->size() + 1;
+        size_t n_ok  = 0;
+        bool   ended = n_hist < spec->shadow_start;
+        while (!ended && n_ok < spec->shadow.size() && spec->shadow_start + n_ok < n_hist) {
+            const size_t i = spec->shadow_start + n_ok;
+            if ((i < dp.prompt->size() ? (*dp.prompt)[i] : dp.id_last) != spec->shadow[n_ok]) {
+                ended = true;
+            } else {
+                n_ok++;
+            }
+        }
+        if (ended || n_ok == spec->shadow.size()) {
+            if (n_hist >= spec->shadow_start) {
+                common_speculative_impl::row_update(spec->shadow_impl->row_state(), spec->shadow.size(), n_ok, spec->shadow_impl->row_fixed());
+            }
+            spec->shadow_impl = nullptr;
+        }
+    }
+
     for (auto & impl : spec->impls) {
-        // the rows this implementation is expected to pay for, from the acceptance measured at its draft positions:
-        // none, and it sits the round out (every 16th round it drafts in full, so the measure follows the text)
-        const bool row_select  = spec->row_cost > 0.0 && !impl->chooses_rows();
-        const bool row_explore = row_select && ++impl->n_row_rounds % 16 == 0;
-        static constexpr double ROW_FIXED = 0.3; // the pass of a model drafter, in decodes of one token
-        if (row_select && !row_explore &&
-                common_speculative_impl::row_choose(impl->row_att, impl->row_acc, (size_t) std::max(0, impl->n_max),
-                    spec->row_cost, ROW_FIXED, common_speculative_impl::ROW_PRIOR) == 0) {
-            continue;
+        // an implementation whose drafts have not been paying sits rounds out (see row_on), but for a shadow draft
+        const bool row_select = spec->rows_adaptive && !impl->chooses_rows();
+        bool row_shadow = false;
+        if (row_select && !impl->row_on) {
+            if (spec->shadow_impl != nullptr || !common_speculative_impl::row_shadow_due(impl->row_state())) {
+                continue;
+            }
+            row_shadow = true;
+        }
+        if (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_STAT) {
+            // the rows the model drafter after it would verify, if this one proposes nothing
+            int32_t rival = 0;
+            for (auto & other : spec->impls) {
+                if (other.get() != impl.get() && !other->chooses_rows()) {
+                    rival = std::max(rival, spec->rows_adaptive && !other->row_on ? 0 : other->n_max);
+                }
+            }
+            static_cast<common_speculative_impl_ngram_stat *>(impl.get())->rival_rows = rival;
         }
 
         {
@@ -3958,14 +4031,17 @@ void common_speculative_draft(common_speculative * spec) {
 
             auto & result = *dp.result;
 
-            if (row_select && !row_explore && !result.empty()) {
-                const size_t n_keep = common_speculative_impl::row_choose(impl->row_att, impl->row_acc, result.size(),
-                        spec->row_cost, ROW_FIXED, common_speculative_impl::ROW_PRIOR);
-                if (n_keep < result.size()) {
-                    result.resize(n_keep);
-                    if (dp.result_q && !dp.result_q->empty()) {
-                        dp.result_q->resize(n_keep);
-                    }
+            if (row_shadow) {
+                // held back: the target decodes alone, and the tokens it produces say what this draft was worth
+                if (!result.empty() && spec->shadow_impl == nullptr) {
+                    spec->shadow_impl  = impl.get();
+                    spec->shadow_seq   = seq_id;
+                    spec->shadow       = result;
+                    spec->shadow_start = dp.prompt->size() + 1;
+                }
+                result.clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
                 }
             }
 
@@ -4007,6 +4083,12 @@ void common_speculative_draft(common_speculative * spec) {
         if (n_drafting == 0) {
             break;
         }
+    }
+
+    if (trace) {
+        trace_rows = spec->n_draft_last.empty() ? 0 : spec->n_draft_last[0];
+        fprintf(trace, "    draft %6.2f ms -> ", (ggml_time_us() - trace_now)/1000.0);
+        trace_t = trace_now;
     }
 
     // these sequences failed to generate a draft
@@ -4054,16 +4136,15 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         }
     }
 
-    // the acceptance at each draft position, for the choice of rows
+    // the rows that were right, for the rows of the next rounds
     const size_t n_drafted = (size_t) seq_id < spec->n_draft_last.size() ? spec->n_draft_last[seq_id] : 0;
     if (n_drafted > 0) {
         spec->n_draft_last[seq_id] = 0;
+        spec->trace_acc = n_accepted;
         if (!impl->chooses_rows()) {
-            common_speculative_impl::row_observe(impl->row_att, impl->row_acc, n_drafted, n_accepted);
+            common_speculative_impl::row_update(impl->row_state(), n_drafted, n_accepted, impl->row_fixed());
         }
-        for (auto & impl_any : spec->impls) {
-            impl_any->observe_round(seq_id, n_drafted, n_accepted, impl_any.get() != impl);
-        }
+        impl->observe_round(seq_id, n_drafted, n_accepted);
     }
 }
 

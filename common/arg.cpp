@@ -4299,14 +4299,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
-        {"--spec-row-cost"}, "F",
-        string_format("cost of one more verified row, in decodes of a single token: a draft is cut to the rows whose "
-                      "expected accepted tokens pay for them, by the acceptance measured at each draft position "
-                      "(0: verify every drafted row; default: %.2f)", (double) params.speculative.row_cost),
+        {"--spec-rows"}, "{all,adaptive}",
+        string_format("rows of a draft that are verified: all of them, or a count that follows the rejections: a round "
+                      "rejected partway cuts it to the rows that were right (at none the drafter sits rounds out and tries "
+                      "one row every eighth round), two fully accepted rounds in a row add one (default: %s)",
+                      params.speculative.rows_adaptive ? "adaptive" : "all"),
         [](common_params & params, const std::string & value) {
-            params.speculative.row_cost = std::stof(value);
+            if (value == "all") {
+                params.speculative.rows_adaptive = false;
+            } else if (value == "adaptive") {
+                params.speculative.rows_adaptive = true;
+            } else {
+                throw std::invalid_argument("invalid value, must be one of: all, adaptive");
+            }
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ROW_COST"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ROWS"));
     add_opt(common_arg(
         {"--spec-ngram-stat-n-match"}, "N",
         string_format("ngram-stat: tokens that must match before a continuation is proposed (default: %d)", params.speculative.ngram_stat_n_match),

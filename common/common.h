@@ -401,9 +401,10 @@ struct common_params_speculative {
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
-    // the cost of one more verified row, in decodes of a single token; a draft is cut to the rows whose expected
-    // accepted tokens pay for them, by the acceptance measured at each draft position (0: verify every drafted row)
-    float row_cost = 0.0f;
+    // true: the rows of a draft that are verified follow its rejections. a round rejected partway cuts the count to the
+    // rows that were right (at none the drafter sits rounds out, and tries one row every eighth round); two rounds in a
+    // row whose rows were all accepted add one. false: every drafted row is verified
+    bool rows_adaptive = false;
 
     // ngram-stat: tokens that must match before a continuation is proposed, and the longest proposal
     int32_t ngram_stat_n_match = 4;
@@ -434,7 +435,13 @@ struct common_params_speculative {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // a lookup draft is rolled back the same way: without its slots every one of its rounds goes through a
+        // checkpoint, and a part-accepted one is decoded again
+        const bool ngram_stat = std::any_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_NGRAM_STAT;
+        });
+
+        return std::max<uint32_t>(needs_rs_seq ? std::max(0, draft.n_max) : 0, ngram_stat ? std::max(0, ngram_stat_n_max) : 0);
     }
 };
 
