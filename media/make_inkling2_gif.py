@@ -2,7 +2,8 @@
 """Renders media/inkling2-mac.gif (and .mp4): decode speed of Inkling 2 Mini on this branch, commit by commit.
 
 Needs Pillow, numpy and ffmpeg. Usage: python media/make_inkling2_gif.py [ffmpeg]
-The numbers are the llama-bench decode results recorded in the commit messages (M5 Ultra, UD-Q4_K_XL).
+The numbers are the llama-bench decode results recorded in the commit messages (M5 Ultra, UD-Q4_K_XL); the last one is
+llama-server on a coding prompt at temperature 1.0 with the DFlash2 draft model.
 """
 import os, subprocess, sys, tempfile
 import numpy as np
@@ -10,10 +11,10 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 W, H, FPS = 1200, 676, 25
 T_DRAW0, T_DRAW1, T_END = 0.6, 6.0, 9.6
-PTS = [37.0, 39.8, 42.5, 43.4, 50.1, 53.6, 55, 60, 62.6, 68, 71.5, 75.5, 80, 85.8, 88, 99, 103, 104, 108, 110, 112]
+PTS = [37.0, 39.8, 42.5, 43.4, 50.1, 53.6, 55, 60, 62.6, 68, 71.5, 75.5, 80, 85.8, 88, 99, 103, 104, 108, 110, 112, 157]
 NOTES = {0: "Unsloth release", 5: "fused kernels", 10: "graph ordered by depth", 13: "barrier fix",
-         15: "commands pre-encoded"}
-CX0, CX1, CY0, CY1, VMAX = 90, 1110, 318, 590, 120.0
+         15: "commands pre-encoded", 20: "112 without a draft", 21: "DFlash2 draft, on code"}
+CX0, CX1, CY0, CY1, VMAX = 90, 1110, 318, 590, 170.0
 INK, DIM, LINE = (255, 255, 255), (176, 208, 255), (140, 228, 255)
 GOLD = (255, 214, 96)
 MID = ((255, 255, 255), (255, 240, 200))
@@ -66,11 +67,11 @@ def frame(t):
     val = PTS[k] + (PTS[k + 1] - PTS[k]) * (pos - k)
     head = (px(pos), py(val))
 
-    for v in (40, 80, 120):
+    for v in (40, 80, 120, 160):
         d.line([(CX0, py(v)), (CX1, py(v))], fill=(60, 110, 220), width=1)
         d.text((CX0 - 12, py(v)), str(v), font=F_NOTE, fill=DIM, anchor="rm")
     d.line([(CX0, CY1), (CX1, CY1)], fill=(120, 160, 240), width=2)
-    d.text((CX0, CY1 + 14), "llama-bench decode, one stream, commit by commit",
+    d.text((CX0, CY1 + 14), "one stream; last point: code, temperature 1.0",
            font=F_SMALL, fill=DIM)
     d.text((CX1, CY1 + 14), "github.com/jhughes2112/llama.cpp-unsloth", font=F_SMALL, fill=DIM, anchor="ra")
 
@@ -85,9 +86,14 @@ def frame(t):
         g.ellipse([px(i) - 4, py(PTS[i]) - 4, px(i) + 4, py(PTS[i]) + 4], fill=INK)
     g.ellipse([head[0] - 9, head[1] - 9, head[0] + 9, head[1] + 9], fill=INK)
     for i, s in NOTES.items():
-        if pos >= i:
-            a = min((pos - i) / 0.6, 1.0) if i else 1.0
-            d.text((px(i) + 12, py(PTS[i]) + 16), s, font=F_NOTE, fill=tuple(int(c * a) for c in INK))
+        last = i >= len(PTS) - 2  # the two labels at the right edge sit left of their points
+        if pos >= i or (i == len(PTS) - 1 and pos > i - 1):
+            a = min(max(pos - (i - 1), 0.0), 1.0) if i == len(PTS) - 1 else min((pos - i) / 0.6, 1.0) if i else 1.0
+            fill = tuple(int(c * a) for c in INK)
+            if last:
+                d.text((px(i) - 16, py(PTS[i]) + (-12 if i == len(PTS) - 1 else -30)), s, font=F_NOTE, fill=fill, anchor="ra")
+            else:
+                d.text((px(i) + 12, py(PTS[i]) + 16), s, font=F_NOTE, fill=fill)
 
     st.text((70, 40), "Inkling 2 Mini", font=F_TITLE, fill=INK)
     st.text((72, 138), "on a ", font=F_SUB, fill=(200, 222, 255))
@@ -105,7 +111,7 @@ def frame(t):
     g.text((946, 132), "tok/sec", font=F_UNIT, fill=INK)
     b = min(max((t - T_DRAW1 - 0.1) / 0.5, 0.0), 1.0)
     if b > 0:
-        g.text((946, 76), "3× faster", font=F_BADGE, fill=tuple(int(c * b) for c in (130, 255, 190)))
+        g.text((946, 76), "4× on code", font=F_BADGE, fill=tuple(int(c * b) for c in (130, 255, 190)))
 
     pulse = 1.0 + 0.5 * np.exp(-((t - T_DRAW1 - 0.25) / 0.35) ** 2)
     ga = np.asarray(glow, np.float32)
