@@ -4299,6 +4299,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-row-cost"}, "F",
+        string_format("cost of one more verified row, in decodes of a single token: a draft is cut to the rows whose "
+                      "expected accepted tokens pay for them, by the acceptance measured at each draft position "
+                      "(0: verify every drafted row; default: %.2f)", (double) params.speculative.row_cost),
+        [](common_params & params, const std::string & value) {
+            params.speculative.row_cost = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ROW_COST"));
+    add_opt(common_arg(
+        {"--spec-ngram-stat-n-match"}, "N",
+        string_format("ngram-stat: tokens that must match before a continuation is proposed (default: %d)", params.speculative.ngram_stat_n_match),
+        [](common_params & params, int value) {
+            params.speculative.ngram_stat_n_match = std::max(1, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-stat-n-max"}, "N",
+        string_format("ngram-stat: the longest proposal, in tokens (default: %d)", params.speculative.ngram_stat_n_max),
+        [](common_params & params, int value) {
+            params.speculative.ngram_stat_n_max = std::max(1, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-draft-sampling"}, "{greedy,probabilistic}",
         string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "
                       "the target verify by rejection sampling; Inkling2 DSpark uses target temperature (1 at target temp 0) (default: %s)",

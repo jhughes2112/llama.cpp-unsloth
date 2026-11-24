@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <map>
 #include <random>
+#include <unordered_map>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -83,7 +84,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v",  COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",      COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"ngram-stat",     COMMON_SPECULATIVE_TYPE_NGRAM_STAT}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -200,6 +202,70 @@ struct common_speculative_impl {
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+
+    // the acceptance measured at each draft position, for the choice of how many rows to verify: position d was verified
+    // row_att[d - 1] times after the position before it was accepted, and accepted row_acc[d - 1] times of those. the
+    // counts decay, so the choice follows the text (a draft that was right on code is cut when prose begins)
+    std::vector<double> row_att;
+    std::vector<double> row_acc;
+    size_t n_row_rounds = 0;
+
+    static constexpr double ROW_DECAY = 0.97;
+    static constexpr double ROW_PRIOR = 0.70; // of two rounds' weight
+
+    // the chance that position d (1-based) is accepted, the position before it accepted
+    static double row_chance(const std::vector<double> & att, const std::vector<double> & acc, size_t d, double prior) {
+        const double t = d <= att.size() ? att[d - 1] : 0.0;
+        const double a = d <= acc.size() ? acc[d - 1] : 0.0;
+        return (a + 2.0*prior)/(t + 2.0);
+    }
+
+    static void row_observe(std::vector<double> & att, std::vector<double> & acc, size_t n_drafted, size_t n_accepted) {
+        if (att.size() < n_drafted) {
+            att.resize(n_drafted, 0.0);
+            acc.resize(n_drafted, 0.0);
+        }
+        for (size_t i = 0; i < att.size(); ++i) {
+            att[i] *= ROW_DECAY;
+            acc[i] *= ROW_DECAY;
+        }
+        for (size_t d = 1; d <= std::min(n_drafted, n_accepted + 1); ++d) {
+            att[d - 1] += 1.0;
+            if (d <= n_accepted) {
+                acc[d - 1] += 1.0;
+            }
+        }
+    }
+
+    // the rows of a draft of n to verify: the count with the most expected tokens a cost, where a round of d rows costs
+    // 1 + row_cost*d + fixed (in decodes of one token) and gives 1 + the expected accepted rows. 0: decode without a
+    // draft. `rate` returns that best expected rate
+    static size_t row_choose(const std::vector<double> & att, const std::vector<double> & acc, size_t n, double row_cost,
+                             double fixed, double prior, double * rate = nullptr) {
+        size_t best_n    = 0;
+        double best      = 1.0;
+        double expected  = 1.0;
+        double surviving = 1.0;
+        for (size_t d = 1; d <= n; ++d) {
+            surviving *= row_chance(att, acc, d, prior);
+            expected  += surviving;
+            const double r = expected/(1.0 + row_cost*(double) d + fixed);
+            if (r > best) {
+                best   = r;
+                best_n = d;
+            }
+        }
+        if (rate) {
+            *rate = best;
+        }
+        return best_n;
+    }
+
+    // true: the implementation chose the rows of its draft itself
+    virtual bool chooses_rows() const { return false; }
+
+    // a verified round of any implementation: the rows it drafted and how many of them were accepted
+    virtual void observe_round(llama_seq_id /*seq_id*/, size_t /*n_drafted*/, size_t /*n_accepted*/, bool /*is_other*/) {}
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
@@ -2947,6 +3013,187 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// ngram-stat: proposes what followed the last tokens where they occurred before in the context (the prompt and the
+// output so far), and has it verified only as far as that has been paying. the longer the text before the match agrees,
+// the more likely the continuation; acceptance is measured per draft position in three classes of that length. it
+// proposes nothing where its expected tokens a cost are below what the other implementations have been getting, so a
+// model drafter keeps the rounds it is better at
+struct common_speculative_impl_ngram_stat : public common_speculative_impl {
+    static constexpr int N_CLASS   = 3;
+    static constexpr int N_BACK    = 64; // tokens compared before a match
+    static constexpr int N_KEEP    = 8;  // occurrences kept a key
+
+    const int32_t n_match;
+    const double  row_cost;
+
+    struct seq_state {
+        llama_tokens hist;
+        std::unordered_map<uint64_t, std::vector<int32_t>> index; // hash of n_match tokens -> the positions they end at
+        size_t n_indexed  = 0;
+        int    cls_last   = -1; // class of the proposal in flight
+    };
+
+    std::vector<seq_state> seqs;
+
+    std::vector<double> att[N_CLASS];
+    std::vector<double> acc[N_CLASS];
+
+    // expected tokens a cost that the other implementations realized lately
+    double rival = 1.0;
+
+    size_t n_explore = 0;
+
+    static double class_prior(int cls) {
+        return cls == 0 ? 0.50 : cls == 1 ? 0.75 : 0.90;
+    }
+
+    common_speculative_impl_ngram_stat(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_STAT, n_seq, params.ngram_stat_n_max)
+        , n_match(std::max(1, params.ngram_stat_n_match))
+        , row_cost(params.row_cost > 0.0f ? params.row_cost : 0.28)
+        , seqs(n_seq)
+    {
+        SPC_TRC("%s", "adding speculative implementation 'ngram-stat'\n");
+        SPC_TRC("- n_match=%d, n_max=%d, row_cost=%.2f\n", n_match, n_max, row_cost);
+    }
+
+    bool chooses_rows() const override { return true; }
+
+    static int match_class(int n_back) {
+        return n_back < 8 ? 0 : n_back < 24 ? 1 : 2;
+    }
+
+    uint64_t key_at(const llama_tokens & h, size_t end) const {
+        uint64_t k = 1469598103934665603ull;
+        for (int32_t j = n_match - 1; j >= 0; --j) {
+            k = (k ^ (uint64_t) (uint32_t) h[end - j])*1099511628211ull;
+        }
+        return k;
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            seqs[seq_id] = seq_state();
+        }
+    }
+
+    bool process(const common_batch & /*batch*/) override {
+        return true;
+    }
+
+    // the history is the prompt and the last token: extend the index, or build it again where the history changed
+    void sync(seq_state & st, const llama_tokens & prompt, llama_token id_last) {
+        const size_t n = prompt.size() + 1;
+        bool extend = st.hist.size() <= n && st.hist.size() > 0;
+        if (extend) {
+            const size_t m = st.hist.size();
+            for (size_t i = m > 32 ? m - 32 : 0; i < m && extend; ++i) {
+                extend = st.hist[i] == (i < prompt.size() ? prompt[i] : id_last);
+            }
+        }
+        if (!extend) {
+            st.hist.clear();
+            st.index.clear();
+            st.n_indexed = 0;
+        }
+        st.hist.reserve(n);
+        for (size_t i = st.hist.size(); i < n; ++i) {
+            st.hist.push_back(i < prompt.size() ? prompt[i] : id_last);
+        }
+        // every position but the last is a place a continuation can be read from
+        for (size_t end = std::max(st.n_indexed, (size_t) n_match - 1); end + 1 < n; ++end) {
+            auto & v = st.index[key_at(st.hist, end)];
+            if (v.size() == (size_t) N_KEEP) {
+                v.erase(v.begin());
+            }
+            v.push_back((int32_t) end);
+            st.n_indexed = end + 1;
+        }
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+            auto & st = seqs[seq_id];
+            st.cls_last = -1;
+            sync(st, *dp.prompt, dp.id_last);
+
+            const auto & h = st.hist;
+            const size_t last = h.size() - 1;
+            if (last + 1 < (size_t) n_match + 1) {
+                continue;
+            }
+            const auto it = st.index.find(key_at(h, last));
+            if (it == st.index.end()) {
+                continue;
+            }
+
+            // the occurrence whose text before it agrees longest; the latest of equals
+            int32_t best_pos  = -1;
+            int     best_back = 0;
+            for (const int32_t pos : it->second) {
+                int back = 0;
+                while (back < N_BACK && back <= pos && h[pos - back] == h[last - back]) {
+                    back++;
+                }
+                if (back >= n_match && back >= best_back) {
+                    best_back = back;
+                    best_pos  = pos;
+                }
+            }
+            if (best_pos < 0) {
+                continue;
+            }
+
+            size_t n = std::min((size_t) n_max, last - (size_t) best_pos);
+            if (dp.n_max > 0) {
+                n = std::min(n, (size_t) dp.n_max);
+            }
+            const int cls = match_class(best_back);
+
+            double rate = 1.0;
+            size_t n_rows = row_choose(att[cls], acc[cls], n, row_cost, 0.0, class_prior(cls), &rate);
+
+            // now and then a short proposal is verified whatever it is expected to give, or a class that fell behind
+            // could never come back
+            const bool explore = ++n_explore % 24 == 0;
+            if ((n_rows == 0 || rate < rival) && !explore) {
+                continue;
+            }
+            if (n_rows == 0) {
+                n_rows = std::min(n, (size_t) 2);
+            }
+            if (n_rows == 0) {
+                continue;
+            }
+
+            st.cls_last = cls;
+            dp.result->assign(h.begin() + best_pos + 1, h.begin() + best_pos + 1 + n_rows);
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // noop: observe_round has the rows too
+    }
+
+    void observe_round(llama_seq_id seq_id, size_t n_drafted, size_t n_accepted, bool is_other) override {
+        if (is_other) {
+            // the fixed part stands for a model drafter's own pass
+            const double r = (1.0 + (double) n_accepted)/(1.0 + row_cost*(double) n_drafted + 0.3);
+            rival = 0.9*rival + 0.1*r;
+            return;
+        }
+        auto & st = seqs[seq_id];
+        if (st.cls_last >= 0 && n_drafted > 0) {
+            row_observe(att[st.cls_last], acc[st.cls_last], n_drafted, n_accepted);
+        }
+        st.cls_last = -1;
+    }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -2957,6 +3204,10 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // the cost of one more verified row (0: every drafted row is verified), and the rows of the draft in flight
+    double              row_cost = 0.0;
+    std::vector<size_t> n_draft_last;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3017,6 +3268,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:  return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:      return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:    return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_STAT:     return "ngram-stat";
         default:                                     return "unknown";
     }
 }
@@ -3119,6 +3371,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_STAT:
+                n_max = std::max(n_max, spec->ngram_stat_n_max);
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -3419,10 +3674,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
+        // ngram-stat proposes only where its measured acceptance beats what the others have been getting
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_STAT);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
@@ -3534,6 +3791,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impls.push_back(create_state_ngram_cache(config, n_seq));
                 break;
             }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_STAT: {
+                impls.push_back(std::make_unique<common_speculative_impl_ngram_stat>(config.params, n_seq));
+                break;
+            }
             default:
                 break;
         }
@@ -3553,6 +3814,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
             case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_STAT:
                 return false;
             default:
                 return true;
@@ -3570,6 +3832,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
     });
+    result->row_cost = params.row_cost;
+    result->n_draft_last.assign(n_seq, 0);
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
@@ -3666,6 +3930,17 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        // the rows this implementation is expected to pay for, from the acceptance measured at its draft positions:
+        // none, and it sits the round out (every 16th round it drafts in full, so the measure follows the text)
+        const bool row_select  = spec->row_cost > 0.0 && !impl->chooses_rows();
+        const bool row_explore = row_select && ++impl->n_row_rounds % 16 == 0;
+        static constexpr double ROW_FIXED = 0.3; // the pass of a model drafter, in decodes of one token
+        if (row_select && !row_explore &&
+                common_speculative_impl::row_choose(impl->row_att, impl->row_acc, (size_t) std::max(0, impl->n_max),
+                    spec->row_cost, ROW_FIXED, common_speculative_impl::ROW_PRIOR) == 0) {
+            continue;
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -3682,6 +3957,17 @@ void common_speculative_draft(common_speculative * spec) {
             }
 
             auto & result = *dp.result;
+
+            if (row_select && !row_explore && !result.empty()) {
+                const size_t n_keep = common_speculative_impl::row_choose(impl->row_att, impl->row_acc, result.size(),
+                        spec->row_cost, ROW_FIXED, common_speculative_impl::ROW_PRIOR);
+                if (n_keep < result.size()) {
+                    result.resize(n_keep);
+                    if (dp.result_q && !dp.result_q->empty()) {
+                        dp.result_q->resize(n_keep);
+                    }
+                }
+            }
 
             // a new draft has been sampled
             if (dp.drafting && !result.empty()) {
@@ -3706,6 +3992,7 @@ void common_speculative_draft(common_speculative * spec) {
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();
+                    spec->n_draft_last[seq_id] = result.size();
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
@@ -3764,6 +4051,18 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     for (auto & impl_other : spec->impls) {
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
+        }
+    }
+
+    // the acceptance at each draft position, for the choice of rows
+    const size_t n_drafted = (size_t) seq_id < spec->n_draft_last.size() ? spec->n_draft_last[seq_id] : 0;
+    if (n_drafted > 0) {
+        spec->n_draft_last[seq_id] = 0;
+        if (!impl->chooses_rows()) {
+            common_speculative_impl::row_observe(impl->row_att, impl->row_acc, n_drafted, n_accepted);
+        }
+        for (auto & impl_any : spec->impls) {
+            impl_any->observe_round(seq_id, n_drafted, n_accepted, impl_any.get() != impl);
         }
     }
 }

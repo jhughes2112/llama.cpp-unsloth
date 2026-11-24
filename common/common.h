@@ -187,6 +187,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,  // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,    // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_NGRAM_STAT,     // lookup in the context, verified only as far as its measured acceptance pays
     COMMON_SPECULATIVE_TYPE_COUNT           // number of types, unknown type
 };
 
@@ -399,6 +400,14 @@ struct common_params_speculative {
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
+
+    // the cost of one more verified row, in decodes of a single token; a draft is cut to the rows whose expected
+    // accepted tokens pay for them, by the acceptance measured at each draft position (0: verify every drafted row)
+    float row_cost = 0.0f;
+
+    // ngram-stat: tokens that must match before a continuation is proposed, and the longest proposal
+    int32_t ngram_stat_n_match = 4;
+    int32_t ngram_stat_n_max   = 15;
 
     common_params_speculative_ngram_mod ngram_mod;
     common_params_speculative_ngram_map ngram_simple;
