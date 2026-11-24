@@ -760,10 +760,67 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        // unsorted: a sort of the whole vocabulary a row cost more than the rest of the verify (200K tokens with top_k 0)
+        auto *       cur_p = common_sampler_get_candidates(gsmpl, false);
         const auto & q     = draft_q[i];
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
+
+        // the usual case: every token is a candidate, at the index of its id, so nothing needs a search
+        const bool by_id = !masked && cur_p->size > 0 && (size_t) draft[i] < cur_p->size &&
+            cur_p->data[draft[i]].id == draft[i] && cur_p->data[cur_p->size - 1].id == (llama_token) (cur_p->size - 1);
+        if (by_id) {
+            const float q_x = prob_of(q.data(), q.size(), draft[i]);
+            const float p_x = cur_p->data[draft[i]].p;
+            if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+                common_sampler_accept(gsmpl, draft[i], true);
+                result.push_back(draft[i]);
+                continue;
+            }
+
+            // rejected: the residual is p outside the support of q and max(0, p - q) inside it. take q out of p in
+            // place for the walk and put p back
+            std::vector<std::pair<llama_token, float>> saved;
+            float sum = 0.0f;
+            for (const auto & e : q) {
+                if (e.id < 0 || (size_t) e.id >= cur_p->size || cur_p->data[e.id].id != e.id) {
+                    continue;
+                }
+                bool seen = false;
+                for (const auto & sv : saved) {
+                    seen = seen || sv.first == e.id;
+                }
+                if (seen) {
+                    continue;
+                }
+                saved.push_back({ e.id, cur_p->data[e.id].p });
+                cur_p->data[e.id].p = std::max(0.0f, cur_p->data[e.id].p - e.p);
+            }
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                sum += cur_p->data[k].p;
+            }
+            llama_token id = id_tgt;
+            if (sum > 0.0f) {
+                float u = uni(gsmpl->rng) * sum;
+                for (size_t k = 0; k < cur_p->size; ++k) {
+                    if (cur_p->data[k].p > 0.0f) {
+                        id = cur_p->data[k].id;
+                        u -= cur_p->data[k].p;
+                        if (u <= 0.0f) {
+                            break;
+                        }
+                    }
+                }
+            }
+            for (const auto & sv : saved) {
+                cur_p->data[sv.first].p = sv.second;
+            }
+
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
+
+            break;
+        }
         if (masked) {
             cand.assign(cur_p->data, cur_p->data + cur_p->size);
             llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
