@@ -27,12 +27,13 @@ of the server build fails there.
 
 ```bash
 pip install -U huggingface_hub
-hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-Q4_K_XL.gguf mmproj-BF16.gguf \
-    --revision 29eac40 --local-dir models
+hf download unsloth/Inkling-2-Mini-GGUF Old_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file     Old_Support/mmproj-BF16.gguf_file --local-dir models
+mv models/Old_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file models/Inkling-2-Mini-UD-Q4_K_XL.gguf
+mv models/Old_Support/mmproj-BF16.gguf_file models/mmproj-BF16.gguf
 ```
 
-17.6 GB of weights plus the 0.6 GB image projector. The revision is pinned because this release reads the GGUF layout
-of that upload.
+17.6 GB of weights plus the 0.6 GB image projector. This release reads the GGUF layout Unsloth first published, which
+now lives in the `Old_Support` folder of their repo (the root files have a newer layout and will not load here).
 
 ### Run
 
