@@ -981,16 +981,16 @@ kernel void kernel_ctrl_down_f32(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tpitg.x == 0) {
-        px = pm = sx = sm = 0.0f;
-        for (int i = 0; i < nsg; ++i) {
-            px += shmem[4*i + 0];
-            pm += shmem[4*i + 1];
-            sx += shmem[4*i + 2];
-            sm += shmem[4*i + 3];
-        }
+    // the simdgroup totals: a lane each, summed by the first simdgroup
+    if (sgitg == 0) {
+        px = simd_sum(tiisg < nsg ? shmem[4*tiisg + 0] : 0.0f);
+        pm = simd_sum(tiisg < nsg ? shmem[4*tiisg + 1] : 0.0f);
+        sx = simd_sum(tiisg < nsg ? shmem[4*tiisg + 2] : 0.0f);
+        sm = simd_sum(tiisg < nsg ? shmem[4*tiisg + 3] : 0.0f);
 
-        dst[(ulong) tgpig.y*args.n_rank + tgpig.x] = px/sqrt(sx/n + args.eps) + pm/sqrt(sm/n + args.eps);
+        if (tiisg == 0) {
+            dst[(ulong) tgpig.y*args.n_rank + tgpig.x] = px/sqrt(sx/n + args.eps) + pm/sqrt(sm/n + args.eps);
+        }
     }
 }
 // a few-row mat-mul over the weighted rms norm of its input: dst[r] = W[r] . (x*w)/rms(x), one threadgroup a row and
