@@ -3183,47 +3183,56 @@ void kernel_mul_mv_nvfp4_f32_impl(
     const int nb   = args.ne00/QK_NVFP4;
     const int ns01 = args.nb01/args.nb00; // this can be larger than nb for permuted src0 tensors
 
-    const short ix = tiisg/2;  // 0...15
-    const short it = tiisg%2;  // 0 or 1, each thread takes 2 of the 4 sub-blocks
-
-    shmem_f32[tiisg] = kvalues_mxfp4_f[tiisg%16];
+    // a lane a sub-block of 16 weights (8 bytes, one scale), 8 lanes across blocks (16 lanes a half block each left
+    // most lanes idle at the end of rows of 18 or 36 blocks); a byte decoded to both its values at once from a table of
+    // 256 half2 in threadgroup memory (fp4 values are exact in fp16: the same values as before). measured on an M5 Ultra,
+    // 8 experts (stepbench/nvfp4c): 2304x2304 30.0 -> 26.1 us, 1152 in x 2304 rows 20.0 -> 15.2 us (with N_R0_NVFP4 4)
+    (void) shmem_f32;
+    threadgroup half2 * lut = (threadgroup half2 *) shmem;
+    for (short j = sgitg*32 + tiisg; j < 256; j += NSG*32) {
+        lut[j] = half2((half) kvalues_mxfp4_f[j & 15], (half) kvalues_mxfp4_f[j >> 4]);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float4 yl[8];
+    const short ix   = tiisg/4;                     // 0...7: the block
+    const short iq   = tiisg%4;                     // 0...3: the sub-block
+    const short boff = 16*(iq/2) + 8*(iq%2);        // its 8 bytes in qs
+
+    // rows past the end read the last row (no reads outside the tensor); their sums are not stored
+    const int nrv = max(1, min(NR0, (int) args.ne01 - first_row));
+
+    float4 yl[4];
     float sumf[NR0]={0.f};
 
-    device const float * yb = y + ix*QK_NVFP4 + it*2*QK_NVFP4_SUB;
+    device const float * yb = y + ix*QK_NVFP4 + iq*QK_NVFP4_SUB;
 
-    for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
+    for (int ib = ix; ib < nb && ib < ns01; ib += 8) {
         device const float4 * y4 = (device const float4 *) yb;
 
-        FOR_UNROLL (short i = 0; i < 8; ++i) {
+        FOR_UNROLL (short i = 0; i < 4; ++i) {
             yl[i] = y4[i];
         }
 
         FOR_UNROLL (short row = 0; row < NR0; row++) {
-            device const block_nvfp4 & xb = x[row*ns01 + ib];
-            device const uint8_t     * q2 = xb.qs + 2*it*(QK_NVFP4_SUB/2);
+            device const block_nvfp4 & xb = x[min((int) row, nrv - 1)*ns01 + ib];
+            device const uint * qp = (device const uint *) (xb.qs + boff);
+            const uint lo = qp[0];
+            const uint hi = qp[1];
 
-            float sumq = 0.f;
+            const half2 v0 = lut[lo & 255], v1 = lut[(lo >> 8) & 255], v2 = lut[(lo >> 16) & 255], v3 = lut[lo >> 24];
+            const half2 v4 = lut[hi & 255], v5 = lut[(hi >> 8) & 255], v6 = lut[(hi >> 16) & 255], v7 = lut[hi >> 24];
 
-            FOR_UNROLL (short s = 0; s < 2; ++s) {
-                device const uint8_t * q = q2 + 8*s;
+            float4 acc1 = yl[0]*float4(v0.x, v1.x, v2.x, v3.x);
+            float4 acc2 = yl[1]*float4(v4.x, v5.x, v6.x, v7.x);
+            float4 acc3 = yl[2]*float4(v0.y, v1.y, v2.y, v3.y);
+            float4 acc4 = yl[3]*float4(v4.y, v5.y, v6.y, v7.y);
 
-                float4 acc1 = yl[4*s + 0]*float4(shmem_f32[q[0] &  0x0F], shmem_f32[q[1] &  0x0F], shmem_f32[q[2] &  0x0F], shmem_f32[q[3] &  0x0F]);
-                float4 acc2 = yl[4*s + 1]*float4(shmem_f32[q[4] &  0x0F], shmem_f32[q[5] &  0x0F], shmem_f32[q[6] &  0x0F], shmem_f32[q[7] &  0x0F]);
-                float4 acc3 = yl[4*s + 2]*float4(shmem_f32[q[0] >> 4   ], shmem_f32[q[1] >> 4   ], shmem_f32[q[2] >> 4   ], shmem_f32[q[3] >> 4   ]);
-                float4 acc4 = yl[4*s + 3]*float4(shmem_f32[q[4] >> 4   ], shmem_f32[q[5] >> 4   ], shmem_f32[q[6] >> 4   ], shmem_f32[q[7] >> 4   ]);
+            acc1 = (acc1 + acc3) + (acc2 + acc4);
 
-                acc1 = (acc1 + acc3) + (acc2 + acc4);
-
-                sumq += ue4m3_to_fp32(xb.d[2*it + s]) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
-            }
-
-            sumf[row] += sumq;
+            sumf[row] += ue4m3_to_fp32(xb.d[iq]) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
         }
 
-        yb += 16 * QK_NVFP4;
+        yb += 8 * QK_NVFP4;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
