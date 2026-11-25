@@ -405,6 +405,20 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     if (ctx->cmd_buf_last) {
         // (polling the status instead brought the thread back in 60 us rather than 89 on an M5 Ultra, but only when it
         // polled for the whole execution: sleeping until shortly before the end and polling from there gained nothing)
+        // the thread polls the status until the GPU is done, on by default (GGML_METAL_NO_POLL=1: only wait): it comes
+        // back in ~58 us instead of ~95, and the work it does next (sampling, the next decode) runs on a core that
+        // stayed awake: 158 -> 100 us of CPU time between two tokens, llama-server 122.3 -> 124.2 tok/s on an M5 Ultra
+        static int poll = -1;
+        if (poll < 0) {
+            poll = getenv("GGML_METAL_NO_POLL") == NULL;
+        }
+        if (poll) {
+            while ([ctx->cmd_buf_last status] < MTLCommandBufferStatusCompleted) {
+#if defined(__aarch64__)
+                __asm__ __volatile__("yield");
+#endif
+            }
+        }
         [ctx->cmd_buf_last waitUntilCompleted];
         if (getenv("GGML_METAL_PROFILE")) {
             g_profile_t_wake  = [[NSProcessInfo processInfo] systemUptime];
