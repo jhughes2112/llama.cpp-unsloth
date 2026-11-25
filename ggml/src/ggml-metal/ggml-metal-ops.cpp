@@ -8195,8 +8195,9 @@ static bool ggml_metal_op_situ_fusable(ggml_metal_op_t ctx, int idx) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne20 = op->src[2]->ne[0];
     const int64_t ne21 = op->src[2]->ne[1];
+    static const bool one_only = getenv("GGML_METAL_TOPK_FOLD_1") != nullptr;
     if (op->src[0]->type != GGML_TYPE_NVFP4 || op->src[1]->type != GGML_TYPE_F32 || ne00 % 64 != 0 ||
-        op->ne[1] != ne20 || op->ne[2] != ne21 || ne21 != 1) {
+        op->ne[1] != ne20 || op->ne[2] != ne21 || (one_only && ne21 != 1)) {
         return false;
     }
     int n2 = 0;
@@ -8318,8 +8319,10 @@ int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
     };
 
     static const bool no_fold = getenv("GGML_METAL_NO_TOPK_FOLD") != nullptr;
-    if (!no_fold && n_tokens == 1 && n_expert <= 128 && n_expert_used <= 32 && ggml_is_contiguous(logits) &&
-        ggml_is_contiguous(ids) && ggml_is_contiguous(weights)) {
+    static const bool fold_one_only = getenv("GGML_METAL_TOPK_FOLD_1") != nullptr;
+    if (!no_fold && (n_tokens == 1 || !fold_one_only) && n_expert <= 128 && n_expert_used <= 32 && ggml_is_contiguous(logits) &&
+        ids->nb[0] == sizeof(int32_t) && (n_tokens == 1 || ggml_is_contiguous(ids) || ids->ne[2] == 1) && ggml_is_contiguous(weights)) {
+        // (ids: the first top_k of each row of the argsort, written by the kernel through the row stride of its ids)
         // the first later node that reads the ids or the weights must be the fused gate_up of these ids, and the
         // logits and the bias must stay as they are until then
         const ggml_tensor * r_ids = ggml_metal_op_root(ids);

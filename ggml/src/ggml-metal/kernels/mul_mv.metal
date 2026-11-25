@@ -3557,15 +3557,16 @@ static inline void kernel_mul_mv_id_nvfp4_situ_impl(
 
     if (TOPK && sgitg == 0) {
         constant ggml_metal_kargs_situ_topk & ta = *tap;
-        // the router top-k of kernel_topk_moe_f32 (one token, at most 128 experts: 4 a lane); every threadgroup
-        // selects for itself, threadgroup 0 of slot 0 also writes the ids and the weights for the later kernels
+        // the router top-k of kernel_topk_moe_f32 (at most 128 experts: 4 a lane), of the token of this threadgroup;
+        // every threadgroup selects for itself, threadgroup 0 of slot 0 of a token also writes its ids and weights
         const int lane = tiisg;
+        const int tk   = tgpig.z/args.nei0;
         float wt[4];
         float sel[4];
         float ow = 0.0f;
         FOR_UNROLL (int i = 0; i < 4; ++i) {
             const int e = lane + 32*i;
-            const float v = e < ta.n_expert ? logits[e] : -INFINITY;
+            const float v = e < ta.n_expert ? logits[tk*ta.n_expert + e] : -INFINITY;
             wt[i] = isnan(v) ? -FLT_MAX : v;
         }
         if (ta.gating == 1) {
@@ -3631,14 +3632,14 @@ static inline void kernel_mul_mv_id_nvfp4_situ_impl(
             }
             wt_sum += best_val;
         }
-        if (tgpig.x == 0 && tgpig.z == 0) {
+        if (tgpig.x == 0 && tgpig.z % args.nei0 == 0) {
             float inv = 1.0f;
             if (ta.with_norm) {
                 inv = 1.0f/(max(wt_sum, ta.clamp) + ta.bias);
             }
             if (lane < ta.top_k) {
-                ((device int32_t *) ids)[lane] = sh_ids[lane];
-                weights[lane] = ow*inv*ta.scale;
+                ((device int32_t *) (ids + tk*args.nbi1))[lane] = sh_ids[lane];
+                weights[tk*ta.top_k + lane] = ow*inv*ta.scale;
             }
         }
     }
