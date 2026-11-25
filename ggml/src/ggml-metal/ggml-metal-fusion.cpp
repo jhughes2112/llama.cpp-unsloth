@@ -2995,6 +2995,21 @@ void ggml_metal_fusion_add_alloc_deps(
                         }
                     }
                 }
+                // the depth mix with the norm may take the router mat-mul right behind into its kernel: the inputs of
+                // the mix stay until the router is done
+                if (fusion.id == GGML_METAL_FUSION_DEPTH_MIX_NORM) {
+                    const int last = i + (int) fusion.ops_all.size() - 1;
+                    if (last + 1 < gf->n_nodes && gf->nodes[last + 1]->op == GGML_OP_MUL_MAT &&
+                        gf->nodes[last + 1]->src[1] == gf->nodes[last]) {
+                        for (int j = i; j <= last; ++j) {
+                            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                                for (ggml_tensor * u = gf->nodes[j]->src[s]; u != nullptr; u = u->view_src) {
+                                    add_alloc_dep(user_data, u, gf->nodes[last + 1]);
+                                }
+                            }
+                        }
+                    }
+                }
                 // the soft cap of the output mat-mul in its epilogue: the input of the mat-mul stays until the cap is done
                 if (fusion.id == GGML_METAL_FUSION_SOFTCAP) {
                     const int last = i + (int) fusion.ops_all.size() - 1;

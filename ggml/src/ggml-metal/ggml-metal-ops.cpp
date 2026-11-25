@@ -7036,7 +7036,22 @@ int ggml_metal_op_depth_mix_impl(ggml_metal_op_t ctx, int idx, int n, bool norm)
     const ggml_tensor * sm  = ctx->node(idx + k + 4);
     ggml_tensor *       dst = ctx->node(idx + n - 1);
 
-    ggml_metal_op_fused_concurrency(ctx, idx, n);
+    // the router mat-vec of one token right behind (f32, a few rows over the result): in the same kernel, every
+    // threadgroup mixes again and takes GGML_METAL_MIX_ROUTER_RPT rows (default 2). GGML_METAL_NO_MIX_ROUTER=1 turns it off
+    static const bool no_mix_router = getenv("GGML_METAL_NO_MIX_ROUTER") != nullptr;
+    static const int  mix_rpt = getenv("GGML_METAL_MIX_ROUTER_RPT") ? atoi(getenv("GGML_METAL_MIX_ROUTER_RPT")) : 2;
+    ggml_tensor * router = nullptr;
+    if (!no_mix_router && norm && dst->ne[1] == 1 && mix_rpt >= 1 && mix_rpt <= 8 && idx + n < ctx->n_nodes() &&
+        getenv("GGML_METAL_NO_MIX_FAST") == nullptr && dst->ne[0] <= 3*1024) {
+        ggml_tensor * mm = ctx->node(idx + n);
+        if (mm->op == GGML_OP_MUL_MAT && mm->src[1] == dst && mm->src[0]->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(mm->src[0]) && ggml_is_contiguous(mm) && mm->src[0]->ne[0] == dst->ne[0] &&
+            mm->ne[1] == 1 && mm->ne[2] == 1 && mm->ne[3] == 1 && mm->src[0]->ne[2] == 1 && mm->src[0]->ne[3] == 1) {
+            router = mm;
+        }
+    }
+
+    ggml_metal_op_fused_concurrency(ctx, idx, n + (router ? 1 : 0));
 
     auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_depth_mix_f32");
 
@@ -7088,6 +7103,18 @@ int ggml_metal_op_depth_mix_impl(ggml_metal_op_t ctx, int idx, int n, bool norm)
     }
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, (2*8 + 1)*32*sizeof(float), 0);
+
+    // the fast kernel kept: it takes the router too (else the router is encoded on its own, behind a barrier)
+    if (router && !no_mix_fast && nth*3 >= args.n_embd) {
+        auto pr = ggml_metal_library_get_pipeline_named(lib, "kernel_depth_mix_fast_norm_router_f32");
+        ggml_metal_kargs_mix_router ra = { (int32_t) router->ne[0], mix_rpt };
+        ggml_metal_encoder_set_pipeline(enc, pr);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(router->src[0]), 5);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(router),         6);
+        ggml_metal_encoder_set_bytes   (enc, &ra, sizeof(ra), 7);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ra.n_rows + mix_rpt - 1)/mix_rpt, 1, 1, nth, 1, 1);
+        return n + 1;
+    }
 
     ggml_metal_encoder_dispatch_threadgroups(enc, args.nq, args.n_tokens, 1, nth, 1, 1);
 

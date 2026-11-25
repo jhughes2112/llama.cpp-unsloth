@@ -944,6 +944,13 @@ typedef struct {
     uint64_t offs[8]; // of each state in the source buffer
 } ggml_metal_kargs_depth_mix;
 
+// the router mat-vec of the MoE in the depth mix with the norm (kernel_depth_mix_fast_norm_router_f32): every
+// threadgroup mixes again and takes rpt rows of the router
+typedef struct {
+    int32_t  n_rows;
+    int32_t  rpt;
+} ggml_metal_kargs_mix_router;
+
 typedef struct {
     int64_t n; // elements
     float   s; // forget gate scale and bias

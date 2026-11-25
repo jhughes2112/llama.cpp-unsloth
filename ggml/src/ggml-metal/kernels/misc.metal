@@ -1933,13 +1933,16 @@ template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t ker
 // kernel_depth_mix_f32 for rows of at most 3 values a thread, specialized (its time is all latency, and the generic
 // kernel carried the code of both paths): everything a thread needs (states, query, weight) is loaded at once, the
 // partial sums go through threadgroup memory with one barrier (lanes past the simdgroup count read 0, no zeroing)
-template <bool NORM>
+template <bool NORM, bool ROUTER>
 kernel void kernel_depth_mix_fast_f32(
         constant ggml_metal_kargs_depth_mix & args,
         device const char  * src,
         device const float * query,
         device       float * dst,
         device const float * weight,
+        device const float * W,
+        device       float * rdst,
+        constant ggml_metal_kargs_mix_router & ra,
         threadgroup  float * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort3 tpitg [[thread_position_in_threadgroup]],
@@ -1948,7 +1951,7 @@ kernel void kernel_depth_mix_fast_f32(
         ushort3 ntg3  [[threads_per_threadgroup]]) {
     const int tid = tpitg.x;
     const int ntg = ntg3.x;
-    const int iq  = tgpig.x;
+    const int iq  = ROUTER ? 0 : tgpig.x;
     const int it  = tgpig.y;
     const int n   = args.n_embd;
     const int nsg = ntg/N_SIMDWIDTH;
@@ -2046,17 +2049,53 @@ kernel void kernel_depth_mix_fast_f32(
 
     const float sc = 1.0f/sqrt(sy/n + args.eps_out);
     FOR_UNROLL (short j = 0; j < 3; ++j) {
-        const int i = tid + j*ntg;
-        if (i < n) {
-            y[i] = yv[j]*sc*wv[j];
+        yv[j] *= sc*wv[j];
+    }
+    if (!ROUTER || tgpig.x == 0) {
+        FOR_UNROLL (short j = 0; j < 3; ++j) {
+            const int i = tid + j*ntg;
+            if (i < n) {
+                y[i] = yv[j];
+            }
+        }
+    }
+    if (!ROUTER) {
+        return;
+    }
+
+    // the rows of the router of this threadgroup over the result in the registers (slots 0..8*32 of shmem are
+    // free: their last reads were before the barrier of the norm)
+    const int row0 = tgpig.x*ra.rpt;
+    FOR_UNROLL (short r = 0; r < 8; ++r) {
+        float p = 0.0f;
+        if (r < ra.rpt && row0 + r < ra.n_rows) {
+            device const float * Wr = W + (ulong) (row0 + r)*n;
+            FOR_UNROLL (short j = 0; j < 3; ++j) {
+                const int i = tid + j*ntg;
+                p += i < n ? Wr[i]*yv[j] : 0.0f;
+            }
+        }
+        p = simd_sum(p);
+        if (tiisg == 0) {
+            shmem[r*N_SIMDWIDTH + sgitg] = p;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        FOR_UNROLL (short r = 0; r < 8; ++r) {
+            const float p = simd_sum(tiisg < nsg ? shmem[r*N_SIMDWIDTH + tiisg] : 0.0f);
+            if (tiisg == 0 && r < ra.rpt && row0 + r < ra.n_rows) {
+                rdst[(ulong) it*ra.n_rows + row0 + r] = p;
+            }
         }
     }
 }
 
-typedef decltype(kernel_depth_mix_fast_f32<false>) kernel_depth_mix_fast_t;
+typedef decltype(kernel_depth_mix_fast_f32<false, false>) kernel_depth_mix_fast_t;
 
-template [[host_name("kernel_depth_mix_fast_f32")]]      kernel kernel_depth_mix_fast_t kernel_depth_mix_fast_f32<false>;
-template [[host_name("kernel_depth_mix_fast_norm_f32")]] kernel kernel_depth_mix_fast_t kernel_depth_mix_fast_f32<true>;
+template [[host_name("kernel_depth_mix_fast_f32")]]             kernel kernel_depth_mix_fast_t kernel_depth_mix_fast_f32<false, false>;
+template [[host_name("kernel_depth_mix_fast_norm_f32")]]        kernel kernel_depth_mix_fast_t kernel_depth_mix_fast_f32<true,  false>;
+template [[host_name("kernel_depth_mix_fast_norm_router_f32")]] kernel kernel_depth_mix_fast_t kernel_depth_mix_fast_f32<true,  true>;
 
 
 // kernel_kv_conv_store_f32 for one token with the per-head, input-dependent taps of kernel_short_conv_dyn_f32 on top of
