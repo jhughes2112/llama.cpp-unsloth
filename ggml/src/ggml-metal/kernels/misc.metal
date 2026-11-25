@@ -1029,14 +1029,14 @@ kernel void kernel_norm_router_f32(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tpitg.x == 0) {
-        px = sx = 0.0f;
-        for (int i = 0; i < nsg; ++i) {
-            px += shmem[2*i + 0];
-            sx += shmem[2*i + 1];
-        }
+    // the simdgroup totals: a lane each, summed by the first simdgroup
+    if (sgitg == 0) {
+        px = simd_sum(tiisg < nsg ? shmem[2*tiisg + 0] : 0.0f);
+        sx = simd_sum(tiisg < nsg ? shmem[2*tiisg + 1] : 0.0f);
 
-        dst[(ulong) tgpig.y*args.n_rank + tgpig.x] = px/sqrt(sx/n + args.eps);
+        if (tiisg == 0) {
+            dst[(ulong) tgpig.y*args.n_rank + tgpig.x] = px/sqrt(sx/n + args.eps);
+        }
     }
 }
 // loop controller, both gates and the output: y = (s*tanh(F h) + b)*x + tanh(G h)*m, one simdgroup an element:
