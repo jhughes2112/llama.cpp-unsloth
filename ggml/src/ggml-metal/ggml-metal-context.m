@@ -68,6 +68,11 @@ static void ggml_metal_profile_cmd_buf_graph(id<MTLCommandBuffer> cmd_buf, int n
     }
     [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
         atomic_fetch_add(&g_profile_bucket_gpu_ns[b], (int64_t) (([cb GPUEndTime] - [cb GPUStartTime])*1e9));
+        static int each = -1;
+        if (each < 0) each = getenv("GGML_METAL_PROFILE_EACH") != NULL;
+        if (each) {
+            fprintf(stderr, "ggml_metal_profile: graph of %d nodes: %.3f ms GPU\n", n_nodes, ([cb GPUEndTime] - [cb GPUStartTime])*1e3);
+        }
 
         // the time the GPU sat idle before this command buffer: between two graphs (the CPU work of a decode) or
         // inside one (the encoder of the next command buffer was not done)
@@ -650,6 +655,7 @@ static id<MTLCommandBuffer> ggml_metal_encode_whole(ggml_metal_t ctx, struct ggm
     id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
     [cmd_buf retain];
 
+    const int64_t t0 = ggml_time_us();
     ggml_metal_mega_next_encoder();
     ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, 0, gf->n_nodes, ctx->use_concurrency, false, ctx->debug_graph);
     for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
@@ -659,7 +665,22 @@ static id<MTLCommandBuffer> ggml_metal_encode_whole(ggml_metal_t ctx, struct ggm
         }
         idx += res - 1;
     }
+    {
+        // GGML_METAL_SPIN_US: experiment, busy the CPU this long after encoding a graph
+        static int spin = -1;
+        if (spin < 0) spin = getenv("GGML_METAL_SPIN_US") ? atoi(getenv("GGML_METAL_SPIN_US")) : 0;
+        if (spin > 0) { const int64_t te = ggml_time_us() + spin; volatile int x = 0; while (ggml_time_us() < te) { x++; } }
+    }
+    const int64_t t1 = ggml_time_us();
     ggml_metal_op_free(ctx_op);
+    {
+        // GGML_METAL_PROFILE: the CPU time of encoding a whole graph (ops, then the end of encoding)
+        static int64_t s_ops = 0, s_end = 0; static int n = 0;
+        if (getenv("GGML_METAL_PROFILE")) {
+            s_ops += t1 - t0; s_end += ggml_time_us() - t1;
+            if (++n % 16 == 0) fprintf(stderr, "ggml_metal_encode_whole: %d graphs, %.0f us encoding ops, %.0f us ending\n", n, (double) s_ops/n, (double) s_end/n);
+        }
+    }
 
     return cmd_buf;
 }

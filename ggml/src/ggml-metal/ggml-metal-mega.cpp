@@ -285,6 +285,9 @@ kernel void kernel_mega(
         uint   tg [[threadgroup_position_in_grid]],
         uint   R  [[threadgroups_per_grid]],
         ushort ti [[thread_index_in_threadgroup]]) {
+    // a wait that timed out (a threadgroup that never started: the GPU is shared) ends the whole dispatch at the
+    // next barrier, so that it never holds the GPU for more than one wait
+    threadgroup uint aborted;
     for (uint s = 0; s < P.n_steps; ++s) {
         const uint e0 = S[s].e0;
         const uint ni = S[s].n_items;
@@ -330,16 +333,22 @@ MEGA_CASES
             if (ti == 0) {
                 atomic_fetch_add_explicit(bar, 1u, memory_order_relaxed);
                 const uint want = (s + 1)*R;
+                const uint lim  = P.pad[0] ? P.pad[0] : (1u << 22);
                 uint it = 0;
+                aborted = 0;
                 while (atomic_load_explicit(bar, memory_order_relaxed) < want) {
-                    if (++it > (P.pad[0] ? P.pad[0] : (1u << 15))) {
-                        atomic_store_explicit(bar + 1, 1u, memory_order_relaxed);
+                    if (atomic_load_explicit(bar + 1, memory_order_relaxed) != 0 || ++it > lim) {
+                        atomic_fetch_add_explicit(bar + 1, 1u, memory_order_relaxed);
+                        aborted = 1;
                         break;
                     }
                 }
             }
             threadgroup_barrier(mem_flags::mem_device);
             atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            if (aborted) {
+                return;
+            }
         }
     }
 }

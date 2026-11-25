@@ -1008,6 +1008,7 @@ struct ggml_metal_encoder {
     int    tl_slot; // GGML_METAL_TIMELINE: the sample pair of this encoder, -1 if none
 
     struct ggml_metal_mega_rec * mega; // GGML_METAL_MEGA: dispatches are recorded, encoded at the end
+    uint64_t kl_b[16]; // GGML_METAL_KERNEL_LIST: the bindings (address, 1 for bytes)
 };
 
 // GGML_METAL_TIMELINE=file[,skip[,count]]: GPU timestamps at the start and the end of every compute encoder (with an
@@ -1300,7 +1301,8 @@ void ggml_metal_recording_replay(ggml_metal_recording_t rec, ggml_metal_cmd_buf_
 //
 
 #define GGML_METAL_MEGA_RING 8
-#define GGML_METAL_MEGA_THREADS 256
+static int g_mega_T = 256; // threads a threadgroup of the persistent kernel (GGML_METAL_MEGA_TPT)
+#define GGML_METAL_MEGA_THREADS g_mega_T
 
 struct ggml_metal_mega_bind {
     id<MTLBuffer> buf;  // nil: bytes (or unbound)
@@ -1369,12 +1371,14 @@ static void ggml_metal_mega_forget_library(struct ggml_metal_library * lib) {
 }
 
 static __thread bool t_mega_next = false;
+static int g_mega_pt = 0; // GGML_METAL_MEGA_PASSTHRU: record, but encode as usual too (no replay)
 
 static bool ggml_metal_mega_enabled(void) {
     if (g_mega.on < 0) {
-        g_mega.on = getenv("GGML_METAL_MEGA") != NULL && atoi(getenv("GGML_METAL_MEGA")) != 0;
+        g_mega.on = getenv("GGML_METAL_MEGA") != NULL && atoi(getenv("GGML_METAL_MEGA")) != 0 && !getenv("GGML_METAL_MEGA_IGNORE");
         g_mega.R  = getenv("GGML_METAL_MEGA_TGS") ? atoi(getenv("GGML_METAL_MEGA_TGS")) : 64;
         g_mega.min_steps = getenv("GGML_METAL_MEGA_MIN_STEPS") ? atoi(getenv("GGML_METAL_MEGA_MIN_STEPS")) : 2;
+        g_mega_T = getenv("GGML_METAL_MEGA_TPT") ? atoi(getenv("GGML_METAL_MEGA_TPT")) : 256;
         g_mega_lock = [NSLock new];
         g_mega.old_psos = [NSMutableArray new];
         if (g_mega.on) {
@@ -1385,7 +1389,7 @@ static bool ggml_metal_mega_enabled(void) {
 }
 
 void ggml_metal_mega_next_encoder(void) {
-    if (ggml_metal_mega_enabled()) {
+    if (ggml_metal_mega_enabled() && !getenv("GGML_METAL_MEGA_NOREC")) {
         t_mega_next = true;
     }
 }
@@ -1465,7 +1469,7 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
         static int nv = 0;
         if (nv++ < 2) fprintf(stderr, "ggml_metal_mega: update: missing %d on %d lib %p first %s kind %d never %d gen %d/%d\n", missing, g_mega.on, (void *) g_mega.lib, r->d[0].pl->base, r->d[0].pl->kind, r->d[0].pl->mega_never, r->d[0].pl->mega_gen, g_mega.gen);
     }
-    if (!missing || g_mega.on != 1) {
+    if (!missing || g_mega.on != 1 || getenv("GGML_METAL_MEGA_NOBUILD")) {
         [g_mega_lock unlock];
         return;
     }
@@ -1638,8 +1642,17 @@ static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_m
 }
 
 static void ggml_metal_mega_encode_plain(id<MTLCommandBuffer> cmd, bool concurrent, struct ggml_metal_mega_rec * r, int d0, int d1) {
+    // each encoder released right after it ends, as the normal encoding does
+    @autoreleasepool {
     int slot = -1;
-    id<MTLComputeCommandEncoder> enc = ggml_metal_new_compute_encoder(cmd, concurrent, &slot);
+    id<MTLComputeCommandEncoder> enc = nil;
+    if (getenv("GGML_METAL_MEGA_DESC")) {
+        MTLComputePassDescriptor * pd = [MTLComputePassDescriptor computePassDescriptor];
+        pd.dispatchType = concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+        enc = [cmd computeCommandEncoderWithDescriptor:pd];
+    } else {
+        enc = ggml_metal_new_compute_encoder(cmd, concurrent, &slot);
+    }
     for (int i = d0; i < d1; ++i) {
         const struct ggml_metal_mega_disp * d = &r->d[i];
         [enc setComputePipelineState:d->pl->obj];
@@ -1657,6 +1670,7 @@ static void ggml_metal_mega_encode_plain(id<MTLCommandBuffer> cmd, bool concurre
             threadsPerThreadgroup:MTLSizeMake(d->tptg[0], d->tptg[1], d->tptg[2])];
     }
     [enc endEncoding];
+    }
 }
 
 static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
@@ -1664,6 +1678,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
     id<MTLCommandBuffer> cmd = encoder->cmd;
     if (r->n == 0) return;
 
+    const int64_t t_flush0 = ggml_time_us();
     ggml_metal_mega_update(r);
 
     const int nd = r->n;
@@ -1681,16 +1696,27 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
         if (!dok[i]) sok[r->d[i].step] = false;
     }
 
+    const int64_t t_flush1 = ggml_time_us();
+    bool any_ok = false;
+    for (int k = 0; k < ns && !any_ok; ++k) any_ok = sok[k];
+    if (!any_ok && getenv("GGML_METAL_MEGA_NORING")) {
+        for (int k = 0; k < ns; ++k) ggml_metal_mega_encode_plain(cmd, encoder->concurrent, r, sfirst[k], sfirst[k + 1]);
+        free(ent); free(dok); free(sfirst); free(sok);
+        return;
+    }
     // a ring slot for this command buffer
     const int ri = g_mega.ring_i++ % GGML_METAL_MEGA_RING;
     if (g_mega.ring[ri].cmd) {
-        if ([g_mega.ring[ri].cmd status] < MTLCommandBufferStatusCompleted) {
+        // a pre-encoded command buffer that was dropped is never committed: waiting for it would block forever
+        const MTLCommandBufferStatus st = [g_mega.ring[ri].cmd status];
+        if (st >= MTLCommandBufferStatusCommitted && st < MTLCommandBufferStatusCompleted) {
             [g_mega.ring[ri].cmd waitUntilCompleted];
         }
         const uint32_t * base = (const uint32_t *) [g_mega.ring[ri].buf contents];
         for (size_t k = 0; k < g_mega.ring[ri].n_ctr; ++k) {
-            if (base[g_mega.ring[ri].ctr[k]/4 + 1]) {
-                fprintf(stderr, "ggml_metal_mega: a grid barrier timed out (results of that graph are garbage), off\n");
+            const uint32_t nto = base[g_mega.ring[ri].ctr[k]/4 + 1];
+            if (nto) {
+                fprintf(stderr, "ggml_metal_mega: %u grid barrier waits timed out (results of that graph are garbage), off\n", nto);
                 g_mega.on = 0;
             }
         }
@@ -1710,6 +1736,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
     size_t cursor = 0;
     #define MEGA_ALLOC(sz) ({ cursor = (cursor + 255) & ~(size_t) 255; size_t _o = cursor; cursor += (sz); _o; })
 
+    const int64_t t_flush2 = ggml_time_us();
     int s = 0;
     while (s < ns) {
         int t = s;
@@ -1779,13 +1806,15 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
         } else {
             const int t1 = t > s ? t : s + 1;
             for (int k = s; k < t1; ++k) {
-                ggml_metal_mega_encode_plain(cmd, encoder->concurrent, r, sfirst[k], sfirst[k + 1]);
+                ggml_metal_mega_encode_plain(cmd, getenv("GGML_METAL_MEGA_SERIAL") ? false : true, r, sfirst[k], sfirst[k + 1]);
+                static int pc = 0; if (pc++ == 0 && getenv("GGML_METAL_MEGA_VERBOSE")) fprintf(stderr, "ggml_metal_mega: encoder concurrent = %d\n", (int) encoder->concurrent);
                 g_mega.n_steps_plain++;
             }
             s = t1;
         }
     }
     #undef MEGA_ALLOC
+    const int64_t t_flush3 = ggml_time_us();
     g_mega.ring[ri].cmd = [cmd retain];
 
     static int verbose = -1;
@@ -1809,6 +1838,13 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
         }
     }
     free(ent); free(dok); free(sfirst); free(sok);
+    {
+        static int64_t t_sum = 0, t_a = 0, t_b = 0, t_c = 0; static int n_sum = 0;
+        t_sum += ggml_time_us() - t_flush0;
+        t_a += t_flush1 - t_flush0; t_b += t_flush2 - t_flush1; t_c += t_flush3 - t_flush2;
+        if (++n_sum % 16 == 0 && verbose) fprintf(stderr, "ggml_metal_mega: flush %.0f us on average (layout %.0f, ring %.0f, encode %.0f)\n",
+            (double) t_sum/n_sum, (double) t_a/n_sum, (double) t_b/n_sum, (double) t_c/n_sum);
+    }
 }
 
 static struct ggml_metal_mega_rec * ggml_metal_mega_rec_init(void) {
@@ -1822,9 +1858,40 @@ static struct ggml_metal_mega_rec * ggml_metal_mega_rec_init(void) {
 }
 
 static void ggml_metal_mega_rec_free(struct ggml_metal_mega_rec * r) {
+    const int64_t t0 = ggml_time_us();
     free(r->d);
     free(r->bytes);
     free(r);
+    static int64_t s = 0; static int n = 0;
+    s += ggml_time_us() - t0;
+    if (++n % 16 == 0 && getenv("GGML_METAL_PROFILE")) fprintf(stderr, "ggml_metal_mega: rec_free %.0f us\n", (double) s/n);
+}
+
+// GGML_METAL_KERNEL_LIST=file,skip,count: every dispatch after the first skip ones: kernel, grid, threads, threadgroup
+// memory (as recorded by GGML_METAL_MEGA too, to compare its replay with the normal encoding)
+static atomic_int g_kl_step = 0;
+static uint64_t ggml_metal_kl_hash(const void * p, size_t n) { uint64_t h = 1469598103934665603ull; for (size_t i = 0; i < n; ++i) h = (h ^ ((const uint8_t *) p)[i])*1099511628211ull; return h | 1; }
+
+static void ggml_metal_kernel_list(id<MTLComputePipelineState> pso, int step, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2,
+                                   size_t sm0, size_t sm1, const uint64_t * kb) {
+    static FILE * kl = NULL; static int kl_on = -1, kl_skip = 0, kl_cnt = 0; static atomic_int kl_n = 0;
+    if (kl_on < 0) {
+        kl_on = 0;
+        const char * v = getenv("GGML_METAL_KERNEL_LIST");
+        if (v) { char tmp[512]; snprintf(tmp, sizeof(tmp), "%s", v); char * c = strchr(tmp, 0x2c); kl_cnt = 4000;
+            if (c) { *c = 0; kl_skip = atoi(c + 1); char * c2 = strchr(c + 1, 0x2c); if (c2) kl_cnt = atoi(c2 + 1); }
+            kl = fopen(tmp, "w"); kl_on = kl != NULL; }
+    }
+    if (kl_on == 1) {
+        const int k = atomic_fetch_add(&kl_n, 1) - kl_skip;
+        if (k >= 0 && k < kl_cnt) {
+            fprintf(kl, "%d %d %s %d %d %d %d %d %d %zu %zu", k, step, [[pso label] UTF8String] ?: "?",
+                    tg0, tg1, tg2, tptg0, tptg1, tptg2, sm0, sm1);
+            for (int j = 0; j < 16; ++j) fprintf(kl, " %llx", (unsigned long long) kb[j]);
+            fprintf(kl, "\n");
+            if (k == kl_cnt - 1) fflush(kl);
+        }
+    }
 }
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
@@ -1836,6 +1903,8 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
         res->cmd        = (id<MTLCommandBuffer>) cmd_buf_raw;
         res->concurrent = concurrent;
         res->tl_slot    = -1;
+        g_mega_pt = getenv("GGML_METAL_MEGA_PASSTHRU") != NULL;
+        if (g_mega_pt) { res->obj = ggml_metal_new_compute_encoder(res->cmd, concurrent, &res->tl_slot); [res->obj retain]; }
         return res;
     }
     t_mega_next = false;
@@ -1860,6 +1929,7 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
     if (encoder->mega) {
+        if (g_mega_pt) [encoder->obj release];
         ggml_metal_mega_rec_free(encoder->mega);
         free(encoder);
         return;
@@ -1893,10 +1963,14 @@ void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_m
 
     if (encoder->mega) {
         struct ggml_metal_mega_rec * r = encoder->mega;
+        // threadgroup memory lengths stay set in a Metal encoder (a step) until set again: keep them
+        const size_t tg0 = r->step_used ? r->cur.tg[0] : 0, tg1 = r->step_used ? r->cur.tg[1] : 0;
         memset(&r->cur, 0, sizeof(r->cur));
+        r->cur.tg[0] = tg0;
+        r->cur.tg[1] = tg1;
         for (int j = 0; j < GGML_METAL_RECORDING_BINDS; ++j) r->cur.b[j].bytes_off = -1;
         r->cur.pl = pipeline.pipeline;
-        return;
+        if (!g_mega_pt) return;
     }
 
     if (encoder->rec) {
@@ -1935,7 +2009,7 @@ void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, siz
         r->cur.b[idx].bytes_off  = (int) offs;
         r->cur.b[idx].bytes_size = (int) size;
         if (idx >= r->cur.nb) r->cur.nb = idx + 1;
-        return;
+        if (!g_mega_pt) return;
     }
     if (encoder->rec) {
         // the bytes go to the arguments buffer of the recording and are bound like any buffer
@@ -1954,6 +2028,7 @@ void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, siz
         }
         return;
     }
+    if (idx < 16) encoder->kl_b[idx] = ggml_metal_kl_hash(data, size);
     [encoder->obj setBytes:data length:size atIndex:idx];
 }
 
@@ -1965,7 +2040,7 @@ void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_met
         r->cur.b[idx].offs = buffer.offs;
         r->cur.b[idx].bytes_off = -1;
         if (idx >= r->cur.nb) r->cur.nb = idx + 1;
-        return;
+        if (!g_mega_pt) return;
     }
     if (encoder->rec) {
         if (idx >= GGML_METAL_RECORDING_BINDS) {
@@ -1979,6 +2054,7 @@ void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_met
         }
         return;
     }
+    if (idx < 16) encoder->kl_b[idx] = [buffer.metal gpuAddress] + buffer.offs;
     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
 }
 
@@ -1989,7 +2065,7 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
     if (encoder->mega) {
         if (idx >= 2) { encoder->mega->failed = true; return; }
         encoder->mega->cur.tg[idx] = size;
-        return;
+        if (!g_mega_pt) return;
     }
     if (encoder->rec) {
         if (idx >= 2) {
@@ -1999,6 +2075,7 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
         encoder->tg_size[idx] = size;
         return;
     }
+    if (idx < 2) encoder->tg_size[idx] = size;
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
@@ -2016,7 +2093,9 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
         d->tptg[0] = tptg0; d->tptg[1] = tptg1; d->tptg[2] = tptg2;
         d->step = r->step;
         r->step_used = true;
-        return;
+        { uint64_t kb[16] = { 0 }; for (int j = 0; j < 16 && j < d->nb; ++j) kb[j] = d->b[j].bytes_off >= 0 ? ggml_metal_kl_hash(r->bytes + d->b[j].bytes_off, d->b[j].bytes_size) : (d->b[j].buf ? [d->b[j].buf gpuAddress] + d->b[j].offs : 0);
+          ggml_metal_kernel_list(d->pl->obj, d->step, tg0, tg1, tg2, tptg0, tptg1, tptg2, d->tg[0], d->tg[1], kb); }
+        if (!g_mega_pt) return;
     }
     if (encoder->rec) {
         ggml_metal_recording_t rec = encoder->rec;
@@ -2078,25 +2157,7 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
         encoder->barrier = false;
         return;
     }
-    {
-        // GGML_METAL_KERNEL_LIST=file,skip,count: every dispatch after the first skip ones: step, kernel, grid, threads, smem
-        static FILE * kl = NULL; static int kl_on = -1, kl_skip = 0, kl_cnt = 0; static atomic_int kl_n = 0;
-        if (kl_on < 0) {
-            kl_on = 0;
-            const char * v = getenv("GGML_METAL_KERNEL_LIST");
-            if (v) { char tmp[512]; snprintf(tmp, sizeof(tmp), "%s", v); char * c = strchr(tmp, 0x2c); kl_cnt = 4000;
-                if (c) { *c = 0; kl_skip = atoi(c + 1); char * c2 = strchr(c + 1, 0x2c); if (c2) kl_cnt = atoi(c2 + 1); }
-                kl = fopen(tmp, "w"); kl_on = kl != NULL; }
-        }
-        if (kl_on == 1) {
-            const int k = atomic_fetch_add(&kl_n, 1) - kl_skip;
-            if (k >= 0 && k < kl_cnt) {
-                fprintf(kl, "%d %p %s %d %d %d %d %d %d %lu\n", k, (void *) encoder->obj, [[encoder->obj_pso label] UTF8String] ?: "?",
-                        tg0, tg1, tg2, tptg0, tptg1, tptg2, (unsigned long) [encoder->obj_pso maxTotalThreadsPerThreadgroup]);
-                if (k == kl_cnt - 1) fflush(kl);
-            }
-        }
-    }
+    ggml_metal_kernel_list(encoder->obj_pso, atomic_load(&g_kl_step), tg0, tg1, tg2, tptg0, tptg1, tptg2, encoder->tg_size[0], encoder->tg_size[1], encoder->kl_b);
     if (encoder->tl_slot >= 0) {
         if (g_tl_ndisp[encoder->tl_slot]++ == 0) {
             memcpy(g_tl_lab[encoder->tl_slot], t_tl_label, sizeof(t_tl_label));
@@ -2113,7 +2174,7 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
             encoder->mega->step++;
             encoder->mega->step_used = false;
         }
-        return;
+        if (!g_mega_pt) return;
     }
     if (encoder->rec) {
         encoder->barrier = true;
@@ -2144,6 +2205,9 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
         [encoder->obj endEncoding];
         [encoder->obj release];
         encoder->obj = ggml_metal_new_compute_encoder(encoder->cmd, encoder->concurrent, &encoder->tl_slot);
+        encoder->tg_size[0] = encoder->tg_size[1] = 0;
+        memset(encoder->kl_b, 0, sizeof(encoder->kl_b));
+        atomic_fetch_add(&g_kl_step, 1);
         [encoder->obj retain];
         return;
     }
@@ -2153,6 +2217,7 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     if (encoder->mega) {
         @autoreleasepool {
+            if (g_mega_pt) { [encoder->obj endEncoding]; return; }
             ggml_metal_mega_flush(encoder);
         }
         return;
