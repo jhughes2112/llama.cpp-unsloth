@@ -1796,7 +1796,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
         if (t - s >= g_mega.min_steps && g_mega.ring[ri].n_ctr < 1024) {
             // steps [s, t) in one persistent dispatch
             const int e0 = sfirst[s], e1 = sfirst[t];
-            const size_t o_ctr = MEGA_ALLOC(16);
+            const size_t o_ctr = MEGA_ALLOC(256); // counter, timeouts, and (at +128) the flag of GGML_METAL_MEGA_FLAGBAR
             const size_t o_stp = MEGA_ALLOC((t - s)*sizeof(ggml_metal_mega_step));
             const size_t o_ent = MEGA_ALLOC((e1 - e0)*sizeof(ggml_metal_mega_entry));
             size_t argsz = 0;
@@ -1804,7 +1804,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
                 if (r->d[i].b[j].bytes_off >= 0) argsz += (r->d[i].b[j].bytes_size + 15) & ~15;
             }
             const size_t o_arg = MEGA_ALLOC(MAX(argsz, (size_t) 16));
-            memset(rbase + o_ctr, 0, 16);
+            memset(rbase + o_ctr, 0, 256);
             g_mega.ring[ri].ctr[g_mega.ring[ri].n_ctr++] = o_ctr;
             ggml_metal_mega_step * stp = (ggml_metal_mega_step *) (rbase + o_stp);
             ggml_metal_mega_entry * en = (ggml_metal_mega_entry *) (rbase + o_ent);
@@ -1848,7 +1848,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
                     stop = getenv("GGML_METAL_MEGA_STOP") ? atoi(getenv("GGML_METAL_MEGA_STOP")) : 0;
                     upto = getenv("GGML_METAL_MEGA_UPTO") ? atoi(getenv("GGML_METAL_MEGA_UPTO")) : -1;
                 }
-                prm.pad[1] = (uint32_t) stop;
+                prm.pad[1] = (uint32_t) stop | (getenv("GGML_METAL_MEGA_FLAGBAR") ? 0x100u : 0u) | (getenv("GGML_METAL_MEGA_NOFENCE") ? 0x200u : 0u);
                 if (upto >= 0) {
                     const int n_exec = MAX(0, MIN(upto - s, t - s));
                     prm.pad[2] = (uint32_t) n_exec + 1;

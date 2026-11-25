@@ -292,15 +292,15 @@ kernel void kernel_mega(
     // a wait that timed out (a threadgroup that never started: the GPU is shared) ends the whole dispatch at the
     // next barrier, so that it never holds the GPU for more than one wait
     threadgroup uint aborted;
-    if (P.pad[1] == 1) {
+    if ((P.pad[1] & 0xff) == 1) {
         return; // GGML_METAL_MEGA_STOP=1: the dispatch alone
     }
     for (uint s = 0; s < P.n_steps; ++s) {
         const uint e0 = S[s].e0;
         const uint ni = S[s].n_items;
-        const bool work = P.pad[1] != 2 && (P.pad[2] == 0 || s + 1 < P.pad[2]); // STOP=2: steps and barriers only; UPTO
+        const bool work = (P.pad[1] & 0xff) != 2 && (P.pad[2] == 0 || s + 1 < P.pad[2]); // STOP=2: steps and barriers only; UPTO
         // STOP=4: each threadgroup only its first item of a step; STOP=5: only item 0, on threadgroup 0
-        const uint g_end = P.pad[1] == 4 ? min(ni, tg + 1) : P.pad[1] == 5 ? (tg == 0 ? min(ni, 1u) : 0u) : ni;
+        const uint g_end = (P.pad[1] & 0xff) == 4 ? min(ni, tg + 1) : (P.pad[1] & 0xff) == 5 ? (tg == 0 ? min(ni, 1u) : 0u) : ni;
         for (uint g = tg; g < g_end && work; g += R) {
             uint e  = e0;
             uint gi = g;
@@ -318,7 +318,7 @@ kernel void kernel_mega(
                 }
                 v = en->n_vtg - 1;
             }
-            if (P.pad[1] == 6) {
+            if ((P.pad[1] & 0xff) == 6) {
                 v = 0; // STOP=6: the same work, every item on the data of threadgroup 0 (cache-resident)
             }
             const uint tt = en->tptg[0]*en->tptg[1]*en->tptg[2]; // threads the kernel sees
@@ -340,7 +340,7 @@ kernel void kernel_mega(
             c.sgitg   = lt/32;
             c.tiisg   = lt%32;
             c.nsg     = (tt + 31)/32;
-            if (P.pad[1] != 3) switch (en->pipe) { // STOP=3: no kernel call
+            if ((P.pad[1] & 0xff) != 3) switch (en->pipe) { // STOP=3: no kernel call
 MEGA_CASES
                 default: break;
             }
@@ -348,8 +348,26 @@ MEGA_CASES
         }
         if (s + 1 < P.n_steps) {
             threadgroup_barrier(mem_flags::mem_device);
-            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-            if (ti == 0) {
+            if (!(P.pad[1] & 0x200)) atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); // GGML_METAL_MEGA_NOFENCE: timing only
+            if (ti == 0 && (P.pad[1] & 0x100)) {
+                // GGML_METAL_MEGA_FLAGBAR: the last to arrive raises a flag (on a cache line of its own, written
+                // once a step), the others watch only the flag instead of the counter everyone is adding to
+                const uint old  = atomic_fetch_add_explicit(bar, 1u, memory_order_relaxed);
+                const uint lim  = P.pad[0] ? P.pad[0] : (1u << 22);
+                uint it = 0;
+                aborted = 0;
+                if (old + 1 == (s + 1)*R) {
+                    atomic_store_explicit(bar + 32, s + 1, memory_order_relaxed);
+                } else {
+                    while (atomic_load_explicit(bar + 32, memory_order_relaxed) < s + 1) {
+                        if (atomic_load_explicit(bar + 1, memory_order_relaxed) != 0 || ++it > lim) {
+                            atomic_fetch_add_explicit(bar + 1, 1u, memory_order_relaxed);
+                            aborted = 1;
+                            break;
+                        }
+                    }
+                }
+            } else if (ti == 0) {
                 atomic_fetch_add_explicit(bar, 1u, memory_order_relaxed);
                 const uint want = (s + 1)*R;
                 const uint lim  = P.pad[0] ? P.pad[0] : (1u << 22);
@@ -364,7 +382,7 @@ MEGA_CASES
                 }
             }
             threadgroup_barrier(mem_flags::mem_device);
-            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            if (!(P.pad[1] & 0x200)) atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); // GGML_METAL_MEGA_NOFENCE: timing only
             if (aborted) {
                 return;
             }
