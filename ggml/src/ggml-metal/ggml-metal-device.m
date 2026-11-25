@@ -2120,6 +2120,22 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
         if (!dok[i]) sok[r->d[i].step] = false;
     }
 
+    // GGML_METAL_MEGA_LIST=file: every step's dispatches (kernel, grid, threads), once a graph size
+    if (getenv("GGML_METAL_MEGA_LIST")) {
+        static int listed_nd = -1;
+        if (nd != listed_nd) {
+            listed_nd = nd;
+            char path[600];
+            snprintf(path, sizeof(path), "%s.%d", getenv("GGML_METAL_MEGA_LIST"), nd);
+            FILE * f = fopen(path, "w");
+            for (int i = 0; f && i < nd; ++i) {
+                const struct ggml_metal_mega_disp * d = &r->d[i];
+                fprintf(f, "%d %s %d,%d,%d %d,%d,%d\n", d->step, d->pl->base, d->grid[0], d->grid[1], d->grid[2], d->tptg[0], d->tptg[1], d->tptg[2]);
+            }
+            if (f) fclose(f);
+        }
+    }
+
     // GGML_METAL_MEGA_BYTES: the weight bytes the mat-vecs of this graph read (once a graph size), by kernel
     if (getenv("GGML_METAL_MEGA_BYTES")) {
         static int last_nd = -1;

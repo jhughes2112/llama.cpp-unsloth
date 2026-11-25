@@ -781,6 +781,36 @@ kernel void kernel_depth_mix_f32(
     float coef[8];
     float norm[8];
 
+    // fast: a thread's values of every state (at most 3 a state) kept in registers, all loaded before any reduction:
+    // one memory round trip instead of one a state, and no second read for the mix (the same sums in the same order).
+    // measured on an M5 Ultra: ~10 -> see the commit (a single threadgroup: its time is all latency)
+    const bool fast = (int) ntg.x*3 >= args.n_embd;
+    float xv[8][3];
+
+    if (fast) {
+        float qv[3];
+        FOR_UNROLL (short j = 0; j < 3; ++j) {
+            const int i = tpitg.x + j*ntg.x;
+            qv[j] = i < args.n_embd ? q[i] : 0.0f;
+        }
+        FOR_UNROLL (short s = 0; s < 8; ++s) {
+            device const float * x = (device const float *) (src + args.offs[s < args.n_states ? s : 0]) + (ulong) it*args.n_embd;
+            FOR_UNROLL (short j = 0; j < 3; ++j) {
+                const int i = tpitg.x + j*ntg.x;
+                xv[s][j] = (s < args.n_states && i < args.n_embd) ? x[i] : 0.0f;
+            }
+        }
+        FOR_UNROLL (short s = 0; s < 8; ++s) {
+            float sumf = 0.0f;
+            float dotf = 0.0f;
+            FOR_UNROLL (short j = 0; j < 3; ++j) {
+                sumf += xv[s][j]*xv[s][j];
+                dotf += xv[s][j]*qv[j];
+            }
+            norm[s] = simd_sum(sumf);
+            coef[s] = simd_sum(dotf);
+        }
+    } else
     for (int s = 0; s < args.n_states; ++s) {
         device const float * x = (device const float *) (src + args.offs[s]) + (ulong) it*args.n_embd;
 
@@ -834,7 +864,25 @@ kernel void kernel_depth_mix_f32(
     float yv[4];
     float sy = 0.0f;
 
-    {
+    if (fast) {
+        FOR_UNROLL (short j = 0; j < 3; ++j) {
+            const int i = tpitg.x + j*ntg.x;
+            if (i < args.n_embd) {
+                float v = 0.0f;
+                FOR_UNROLL (short s = 0; s < 8; ++s) {
+                    if (s < args.n_states) {
+                        v += coef[s]*xv[s][j];
+                    }
+                }
+                if (args.has_norm) {
+                    yv[j] = v;
+                    sy   += v*v;
+                } else {
+                    y[i] = v;
+                }
+            }
+        }
+    } else {
         int j = 0;
         for (int i = tpitg.x; i < args.n_embd; i += ntg.x, ++j) {
             float v = 0.0f;
