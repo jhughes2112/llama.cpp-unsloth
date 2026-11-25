@@ -514,6 +514,9 @@ char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, 
             ns_kind.push_back(p.kind);
             if (kind_proc[p.kind].empty()) {
                 kind_proc[p.kind] = rewrite_fc(drop_kernels(kind_srcs[p.kind]));
+                // kernel_depth_mix keeps n_embd/threads values a thread in yv[4] (3 with its 1024 threads); the persistent
+                // kernel runs it with 256: 9 values, past the end of the array (garbage in a small library)
+                kind_proc[p.kind] = replace_all(kind_proc[p.kind], "float yv[4];", "float yv[16];");
                 if (getenv("GGML_METAL_MEGA_COHSTORE")) {
                     kind_proc[p.kind] = coherent_stores(kind_proc[p.kind]);
                 }

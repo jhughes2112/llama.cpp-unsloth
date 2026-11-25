@@ -1476,6 +1476,93 @@ static id<MTLComputePipelineState> ggml_metal_mega_pipeline(id<MTLDevice> device
     return p;
 }
 
+// GGML_METAL_MEGA_SPLIT=K: a run of steps is cut where it would need more than K different kernels, and each set of
+// kernels gets a persistent pipeline of its own (one function with all kernels spills registers: 736 B a thread)
+#define GGML_METAL_MEGA_SET_MAX 16
+struct ggml_metal_mega_lib {
+    uint64_t sig;
+    int      n;
+    ggml_metal_pipeline_t pipes[GGML_METAL_MEGA_SET_MAX];
+    int      cases[GGML_METAL_MEGA_SET_MAX];
+    id<MTLComputePipelineState> pso; // nil: did not build, run the steps as usual
+};
+static struct ggml_metal_mega_lib * g_mega_libs = NULL;
+static int g_mega_n_libs = 0;
+
+static struct ggml_metal_mega_lib * ggml_metal_mega_lib_get(ggml_metal_pipeline_t * set, int n) {
+    // sorted by address: the same set is the same library
+    for (int i = 1; i < n; ++i) for (int j = i; j > 0 && set[j - 1] > set[j]; --j) { ggml_metal_pipeline_t t = set[j]; set[j] = set[j - 1]; set[j - 1] = t; }
+    uint64_t sig = 1469598103934665603ull ^ (uint64_t) n;
+    for (int i = 0; i < n; ++i) sig = (sig ^ (uint64_t) (uintptr_t) set[i])*1099511628211ull;
+    for (int i = 0; i < g_mega_n_libs; ++i) {
+        if (g_mega_libs[i].sig == sig && g_mega_libs[i].n == n) return &g_mega_libs[i];
+    }
+    g_mega_libs = realloc(g_mega_libs, (g_mega_n_libs + 1)*sizeof(*g_mega_libs));
+    struct ggml_metal_mega_lib * L = &g_mega_libs[g_mega_n_libs++];
+    memset(L, 0, sizeof(*L));
+    L->sig = sig;
+    L->n   = n;
+    const int64_t t0 = ggml_time_us();
+    ggml_metal_library_t lib = g_mega.lib;
+    char * hdr = ggml_metal_mega_kind_text(lib, GGML_METAL_LIB_QUANTIZE, true);
+    const char * ksrc[GGML_METAL_LIB_COUNT] = { 0 };
+    struct ggml_metal_mega_pipe mp[GGML_METAL_MEGA_SET_MAX];
+    int flags[GGML_METAL_MEGA_SET_MAX];
+    memset(mp, 0, sizeof(mp));
+    for (int i = 0; i < n; ++i) {
+        ggml_metal_pipeline_t pl = set[i];
+        L->pipes[i] = pl;
+        mp[i].base = pl->base;
+        mp[i].kind = pl->kind;
+        mp[i].n_fc = pl->n_fc;
+        for (int j = 0; j < pl->n_fc; ++j) { mp[i].fc_idx[j] = pl->fc_idx[j]; mp[i].fc_type[j] = pl->fc_type[j]; mp[i].fc_val[j] = pl->fc_val[j]; }
+        if (!ksrc[pl->kind]) ksrc[pl->kind] = ggml_metal_mega_kind_text(lib, pl->kind, false);
+    }
+    char * src = hdr ? ggml_metal_mega_source(hdr, ksrc, GGML_METAL_LIB_COUNT, mp, n, L->cases, flags) : NULL;
+    if (src && getenv("GGML_METAL_MEGA_DUMP_SETS")) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s.%d.metal", getenv("GGML_METAL_MEGA_DUMP_SETS"), g_mega_n_libs);
+        FILE * f = fopen(path, "w");
+        if (f) { fputs(src, f); fclose(f); }
+    }
+    if (src) {
+        @autoreleasepool {
+            id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
+            MTLCompileOptions * options = [MTLCompileOptions new];
+            options.preprocessorMacros = lib->prep;
+            options.languageVersion = ggml_metal_device_get_props(lib->dev)->has_tensor ?
+                (MTLLanguageVersion) MTLLanguageVersion4_0_GGML : MTLLanguageVersion3_2;
+            NSError * error = nil;
+            id<MTLLibrary> mlib = [device newLibraryWithSource:[NSString stringWithUTF8String:src] options:options error:&error];
+            [options release];
+            if (mlib) {
+                id<MTLFunction> fn = [mlib newFunctionWithName:@"kernel_mega"];
+                L->pso = ggml_metal_mega_pipeline(device, fn, &error);
+                [fn release];
+                [mlib release];
+                if (L->pso && !ggml_metal_mega_probe(ggml_metal_device_get_queue(lib->dev), L->pso, g_mega.R)) {
+                    fprintf(stderr, "ggml_metal_mega: a set of %d kernels is not resident with %d threadgroups, its steps run as usual\n", n, g_mega.R);
+                    [L->pso release];
+                    L->pso = nil;
+                }
+            } else {
+                fprintf(stderr, "ggml_metal_mega: a set of %d kernels does not compile\n", n);
+            }
+        }
+    }
+    for (int i = 0; i < n; ++i) if (L->cases[i] < 0 && L->pso) { [L->pso release]; L->pso = nil; }
+    free(src); free(hdr);
+    for (int k = 0; k < GGML_METAL_LIB_COUNT; ++k) free((void *) ksrc[k]);
+    static int verbose = -1;
+    if (verbose < 0) verbose = getenv("GGML_METAL_MEGA_VERBOSE") != NULL;
+    if (verbose) {
+        fprintf(stderr, "ggml_metal_mega: set %d of %d kernels built in %.2f s%s:", g_mega_n_libs, n, (ggml_time_us() - t0)/1e6, L->pso ? "" : " (not used)");
+        for (int i = 0; i < n; ++i) fprintf(stderr, " %s=%d", L->pipes[i]->base, L->cases[i]);
+        fprintf(stderr, "\n");
+    }
+    return L;
+}
+
 // make sure the megakernel has a case for every pipeline of the recording that it can have one for
 static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
     [g_mega_lock lock];
@@ -1852,6 +1939,39 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
         static int cut_every = -1;
         if (cut_every < 0) cut_every = getenv("GGML_METAL_MEGA_CUT_EVERY") ? atoi(getenv("GGML_METAL_MEGA_CUT_EVERY")) : 0;
         while (t < ns && sok[t] && !(nocoh && t > s && cut[t]) && !(cut_every > 0 && t - s >= cut_every)) ++t;
+        // GGML_METAL_MEGA_SPLIT=K: at most K different kernels in one persistent dispatch, each set its own pipeline
+        static int split = -1;
+        if (split < 0) split = getenv("GGML_METAL_MEGA_SPLIT") ? MIN(atoi(getenv("GGML_METAL_MEGA_SPLIT")), GGML_METAL_MEGA_SET_MAX) : 0;
+        struct ggml_metal_mega_lib * L = NULL;
+        if (split > 0 && t > s) {
+            ggml_metal_pipeline_t set[GGML_METAL_MEGA_SET_MAX];
+            int n_set = 0;
+            int u = s;
+            for (; u < t; ++u) {
+                ggml_metal_pipeline_t tmp[GGML_METAL_MEGA_SET_MAX];
+                int n_tmp = n_set;
+                memcpy(tmp, set, n_set*sizeof(set[0]));
+                bool over = false;
+                for (int i = sfirst[u]; i < sfirst[u + 1] && !over; ++i) {
+                    bool have = false;
+                    for (int q = 0; q < n_tmp; ++q) if (tmp[q] == r->d[i].pl) { have = true; break; }
+                    if (!have) {
+                        if (n_tmp == split) over = true; else tmp[n_tmp++] = r->d[i].pl;
+                    }
+                }
+                if (over && u > s) break;
+                if (over) { n_set = 0; break; } // one step alone needs more than K: not in the megakernel
+                memcpy(set, tmp, n_tmp*sizeof(set[0]));
+                n_set = n_tmp;
+            }
+            t = u;
+            if (n_set > 0) {
+                L = ggml_metal_mega_lib_get(set, n_set);
+                if (!L->pso) t = s; // run as usual
+            } else {
+                t = s;
+            }
+        }
         if (t - s >= g_mega.min_steps && g_mega.ring[ri].n_ctr < 1024) {
             // steps [s, t) in one persistent dispatch
             const int e0 = sfirst[s], e1 = sfirst[t];
@@ -1881,6 +2001,9 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             for (int i = e0; i < e1; ++i) {
                 ggml_metal_mega_entry * e = &en[i - e0];
                 *e = ent[i];
+                if (L) {
+                    for (int q = 0; q < L->n; ++q) if (L->pipes[q] == r->d[i].pl) { e->pipe = L->cases[q]; break; }
+                }
                 { static int os = -1; if (os < 0) os = getenv("GGML_METAL_MEGA_ONE_STOP") ? atoi(getenv("GGML_METAL_MEGA_ONE_STOP")) : 0; e->pad0 = os; }
                 const struct ggml_metal_mega_disp * d = &r->d[i];
                 for (int j = 0; j < d->nb && j < GGML_METAL_MEGA_NB; ++j) {
@@ -1938,7 +2061,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             }
             int slot = -1;
             id<MTLComputeCommandEncoder> enc = ggml_metal_new_compute_encoder(cmd, encoder->concurrent, &slot);
-            [enc setComputePipelineState:g_mega.pso];
+            [enc setComputePipelineState:L ? L->pso : g_mega.pso];
             [enc setBuffer:rb offset:o_arg atIndex:0];
             [enc setBuffer:rb offset:o_ent atIndex:1];
             [enc setBuffer:rb offset:o_stp atIndex:2];
