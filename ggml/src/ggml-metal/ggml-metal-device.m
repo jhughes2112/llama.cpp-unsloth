@@ -1618,6 +1618,27 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
                 x->idle_ok = e->idle_ok; x->reps = e->reps;
                 for (int j = 0; j < 3; ++j) { x->grid[j] = e->grid[j]; x->tptg[j] = e->tptg[j]; }
                 x->smem0 = e->smem0; x->smem_lane = e->smem_lane;
+                x->vl = e->lanes;
+                if (getenv("GGML_METAL_MEGA_SPREAD") && e->lanes > 1 && e->n_items < g_mega.R) {
+                    x->vl = MAX(1, (e->n_vtg + g_mega.R - 1)/g_mega.R);
+                    x->n_items = (e->n_vtg + x->vl - 1)/x->vl;
+                }
+                x->pf_bind = -1;
+                // GGML_METAL_MEGA_PF: a mat-vec (one token, one matrix) reads rows [x*n, (x+1)*n) of src0 (binding 1),
+                // n = ne01/grid[0] rounded up
+                const struct ggml_metal_mega_disp * d = &r->d[i];
+                const char * nm = d->pl->base;
+                if (strncmp(nm, "kernel_mul_mv_", 14) == 0 && !strstr(nm, "_id") && !strstr(nm, "_ext") &&
+                    d->nb > 1 && d->b[0].bytes_off >= 0 && d->b[0].bytes_size == (int) sizeof(ggml_metal_kargs_mul_mv) &&
+                    d->b[1].buf != nil && d->grid[1] == 1 && d->grid[2] == 1 && d->grid[0] > 0) {
+                    ggml_metal_kargs_mul_mv ka;
+                    memcpy(&ka, r->bytes + d->b[0].bytes_off, sizeof(ka));
+                    if (ka.ne01 > 0 && ka.nb01 > 0) {
+                        x->pf_bind  = 1;
+                        x->pf_slice = (uint64_t) ((ka.ne01 + d->grid[0] - 1)/d->grid[0])*ka.nb01;
+                        x->pf_total = (uint64_t) ka.ne01*ka.nb01;
+                    }
+                }
             }
         }
     }
@@ -1659,16 +1680,28 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
                 fprintf(stderr, "ggml_metal_mega: the baked kernels do not compile: %.3000s\n", msg ? msg : "?");
                 ok = false;
             }
+            id<MTLComputePipelineState> * ups = calloc(n_plan, sizeof(id)); // by function
+            int n_fn = 0;
             for (int p = 0; ok && p < n_plan; ++p) {
-                id<MTLFunction> fn = [mlib newFunctionWithName:[NSString stringWithFormat:@"kernel_seg_%d", p]];
-                psos[p] = fn ? ggml_metal_mega_pipeline(device, fn, &error) : nil;
-                [fn release];
-                if (!psos[p]) { fprintf(stderr, "ggml_metal_mega: no pipeline for segment %d\n", p); ok = false; }
-                else if (!ggml_metal_mega_probe(ggml_metal_device_get_queue(lib->dev), psos[p], g_mega.R)) {
-                    fprintf(stderr, "ggml_metal_mega: segment %d is not resident with %d threadgroups\n", p, g_mega.R);
-                    ok = false;
+                const int f = ggml_metal_mega_seg_fn(p);
+                if (f < 0 || f >= n_plan) { ok = false; break; }
+                if (!ups[f]) {
+                    id<MTLFunction> fn = [mlib newFunctionWithName:[NSString stringWithFormat:@"kernel_seg_%d", f]];
+                    ups[f] = fn ? ggml_metal_mega_pipeline(device, fn, &error) : nil;
+                    [fn release];
+                    if (!ups[f]) { fprintf(stderr, "ggml_metal_mega: no pipeline for segment %d\n", p); ok = false; break; }
+                    if (!ggml_metal_mega_probe(ggml_metal_device_get_queue(lib->dev), ups[f], g_mega.R)) {
+                        fprintf(stderr, "ggml_metal_mega: segment %d is not resident with %d threadgroups\n", p, g_mega.R);
+                        ok = false;
+                        break;
+                    }
+                    n_fn++;
                 }
+                psos[p] = [ups[f] retain];
             }
+            for (int f = 0; f < n_plan; ++f) if (ups[f]) [ups[f] release];
+            free(ups);
+            fprintf(stderr, "ggml_metal_mega: %d distinct segment kernels\n", n_fn);
             [mlib release];
         }
     }

@@ -483,6 +483,9 @@ static std::string replace_all(std::string s, const std::string & a, const std::
 // the call of each case, filled by ggml_metal_mega_source (for the baked schedule)
 static std::vector<std::string> g_case_call;
 
+// the kernel of each baked segment (kernel_seg_<n>)
+static std::vector<int> g_seg_fn;
+
 // the schedule ggml_metal_mega_source_baked writes out (null: none)
 static struct {
     const ggml_metal_mega_sched_entry * ents;
@@ -514,7 +517,88 @@ static const char * k_seg_barrier = R"(
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
     if (aborted) { return; } \
 }
+// the same barrier in two halves, with work between them that does not need the other threadgroups (the prefetch of
+// GGML_METAL_MEGA_PF): arrive, then wait
+#define MEGA_SEG_ARRIVE() { \
+    threadgroup_barrier(mem_flags::mem_device); \
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
+    if (ti == 0) { atomic_fetch_add_explicit(bar, 1u, memory_order_relaxed); } \
+}
+#define MEGA_SEG_WAIT(S) { \
+    if (ti == 0) { \
+        const uint want = (S)*R; \
+        const uint lim  = P.pad[0] ? P.pad[0] : (1u << 22); \
+        uint it = 0; \
+        aborted = 0; \
+        while (atomic_load_explicit(bar, memory_order_relaxed) < want) { \
+            if (atomic_load_explicit(bar + 1, memory_order_relaxed) != 0 || ++it > lim) { \
+                atomic_fetch_add_explicit(bar + 1, 1u, memory_order_relaxed); \
+                aborted = 1; \
+                break; \
+            } \
+        } \
+    } \
+    threadgroup_barrier(mem_flags::mem_device); \
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
+    if (aborted) { return; } \
+}
+// touch the lines [b0, b1) of w: a load a 128-byte line, spread over the threads (the values only feed a store that
+// never happens, so the loads are kept and nothing waits on them but the end of the prefetch)
+#define MEGA_PF_LINE 128u
+#ifdef MEGA_NOBAR
+#undef MEGA_SEG_BARRIER
+#define MEGA_SEG_BARRIER(S)
+#undef MEGA_SEG_ARRIVE
+#define MEGA_SEG_ARRIVE()
+#undef MEGA_SEG_WAIT
+#define MEGA_SEG_WAIT(S)
+#endif
+#ifdef MEGA_NOCALL
+#define MEGA_CALL(x)
+#else
+#define MEGA_CALL(x) x
+#endif
 )";
+
+// the prefetch for step s, before the barrier that opens it: every threadgroup loads the weight lines of its own items of
+// the step (in the order it will run them), up to pf_max bytes
+static std::string seg_prefetch(const ggml_metal_mega_sched_entry * ents, const int * step_e0, int s, int e_base,
+                                uint64_t pf_max) {
+    std::string k;
+    bool any = false;
+    int off = 0;
+    for (int ei = step_e0[s]; ei < step_e0[s + 1]; ++ei) {
+        const auto & e = ents[ei];
+        if (e.pf_bind >= 0 && e.pf_slice > 0) {
+            if (!any) {
+                k += "    {\n        uint pf_acc = 0;\n        ulong pf_spent = 0;\n";
+                any = true;
+            }
+            char buf[2048];
+            snprintf(buf, sizeof(buf),
+                "        {\n"
+                "            device const uchar * w = (device const uchar *) E[%d].p[%d];\n"
+                "            for (uint gi = (tg + R - (%du %% R)) %% R; gi < %du && pf_spent < %lluul; gi += R) {\n"
+                "                const ulong b0 = (ulong) gi*%lluul;\n"
+                "                const ulong b1 = min(b0 + %lluul, %lluul);\n"
+                "                for (ulong o = b0 + (ulong) ti*MEGA_PF_LINE; o < b1; o += (ulong) T_*MEGA_PF_LINE) {\n"
+                "                    pf_acc ^= *(device const uint *) (w + o);\n"
+                "                }\n"
+                "                pf_spent += b1 > b0 ? b1 - b0 : 0;\n"
+                "            }\n"
+                "        }\n",
+                ei - e_base, e.pf_bind, off, e.n_items, (unsigned long long) pf_max,
+                (unsigned long long) (e.pf_slice*e.vl), (unsigned long long) (e.pf_slice*e.vl),
+                (unsigned long long) e.pf_total);
+            k += buf;
+        }
+        off += e.n_items;
+    }
+    if (any) {
+        k += "        if (pf_acc == 0x9e3779b9u && ti == 7) { atomic_fetch_add_explicit(bar + 2, 0u, memory_order_relaxed); }\n    }\n";
+    }
+    return k;
+}
 
 // a baked segment: its steps written out, every count and size a constant; the table E has only the bindings
 static std::string seg_kernel(int si, const ggml_metal_mega_sched_entry * ents, const int * step_e0, int s0, int s1,
@@ -529,12 +613,24 @@ static std::string seg_kernel(int si, const ggml_metal_mega_sched_entry * ents, 
          "        threadgroup char                   * shmem   [[threadgroup(0)]],\n"
          "        uint   tg [[threadgroup_position_in_grid]],\n"
          "        uint   R  [[threadgroups_per_grid]],\n"
-         "        ushort ti [[thread_index_in_threadgroup]]) {\n"
-         "    threadgroup uint aborted;\n";
+         "        ushort ti [[thread_index_in_threadgroup]],\n"
+         "        ushort T_ [[threads_per_threadgroup]]) {\n"
+         "    threadgroup uint aborted;\n"
+         "    uint pf_sink = 0;\n";
+    // GGML_METAL_MEGA_SEGRET: every segment kernel returns at once (timing the launches alone)
+    if (getenv("GGML_METAL_MEGA_SEGRET")) k += "    return;\n";
+    static const bool pfn = getenv("GGML_METAL_MEGA_PFN") != nullptr;
+    static const int  T   = getenv("GGML_METAL_MEGA_TPT") ? atoi(getenv("GGML_METAL_MEGA_TPT")) : 256;
+    static const uint64_t pf_max = getenv("GGML_METAL_MEGA_PF") ? strtoull(getenv("GGML_METAL_MEGA_PF"), nullptr, 0) : 0;
     const int e_base = step_e0[s0];
     for (int s = s0; s < s1; ++s) {
         if (s > s0) {
-            k += "    MEGA_SEG_BARRIER(" + std::to_string(s - s0) + ")\n";
+            const std::string pf = pf_max ? seg_prefetch(ents, step_e0, s, e_base, pf_max) : std::string();
+            if (pf.empty()) {
+                k += "    MEGA_SEG_BARRIER(" + std::to_string(s - s0) + ")\n";
+            } else {
+                k += "    MEGA_SEG_ARRIVE()\n" + pf + "    MEGA_SEG_WAIT(" + std::to_string(s - s0) + ")\n";
+            }
         }
         int off = 0; // items of the step before this entry
         for (int ei = step_e0[s]; ei < step_e0[s + 1]; ++ei) {
@@ -545,8 +641,8 @@ static std::string seg_kernel(int si, const ggml_metal_mega_sched_entry * ents, 
                 "    for (uint gi = (tg + R - (%du %% R)) %% R; gi < %du; gi += R) {\n"
                 "        const uint lane = ti/%du;\n"
                 "        if (lane < %du) {\n"
-                "            uint v = gi*%du + lane;\n"
-                "            bool run = true;\n"
+                "            uint v = gi*%du + lane %% %du;\n"
+                "            bool run = %s;\n"
                 "            if (v >= %du) { %s }\n"
                 "            for (uint rp = 0; run && rp < %du; ++rp) {\n"
                 "                const uint lt = ti - lane*%du + rp*%du;\n"
@@ -564,20 +660,48 @@ static std::string seg_kernel(int si, const ggml_metal_mega_sched_entry * ents, 
                 "                c.sgitg   = lt/32;\n"
                 "                c.tiisg   = lt%%32;\n"
                 "                c.nsg     = %du;\n"
-                "                %s(c);\n"
+                "                MEGA_CALL(%s(c));\n"
                 "            }\n"
                 "        }\n"
                 "    }\n",
-                off, e.n_items, e.width, e.lanes, e.lanes, e.n_vtg,
+                off, e.n_items, e.width, e.lanes, e.vl, e.vl,
+                (e.idle_ok && e.vl < e.lanes) ? ("lane < " + std::to_string(e.vl) + "u").c_str() : "true",
+                e.n_vtg,
                 e.idle_ok ? "run = false;" : ("v = " + std::to_string(e.n_vtg - 1) + "u;").c_str(),
                 e.reps, e.width, e.width, tt, ei - e_base, e.smem_lane, e.smem0,
                 e.grid[0], e.grid[1], e.grid[2], e.grid[0], e.grid[0], e.grid[1], e.grid[0]*e.grid[1],
                 e.tptg[0], e.tptg[1], e.tptg[2], e.tptg[0], e.tptg[0], e.tptg[1], e.tptg[0]*e.tptg[1],
                 (tt + 31)/32, g_case_call[case_of_pipe[e.pipe]].c_str());
-            k += buf;
+            // GGML_METAL_MEGA_PFN: before an item, load the lines of the next item of this threadgroup (gi + R) into
+            // registers that are only used after the item: the loads are in flight while it computes
+            std::string item = buf;
+            if (pfn && e.pf_bind >= 0 && e.pf_slice > 0 && e.n_items > 1) {
+                const uint64_t ib = e.pf_slice*e.vl; // bytes an item
+                int nl = (int) ((ib + 128ull*T - 1)/(128ull*T));
+                if (nl > 8) nl = 8;
+                std::string pre = "        uint pfr[" + std::to_string(nl) + "] = {};\n"
+                                  "        if (gi + R < " + std::to_string(e.n_items) + "u) {\n"
+                                  "            device const uchar * w = (device const uchar *) E[" + std::to_string(ei - e_base) + "].p[" + std::to_string(e.pf_bind) + "];\n"
+                                  "            const ulong b0 = (ulong) (gi + R)*" + std::to_string(ib) + "ul;\n"
+                                  "            const ulong b1 = min(b0 + " + std::to_string(ib) + "ul, " + std::to_string(e.pf_total) + "ul);\n";
+                for (int j = 0; j < nl; ++j) {
+                    pre += "            { const ulong o = b0 + (ulong) (ti + " + std::to_string(j*T) + "u)*128ul; if (o < b1) pfr[" +
+                           std::to_string(j) + "] = *(device const uint *) (w + o); }\n";
+                }
+                pre += "        }\n";
+                std::string post = "        pf_sink ^= pfr[0]";
+                for (int j = 1; j < nl; ++j) post += " ^ pfr[" + std::to_string(j) + "]";
+                post += ";\n";
+                const size_t a = item.find('\n') + 1;          // after the loop header
+                item.insert(a, pre);
+                const size_t z = item.rfind("    }\n");          // before the end of the loop
+                item.insert(z, post);
+            }
+            k += item;
             off += e.n_items;
         }
     }
+    k += "    if (pf_sink == 0x9e3779b9u && ti == 7) { atomic_fetch_add_explicit(bar + 2, 0u, memory_order_relaxed); }\n";
     k += "}\n";
     return k;
 }
@@ -728,11 +852,24 @@ char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, 
     }
     if (sched_ok) {
         // the baked segments
-        std::string segs = k_seg_barrier;
+        // GGML_METAL_MEGA_NOCALL: the segments without their kernel calls (timing the frame alone)
+        std::string segs = getenv("GGML_METAL_MEGA_NOCALL") ? std::string("#define MEGA_NOCALL\n") + k_seg_barrier : std::string(k_seg_barrier);
         std::vector<int> case_of_pipe(n_pipes);
         for (int i = 0; i < n_pipes; ++i) case_of_pipe[i] = out_case[i];
+        // segments with the same code (the same steps of another layer: only their part of E differs) share a kernel
+        std::map<std::string, int> uniq;
+        g_seg_fn.assign(g_sched.n_segs, -1);
         for (int si = 0; si < g_sched.n_segs; ++si) {
-            segs += seg_kernel(si, g_sched.ents, g_sched.step_e0, g_sched.seg_s0[si], g_sched.seg_s0[si + 1], case_of_pipe, nullptr);
+            std::string body = seg_kernel(0, g_sched.ents, g_sched.step_e0, g_sched.seg_s0[si], g_sched.seg_s0[si + 1], case_of_pipe, nullptr);
+            auto it = uniq.find(body);
+            if (it != uniq.end()) {
+                g_seg_fn[si] = it->second;
+                continue;
+            }
+            const int fi = (int) uniq.size();
+            uniq[body] = fi;
+            g_seg_fn[si] = fi;
+            segs += replace_all(body, "kernel void kernel_seg_0(", "kernel void kernel_seg_" + std::to_string(fi) + "(");
         }
         src += cohstore ? coherent_stores(segs) : segs;
     }
@@ -759,4 +896,8 @@ char * ggml_metal_mega_source_baked(const char * hdr, const char * const * kind_
         }
     }
     return res;
+}
+
+int ggml_metal_mega_seg_fn(int seg) {
+    return seg >= 0 && seg < (int) g_seg_fn.size() ? g_seg_fn[seg] : -1;
 }

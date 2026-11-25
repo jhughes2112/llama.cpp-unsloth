@@ -43,6 +43,14 @@ struct ggml_metal_mega_sched_entry {
     int grid[3];
     int tptg[3];
     int smem0, smem_lane;
+    // virtual threadgroups an item (<= lanes; GGML_METAL_MEGA_SPREAD: fewer, so that a small step has an item for
+    // every persistent threadgroup); lanes past it sit out (no barrier inside) or redo one of the item's
+    int vl;
+    // GGML_METAL_MEGA_PF: the weights this dispatch reads, for a prefetch during the barrier before its step:
+    // binding pf_bind (-1: none), virtual threadgroup v reads bytes [v*pf_slice, (v+1)*pf_slice) of [0, pf_total)
+    int      pf_bind;
+    uint64_t pf_slice;
+    uint64_t pf_total;
 };
 
 // the same source, plus a kernel "kernel_seg_<i>" for every segment i: its steps seg_s0[i] .. seg_s0[i+1]-1 written
@@ -52,6 +60,10 @@ char * ggml_metal_mega_source_baked(const char * hdr, const char * const * kind_
                                     const struct ggml_metal_mega_pipe * pipes, int n_pipes, int * out_case, int * out_flags,
                                     const struct ggml_metal_mega_sched_entry * ents, const int * step_e0,
                                     const int * seg_s0, int n_segs);
+
+// after ggml_metal_mega_source_baked: the kernel of segment seg is kernel_seg_<ggml_metal_mega_seg_fn(seg)> (segments
+// with the same code share one)
+int ggml_metal_mega_seg_fn(int seg);
 
 #ifdef __cplusplus
 }
