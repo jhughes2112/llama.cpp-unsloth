@@ -631,8 +631,19 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 // shapes and their parameters. a graph that did not go through ggml_metal_graph_optimize keeps all of this, but a
 // caller that computes graphs without a scheduler reuses node memory for another graph without telling the backend
 static uint64_t ggml_metal_graph_identity(const struct ggml_cgraph * gf) {
+    // the node array, the node count and graph_gen (every graph that is built or allocated goes through
+    // ggml_metal_graph_optimize) are what identify a graph; the hash only guards against a graph changed in place.
+    // all 11.8K nodes of Inkling 2 took 67 us of the CPU time between two tokens, so by default only the first and the
+    // last 64 nodes (GGML_METAL_REPLAY_FULL_HASH=1: all)
+    static int full = -1;
+    if (full < 0) {
+        full = getenv("GGML_METAL_REPLAY_FULL_HASH") != NULL;
+    }
     uint64_t hs[4] = { 1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull };
     for (int i = 0; i < gf->n_nodes; ++i) {
+        if (!full && i == 64 && gf->n_nodes > 128) {
+            i = gf->n_nodes - 64;
+        }
         const struct ggml_tensor * t = gf->nodes[i];
         uint64_t p[8];
         memcpy(p, t->op_params, sizeof(p));

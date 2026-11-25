@@ -1559,6 +1559,10 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
+    // draw from softmax(logits/temp) with the RNG of a dist sampler (the same single draw as its apply), straight from
+    // the contiguous logits of a large vocabulary; -1 if smpl is not a dist sampler or the fast path does not apply
+    LLAMA_API llama_token llama_sampler_dist_sample_logits(struct llama_sampler * smpl, const float * logits, int32_t n, float temp);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

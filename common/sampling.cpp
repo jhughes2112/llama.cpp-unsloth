@@ -125,6 +125,13 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // pure temperature sampling drew straight from the logits (llama_sampler_dist_sample_logits): the candidates are
+    // filled only when asked for (common_sampler_get_candidates)
+    bool          fast_pending = false;
+    llama_context * fast_ctx   = nullptr;
+    int           fast_idx     = 0;
+    llama_token   fast_id      = LLAMA_TOKEN_NULL;
+
     void reset() {
         prev.clear();
 
@@ -555,6 +562,13 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
+    dst->fast_pending = src->fast_pending;
+    dst->fast_ctx     = src->fast_ctx;
+    dst->fast_idx     = src->fast_idx;
+    dst->fast_id      = src->fast_id;
+    if (dst->fast_pending) {
+        dst->cur_p = { dst->cur.data(), 0, -1, false };
+    }
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -611,6 +625,23 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// every sampler of the chain but temperature and dist is neutral: the draw can come straight from the logits
+static bool common_sampler_pure_temp(const common_sampler * gsmpl) {
+    static const bool off = getenv("LLAMA_SAMPLER_NO_FAST_TEMP") != nullptr;
+    const auto & p = gsmpl->params;
+    if (off || gsmpl->grmr || gsmpl->rbudget || p.backend_sampling || p.mirostat != 0 || !(p.temp > 0.0f) ||
+        p.dynatemp_range > 0.0f || p.top_k > 0 || p.top_p < 1.0f || p.min_p > 0.0f || p.typ_p < 1.0f ||
+        (p.xtc_probability > 0.0f && p.xtc_threshold <= 0.5f) || p.top_n_sigma > 0.0f || p.dry_multiplier != 0.0f ||
+        p.adaptive_target >= 0.0f || !p.logit_bias.empty()) {
+        return false;
+    }
+    if (p.penalty_last_n != 0 && (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f)) {
+        return false;
+    }
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+    return n > 0 && strcmp(llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, n - 1)), "dist") == 0;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -623,6 +654,23 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    gsmpl->fast_pending = false;
+    if (common_sampler_pure_temp(gsmpl)) {
+        const llama_model * model = llama_get_model(ctx);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        const llama_token fid = llama_sampler_dist_sample_logits(
+                llama_sampler_chain_get(chain, llama_sampler_chain_n(chain) - 1), logits, n_vocab, gsmpl->params.temp);
+        if (fid >= 0) {
+            gsmpl->fast_pending = true;
+            gsmpl->fast_ctx     = ctx;
+            gsmpl->fast_idx     = idx;
+            gsmpl->fast_id      = fid;
+            cur_p = { gsmpl->cur.data(), 0, -1, false };
+            return fid;
+        }
+    }
 
     gsmpl->set_logits(ctx, idx);
 
@@ -931,6 +979,28 @@ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * g
     const auto tm = gsmpl->tm();
 
     auto * res = &gsmpl->cur_p;
+
+    if (gsmpl->fast_pending) {
+        // the candidates of the fast draw: the logits over the temperature and their softmax
+        gsmpl->fast_pending = false;
+        gsmpl->set_logits(gsmpl->fast_ctx, gsmpl->fast_idx);
+        const float it = 1.0f/gsmpl->params.temp;
+        float max_l = -INFINITY;
+        for (size_t i = 0; i < res->size; ++i) {
+            res->data[i].logit *= it;
+            max_l = std::max(max_l, res->data[i].logit);
+        }
+        double sum = 0.0;
+        for (size_t i = 0; i < res->size; ++i) {
+            res->data[i].p = expf(res->data[i].logit - max_l);
+            sum += res->data[i].p;
+        }
+        for (size_t i = 0; i < res->size; ++i) {
+            res->data[i].p = (float) (res->data[i].p/sum);
+        }
+        res->selected = gsmpl->fast_id;
+        res->sorted   = false;
+    }
 
     // the dist sampler leaves the probabilities of a large vocabulary out (NaN in the first): the softmax of the logits
     if (res->size > 0 && std::isnan(res->data[0].p)) {

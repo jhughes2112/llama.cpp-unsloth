@@ -1565,6 +1565,101 @@ static struct llama_sampler_i llama_sampler_dist_i = {
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_dist>,
 };
 
+llama_token llama_sampler_dist_sample_logits(struct llama_sampler * smpl, const float * logits, int32_t n_i, float temp) {
+#if defined(__APPLE__)
+    if (smpl == nullptr || smpl->iface != &llama_sampler_dist_i || n_i < 65536 || !(temp > 0.0f) || logits == nullptr) {
+        return -1;
+    }
+    auto * ctx = (llama_sampler_dist *) smpl->ctx;
+
+    static thread_local std::vector<float> buf;
+    static thread_local std::vector<float> blocks;
+
+    const size_t n  = (size_t) n_i;
+    const size_t nb = 256;
+    const size_t nc = 8;
+    const size_t cs = ((n + nc - 1)/nc + nb - 1)/nb*nb;
+
+    buf.resize(n);
+    blocks.resize((n + nb - 1)/nb);
+
+    float  cmax_a[nc];
+    double csum_a[nc];
+    float  * cmax = cmax_a;
+    double * csum = csum_a;
+    float  * pbuf = buf.data();
+    float  * pblk = blocks.data();
+    const float it = 1.0f/temp;
+
+    // per chunk: max, exp((l - max)/temp), sums of 256
+    dispatch_apply(nc, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t c) {
+        const size_t i0 = c*cs;
+        const size_t i1 = std::min(n, i0 + cs);
+        if (i0 >= i1) {
+            cmax[c] = -INFINITY;
+            csum[c] = 0.0;
+            return;
+        }
+        float m = 0.0f;
+        vDSP_maxv(logits + i0, 1, &m, i1 - i0);
+        const float off = -m*it;
+        vDSP_vsmsa(logits + i0, 1, &it, &off, pbuf + i0, 1, i1 - i0);
+        const int nn = (int) (i1 - i0);
+        vvexpf(pbuf + i0, pbuf + i0, &nn);
+        double sc = 0.0;
+        for (size_t i = i0; i < i1; i += nb) {
+            float sb = 0.0f;
+            vDSP_sve(pbuf + i, 1, &sb, std::min(nb, i1 - i));
+            pblk[i/nb] = sb;
+            sc += sb;
+        }
+        cmax[c] = m*it;
+        csum[c] = sc;
+    });
+
+    float gmax = -INFINITY;
+    for (size_t c = 0; c < nc; ++c) {
+        gmax = std::max(gmax, cmax[c]);
+    }
+    double cscale[nc];
+    double sum_cum = 0.0;
+    for (size_t c = 0; c < nc; ++c) {
+        cscale[c] = csum[c] > 0.0 ? std::exp((double) cmax[c] - gmax) : 0.0;
+        sum_cum  += csum[c]*cscale[c];
+    }
+
+    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+    const double rnd     = dist(ctx->rng);
+    const double sum_tgt = sum_cum*rnd;
+
+    double sum_run = 0.0;
+    size_t c = 0;
+    while (c + 1 < nc && (c + 1)*cs < n && sum_run + csum[c]*cscale[c] < sum_tgt) {
+        sum_run += csum[c]*cscale[c];
+        c++;
+    }
+    const size_t i0 = c*cs;
+    const size_t i1 = std::min(n, i0 + cs);
+    size_t b = i0/nb;
+    while ((b + 1)*nb < i1 && sum_run + pblk[b]*cscale[c] < sum_tgt) {
+        sum_run += pblk[b]*cscale[c];
+        b++;
+    }
+    size_t sel = std::min(i1, (b + 1)*nb) - 1;
+    for (size_t i = b*nb; i < std::min(i1, (b + 1)*nb); ++i) {
+        sum_run += pbuf[i]*cscale[c];
+        if (sum_run >= sum_tgt) {
+            sel = i;
+            break;
+        }
+    }
+    return (llama_token) sel;
+#else
+    GGML_UNUSED(smpl); GGML_UNUSED(logits); GGML_UNUSED(n_i); GGML_UNUSED(temp);
+    return -1;
+#endif
+}
+
 struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
     auto seed_cur = get_rng_seed(seed);
     return llama_sampler_init(
