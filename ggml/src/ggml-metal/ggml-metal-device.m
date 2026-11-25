@@ -1457,6 +1457,20 @@ static bool ggml_metal_mega_probe(id<MTLCommandQueue> queue, id<MTLComputePipeli
     return ok;
 }
 
+// a pipeline of the megakernel library that is told how many threads a threadgroup it is dispatched with: by default the
+// compiler budgets registers for 1024 and spills (GGML_METAL_MEGA_MAXTPT=0 keeps the default, for comparison)
+static id<MTLComputePipelineState> ggml_metal_mega_pipeline(id<MTLDevice> device, id<MTLFunction> fn, NSError ** error) {
+    if (!fn) return nil;
+    static int lim = -2;
+    if (lim == -2) lim = getenv("GGML_METAL_MEGA_MAXTPT") ? atoi(getenv("GGML_METAL_MEGA_MAXTPT")) : -1;
+    MTLComputePipelineDescriptor * desc = [[MTLComputePipelineDescriptor alloc] init];
+    desc.computeFunction = fn;
+    if (lim != 0) desc.maxTotalThreadsPerThreadgroup = lim > 0 ? lim : GGML_METAL_MEGA_THREADS;
+    id<MTLComputePipelineState> p = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:error];
+    [desc release];
+    return p;
+}
+
 // make sure the megakernel has a case for every pipeline of the recording that it can have one for
 static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
     [g_mega_lock lock];
@@ -1478,6 +1492,7 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
     for (int i = 0; i < r->n; ++i) {
         ggml_metal_pipeline_t pl = r->d[i].pl;
         if (pl->mega_never) continue;
+        if (!ggml_metal_mega_included(pl->base) && !getenv("GGML_METAL_MEGA_LIB_ALL")) { pl->mega_never = true; continue; }
         bool have = false;
         for (int j = 0; j < g_mega.n_pipes; ++j) if (g_mega.pipes[j] == pl) { have = true; break; }
         if (have) continue;
@@ -1532,11 +1547,11 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
                 fprintf(stderr, "ggml_metal_mega: the megakernel does not compile, off: %.4000s\n", msg ? msg : "?");
             } else {
                 id<MTLFunction> fn = [mlib newFunctionWithName:@"kernel_mega"];
-                pso = fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
+                pso = ggml_metal_mega_pipeline(device, fn, &error);
                 [fn release];
                 id<MTLFunction> fn1 = [mlib newFunctionWithName:@"kernel_mega_one"];
                 if (g_mega.pso_one) [g_mega.old_psos addObject:g_mega.pso_one];
-                g_mega.pso_one = fn1 ? [device newComputePipelineStateWithFunction:fn1 error:&error] : nil;
+                g_mega.pso_one = ggml_metal_mega_pipeline(device, fn1, &error);
                 [fn1 release];
                 if (pso) {
                     fprintf(stderr, "ggml_metal_mega: kernel_mega max %d threads a threadgroup, kernel_mega_one %d\n",
