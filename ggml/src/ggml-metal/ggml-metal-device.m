@@ -43,6 +43,7 @@ static const NSUInteger MTLLanguageVersion4_0_GGML = 4 << 16;
 
 struct ggml_metal_library;
 static void ggml_metal_mega_set_library(struct ggml_metal_library * lib);
+static void ggml_metal_mega_forget_library(struct ggml_metal_library * lib);
 
 //
 // MTLFunctionConstantValues wrapper
@@ -733,6 +734,8 @@ void ggml_metal_library_free(ggml_metal_library_t lib) {
         return;
     }
 
+    ggml_metal_mega_forget_library(lib);
+
     for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
         if (lib->objs[kind]) {
             [lib->objs[kind] release];
@@ -1349,9 +1352,19 @@ static struct {
 
 static NSLock * g_mega_lock = nil;
 
+// the library whose pipelines the megakernel is built from: the latest that compiled one. when it is freed, so are its
+// pipelines: ggml_metal_mega_forget_library drops them
 static void ggml_metal_mega_set_library(struct ggml_metal_library * lib) {
-    if (g_mega.lib == NULL) {
-        g_mega.lib = lib;
+    if (g_mega.lib != lib) {
+        g_mega.lib     = lib;
+        g_mega.n_pipes = 0;
+    }
+}
+
+static void ggml_metal_mega_forget_library(struct ggml_metal_library * lib) {
+    if (g_mega.lib == lib) {
+        g_mega.lib     = NULL;
+        g_mega.n_pipes = 0;
     }
 }
 
@@ -1408,6 +1421,34 @@ static char * ggml_metal_mega_kind_text(ggml_metal_library_t lib, int kind, bool
     memcpy(r, a, b - a);
     r[b - a] = 0;
     return r;
+}
+
+// can R threadgroups of the persistent kernel all be on the GPU at once? (else a grid barrier waits for one that never
+// starts) two empty steps with a barrier between them and a short spin limit
+static bool ggml_metal_mega_probe(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pso, int R) {
+    id<MTLBuffer> b = [[queue device] newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+    memset([b contents], 0, 4096);
+    ggml_metal_mega_step * st = (ggml_metal_mega_step *) ((char *) [b contents] + 256);
+    st[0].e0 = st[0].e1 = st[0].n_items = 0;
+    st[1].e0 = st[1].e1 = st[1].n_items = 0;
+    ggml_metal_mega_params prm = { 2, { 1u << 14, 0, 0 } };
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b offset:1024 atIndex:0];
+    [enc setBuffer:b offset:512  atIndex:1];
+    [enc setBuffer:b offset:256  atIndex:2];
+    [enc setBuffer:b offset:0    atIndex:3];
+    [enc setBytes:&prm length:sizeof(prm) atIndex:4];
+    // as much threadgroup memory as a dispatch may take (see ggml_metal_mega_layout): fewer threadgroups fit with more
+    [enc setThreadgroupMemoryLength:32768 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(R, 1, 1) threadsPerThreadgroup:MTLSizeMake(GGML_METAL_MEGA_THREADS, 1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    const bool ok = ((const uint32_t *) [b contents])[1] == 0 && [cmd status] == MTLCommandBufferStatusCompleted;
+    [b release];
+    return ok;
 }
 
 // make sure the megakernel has a case for every pipeline of the recording that it can have one for
@@ -1496,6 +1537,24 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
             }
         }
     }
+    if (pso) {
+        // the most threadgroups that are all resident, from the asked number down
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(lib->dev);
+        const int want = g_mega.R;
+        const int tries[] = { want, want*3/4, want/2, want/4 };
+        int got = 0;
+        for (int k = 0; k < 4 && !got; ++k) {
+            if (tries[k] >= 8 && ggml_metal_mega_probe(queue, pso, tries[k])) got = tries[k];
+        }
+        if (!got) {
+            fprintf(stderr, "ggml_metal_mega: not even %d threadgroups are resident at once, off\n", want/4);
+            [pso release];
+            pso = nil;
+        } else if (got != want) {
+            fprintf(stderr, "ggml_metal_mega: %d threadgroups are not resident at once, %d are\n", want, got);
+            g_mega.R = got;
+        }
+    }
     if (!pso) {
         g_mega.on = 0;
     } else {
@@ -1522,6 +1581,21 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
 static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_metal_mega_entry * e) {
     const ggml_metal_pipeline_t pl = d->pl;
     if (pl->mega_gen != g_mega.gen || pl->mega_case < 0 || !(pl->mega_flags & GGML_METAL_MEGA_FLAG_OK)) return false;
+    {
+        // GGML_METAL_MEGA_EXCLUDE=prefix,prefix: kernels kept out (encoded as usual)
+        static const char * ex = (const char *) -1;
+        if (ex == (const char *) -1) ex = getenv("GGML_METAL_MEGA_EXCLUDE");
+        if (ex) {
+            const char * p = ex;
+            while (*p) {
+                const char * q = strchr(p, ',');
+                const size_t n = q ? (size_t) (q - p) : strlen(p);
+                if (n > 0 && strncmp(pl->base, p, n) == 0) return false;
+                if (!q) break;
+                p = q + 1;
+            }
+        }
+    }
     const int t = d->tptg[0]*d->tptg[1]*d->tptg[2];
     const int T = GGML_METAL_MEGA_THREADS;
     const bool nob = (pl->mega_flags & GGML_METAL_MEGA_FLAG_NO_BARRIER) != 0;

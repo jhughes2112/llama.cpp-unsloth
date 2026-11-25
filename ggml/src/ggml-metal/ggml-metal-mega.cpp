@@ -332,7 +332,7 @@ MEGA_CASES
                 const uint want = (s + 1)*R;
                 uint it = 0;
                 while (atomic_load_explicit(bar, memory_order_relaxed) < want) {
-                    if (++it > (1u << 26)) {
+                    if (++it > (P.pad[0] ? P.pad[0] : (1u << 15))) {
                         atomic_store_explicit(bar + 1, 1u, memory_order_relaxed);
                         break;
                     }
@@ -357,7 +357,11 @@ char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, 
                               const struct ggml_metal_mega_pipe * pipes, int n_pipes, int * out_case, int * out_flags) {
     std::string src;
     src += "#include <metal_stdlib>\nusing namespace metal;\n";
-    src += "#define device coherent(device) device\n";
+    // GGML_METAL_MEGA_NOCOH: plain pointers (results are wrong: a threadgroup can read a stale line of what another
+    // wrote in the step before; for timing the cost of the coherent loads only)
+    if (!getenv("GGML_METAL_MEGA_NOCOH")) {
+        src += "#define device coherent(device) device\n";
+    }
     src += hdr;
     src += k_prelude;
     for (const char * a : k_attrs) {

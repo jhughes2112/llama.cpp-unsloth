@@ -224,7 +224,7 @@ typedef struct {
 
 typedef struct {
     uint32_t n_steps;
-    uint32_t pad[3];
+    uint32_t pad[3]; // pad[0]: spin limit of a grid barrier (0: the default)
 } ggml_metal_mega_params;
 
 // kernel argument structs
