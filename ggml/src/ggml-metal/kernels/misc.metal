@@ -2057,3 +2057,74 @@ typedef decltype(kernel_depth_mix_fast_f32<false>) kernel_depth_mix_fast_t;
 
 template [[host_name("kernel_depth_mix_fast_f32")]]      kernel kernel_depth_mix_fast_t kernel_depth_mix_fast_f32<false>;
 template [[host_name("kernel_depth_mix_fast_norm_f32")]] kernel kernel_depth_mix_fast_t kernel_depth_mix_fast_f32<true>;
+
+
+// kernel_kv_conv_store_f32 for one token with the per-head, input-dependent taps of kernel_short_conv_dyn_f32 on top of
+// the weights, and an F16 cache: the conv, the L2 clip (K) or the RMS norm (V) of the head and the cache row in one
+// kernel (the dynamic layers did these in three steps). one threadgroup a head, one thread a channel
+kernel void kernel_kv_conv_store_dyn_f32(
+        constant ggml_metal_kargs_kv_conv_store & args,
+        device const char  * past,
+        device const float * cur,
+        device const float * w,
+        device       char  * cell,
+        device const long  * idxs,
+        device       char  * dst,
+        device const float * taps,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const int c   = tgpig.x*args.D + tpitg.x;
+    const int nsg = (ntg.x + N_SIMDWIDTH - 1)/N_SIMDWIDTH;
+    const int nh  = args.nc - 1;
+
+    device const float * p  = (device const float *) past + c*nh;
+    device const float * wc = w + c*args.nc;
+
+    float h[8];
+    for (int j = 0; j < nh; ++j) {
+        h[j] = p[j];
+    }
+    const float xt = cur[c];
+
+    float acc = 0.0f;
+    for (int j = 0; j < nh; ++j) {
+        acc += h[j]*wc[j];
+    }
+    acc += xt*wc[nh];
+
+    const int ih = c/(args.C/args.pad);
+    device const float * tap = taps + (ulong) ih*args.nc;
+
+    acc += xt*tap[0];
+    for (int l = 1; l < args.nc; ++l) {
+        acc += h[nh - l]*tap[l];
+    }
+
+    const float y = args.s*(xt + acc) + args.b;
+
+    const float ss0 = simd_sum(y*y);
+    if (tiisg == 0) {
+        shmem[sgitg] = ss0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ss = 0.0f;
+    for (int i = 0; i < nsg; ++i) {
+        ss += shmem[i];
+    }
+
+    const float f = args.is_norm ?
+        1.0f/sqrt(ss/args.D + args.eps) :
+        clamp(args.cc/(args.cs*sqrt(ss) + args.cb), args.lo, args.hi);
+
+    ((device half *) (dst + (ulong) idxs[0]*args.nb_row))[c] = half(y*f);
+
+    device float * q = (device float *) cell + c*nh;
+    for (int j = 0; j < nh - 1; ++j) {
+        q[j] = h[j + 1];
+    }
+    q[nh - 1] = xt;
+}

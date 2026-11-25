@@ -903,7 +903,7 @@ typedef struct {
     int32_t  n_s;      // sequences
     int32_t  is_norm;  // 1: rms norm of each head (V), 0: L2 clip (K)
     int32_t  is_f16;   // type of the cache
-    int32_t  pad;
+    int32_t  pad;      // kernel_kv_conv_store_dyn_f32: heads of the input-dependent taps
     uint64_t nb_past2; // sequence strides of the stored window and of the state cell
     uint64_t nb_cell1;
     uint64_t nb_row;   // row stride of the cache

@@ -78,6 +78,17 @@ struct ggml_metal_op {
         return idxs.size();
     }
 
+    // one past the last graph node of this encoder; all graph nodes
+    int graph_end() const {
+        return idx_end;
+    }
+    int graph_n_nodes() const {
+        return gf->n_nodes;
+    }
+    ggml_tensor * graph_node(int i) const {
+        return ggml_graph_node(gf, i);
+    }
+
     ggml_tensor * node(int i) const {
         assert(i >= 0 && i < (int) idxs.size());
         return ggml_graph_node(gf, idxs[i]);
@@ -119,6 +130,9 @@ struct ggml_metal_op {
     // profiling: the depth of each tensor (by its root) in this encoder
     std::unordered_map<const ggml_tensor *, int> prof_level;
     int prof_depth = 0;
+
+    // groups already dispatched by an earlier kernel: first node -> its length (they are skipped, ranges and all)
+    std::unordered_map<int, int> skip_nodes;
 
     // the MoE top-k of one token, not dispatched: the expert gate_up kernel at node topk_node selects for itself
     // (kernel_mul_mv_id_nvfp4_situ_topk) and writes the ids and weights. GGML_METAL_NO_TOPK_FOLD=1 turns it off
@@ -187,6 +201,7 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
 }
 
+static const ggml_tensor * ggml_metal_op_root(const ggml_tensor * t);
 static void ggml_metal_op_fused_concurrency(ggml_metal_op_t ctx, int idx, int n);
 
 static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
@@ -220,6 +235,15 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
 
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
+
+    if (!ctx->skip_nodes.empty()) {
+        auto it = ctx->skip_nodes.find(idx);
+        if (it != ctx->skip_nodes.end()) {
+            const int n = it->second;
+            ctx->skip_nodes.erase(it);
+            return n;
+        }
+    }
 
     //GGML_LOG_INFO("%s: encoding node %3d, op = %8s\n", __func__, idx, ggml_op_name(node->op));
 
@@ -6504,6 +6528,125 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
         /*.has_res  =*/ res ? 1 : 0,
         /*.n_heads  =*/ tap ? (int32_t) tap->ne[1] : 0,
     };
+
+    // the dynamic conv of K or V (one token) whose only reader is the L2 clip (K) or the RMS norm (V) of the heads, whose
+    // only reader in turn is the store to an F16 cache: all three in one kernel (kernel_kv_conv_store_dyn_f32), the two
+    // later groups skipped. GGML_METAL_NO_KV_DYN=1 turns it off
+    static const bool no_kv_dyn = getenv("GGML_METAL_NO_KV_DYN") != nullptr;
+    if (dyn && taps && !no_kv_dyn && conv->ne[1] == 1 && conv->ne[2] == 1 && !res && w->ne[0] <= 9) {
+        const ggml_tensor * r1 = ggml_metal_op_root(dst);
+        // readers of a tensor (by root) in this encoder and in the graph after it
+        auto readers = [&](const ggml_tensor * r, int from, std::vector<int> & out) {
+            for (int j = from; j < ctx->n_nodes(); ++j) {
+                const ggml_tensor * t = ctx->node(j);
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (t->src[k] && ggml_metal_op_root(t->src[k]) == r) {
+                        out.push_back(j);
+                        break;
+                    }
+                }
+            }
+            for (int j = ctx->graph_end(); j < ctx->graph_n_nodes(); ++j) {
+                const ggml_tensor * t = ctx->graph_node(j);
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (t->src[k] && !ggml_op_is_empty(t->op) && ggml_metal_op_root(t->src[k]) == r) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        std::vector<int> rd1;
+        int j2 = -1, n2 = 0, j3 = -1;
+        bool is_k = false;
+        bool ok = readers(r1, idx + n, rd1) && !rd1.empty();
+        if (ok) {
+            j2 = rd1[0];
+            const ggml_metal_fusion * f2 = ctx->can_fuse(j2, GGML_METAL_FUSION_FULL, &n2);
+            if (f2 && ggml_metal_fusion_get_id(f2) == GGML_METAL_FUSION_L2_CLIP && n2 == 8) {
+                is_k = true;
+            } else if (ctx->node(j2)->op == GGML_OP_RMS_NORM) {
+                n2 = 1;
+                if (f2) {
+                    ok = false; // a fused norm: not this pattern
+                }
+            } else {
+                ok = false;
+            }
+            for (int j : rd1) {
+                ok = ok && j >= j2 && j < j2 + n2;
+            }
+        }
+        const ggml_tensor * g2 = ok ? ctx->node(j2 + n2 - 1) : nullptr;
+        std::vector<int> rd2;
+        if (ok) {
+            ok = readers(ggml_metal_op_root(g2), j2 + n2, rd2) && rd2.size() == 1;
+        }
+        const ggml_tensor * set = nullptr;
+        if (ok) {
+            j3 = rd2[0];
+            set = ctx->node(j3);
+            ok = set->op == GGML_OP_SET_ROWS && set->type == GGML_TYPE_F16 && ggml_metal_op_root(set->src[0]) == ggml_metal_op_root(g2) &&
+                set->src[1]->type == GGML_TYPE_I64 && ggml_nelements(set->src[1]) == 1 && set->src[0]->ne[0] == g2->ne[0]*g2->ne[1] &&
+                ggml_is_contiguous(set->src[0]);
+            int n3 = 1;
+            ok = ok && !ctx->can_fuse(j3, GGML_METAL_FUSION_FULL, &n3);
+        }
+        const int D = ok ? (int) g2->ne[0] : 0;
+        if (ok && D > 0 && D <= 1024 && w->ne[1] % D == 0 && taps->ne[0] % args.nc == 0) {
+            ggml_metal_kargs_kv_conv_store ka = {
+                /*.nc       =*/ args.nc,
+                /*.C        =*/ args.C,
+                /*.D        =*/ D,
+                /*.n_t      =*/ 1,
+                /*.n_s      =*/ 1,
+                /*.is_norm  =*/ is_k ? 0 : 1,
+                /*.is_f16   =*/ 1,
+                /*.pad      =*/ args.n_heads,
+                /*.nb_past2 =*/ past->nb[2],
+                /*.nb_cell1 =*/ cell->nb[1],
+                /*.nb_row   =*/ set->nb[1],
+                /*.s        =*/ args.s,
+                /*.b        =*/ args.b,
+                /*.eps      =*/ is_k ? 0.0f : ggml_get_op_params_f32(ctx->node(j2), 0),
+                /*.cs       =*/ is_k ? ggml_get_op_params_f32(ctx->node(j2 + 3), 0) : 0.0f,
+                /*.cb       =*/ is_k ? ggml_get_op_params_f32(ctx->node(j2 + 3), 1) : 0.0f,
+                /*.cc       =*/ is_k ? ggml_get_op_params_f32(ctx->node(j2 + 4), 0) : 0.0f,
+                /*.lo       =*/ is_k ? ggml_get_op_params_f32(ctx->node(j2 + 6), 0) : 0.0f,
+                /*.hi       =*/ is_k ? ggml_get_op_params_f32(ctx->node(j2 + 6), 1) : 0.0f,
+            };
+
+            // the skipped groups run now: check them against what runs, add their ranges after
+            for (int j = j2; j < j2 + n2; ++j) {
+                if (!ggml_metal_op_concurrency_check(ctx, ctx->node(j))) { ggml_metal_op_concurrency_reset(ctx); break; }
+            }
+            if (!ggml_metal_op_concurrency_check(ctx, set)) {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
+
+            auto pl = ggml_metal_library_get_pipeline_named(lib, "kernel_kv_conv_store_dyn_f32");
+            ggml_metal_encoder_set_pipeline(enc, pl);
+            ggml_metal_encoder_set_bytes   (enc, &ka, sizeof(ka), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(past),        1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur),         2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),           3);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell),        4);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(set->src[1]), 5);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(set),         6);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(taps),        7);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float), 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, args.C/D, 1, 1, D, 1, 1);
+
+            for (int j = j2; j < j2 + n2; ++j) {
+                ggml_metal_op_concurrency_add(ctx, ctx->node(j));
+            }
+            ggml_metal_op_concurrency_add(ctx, set);
+            ctx->skip_nodes[j2] = n2;
+            ctx->skip_nodes[j3] = 1;
+
+            return n;
+        }
+    }
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
