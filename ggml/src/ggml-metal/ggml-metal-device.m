@@ -1578,9 +1578,11 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
 }
 
 // layout of a dispatch in the persistent kernel; false if it cannot run there
+static const char * g_mega_why = "";
+
 static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_metal_mega_entry * e) {
     const ggml_metal_pipeline_t pl = d->pl;
-    if (pl->mega_gen != g_mega.gen || pl->mega_case < 0 || !(pl->mega_flags & GGML_METAL_MEGA_FLAG_OK)) return false;
+    if (pl->mega_gen != g_mega.gen || pl->mega_case < 0 || !(pl->mega_flags & GGML_METAL_MEGA_FLAG_OK)) { g_mega_why = "r1"; return false; }
     {
         // GGML_METAL_MEGA_EXCLUDE=prefix,prefix: kernels kept out (encoded as usual)
         static const char * ex = (const char *) -1;
@@ -1590,7 +1592,7 @@ static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_m
             while (*p) {
                 const char * q = strchr(p, ',');
                 const size_t n = q ? (size_t) (q - p) : strlen(p);
-                if (n > 0 && strncmp(pl->base, p, n) == 0) return false;
+                if (n > 0 && strncmp(pl->base, p, n) == 0) { g_mega_why = "r2"; return false; }
                 if (!q) break;
                 p = q + 1;
             }
@@ -1599,12 +1601,12 @@ static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_m
     const int t = d->tptg[0]*d->tptg[1]*d->tptg[2];
     const int T = GGML_METAL_MEGA_THREADS;
     const bool nob = (pl->mega_flags & GGML_METAL_MEGA_FLAG_NO_BARRIER) != 0;
-    if (d->nb > GGML_METAL_MEGA_NB) return false;
+    if (d->nb > GGML_METAL_MEGA_NB) { g_mega_why = "r3"; return false; }
     // the constant parameters must have been set with set_bytes
     const int cmask = pl->mega_flags >> GGML_METAL_MEGA_FLAG_CONST_SHIFT;
     for (int i = 0; i < d->nb; ++i) {
         if ((cmask >> i) & 1) {
-            if (d->b[i].bytes_off < 0) return false;
+            if (d->b[i].bytes_off < 0) { g_mega_why = "r4"; return false; }
         }
     }
     memset(e, 0, sizeof(*e));
@@ -1614,16 +1616,16 @@ static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_m
         e->lanes = 1; e->width = T;
         e->tptg[0] = d->tptg[0]; e->tptg[1] = d->tptg[1]; e->tptg[2] = d->tptg[2];
     } else if (t > T) {
-        if (d->tptg[1] != 1 || d->tptg[2] != 1) return false;
+        if (d->tptg[1] != 1 || d->tptg[2] != 1) { g_mega_why = "r5"; return false; }
         e->lanes = 1; e->width = T;
         e->tptg[0] = T; e->tptg[1] = 1; e->tptg[2] = 1;
     } else {
         e->lanes = T/t; e->width = t;
-        if (T % t != 0 && !nob) return false; // threads left over would sit out of a barrier
+        if (T % t != 0 && !nob) { g_mega_why = "r6"; return false; } // threads left over would sit out of a barrier
         e->tptg[0] = d->tptg[0]; e->tptg[1] = d->tptg[1]; e->tptg[2] = d->tptg[2];
     }
     e->n_vtg   = d->grid[0]*d->grid[1]*d->grid[2];
-    if (e->n_vtg <= 0) return false;
+    if (e->n_vtg <= 0) { g_mega_why = "r7"; return false; }
     e->n_items = (e->n_vtg + e->lanes - 1)/e->lanes;
     e->idle_ok = nob ? 1 : 0;
     e->grid[0] = d->grid[0]; e->grid[1] = d->grid[1]; e->grid[2] = d->grid[2];
@@ -1631,7 +1633,7 @@ static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_m
     const int s1 = (int) ((d->tg[1] + 15) & ~(size_t) 15);
     e->smem0     = s0;
     e->smem_lane = s0 + s1;
-    if (e->lanes*e->smem_lane > 32768) return false;
+    if (e->lanes*e->smem_lane > 32768) { g_mega_why = "r8"; return false; }
     return true;
 }
 
@@ -1796,7 +1798,10 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             fprintf(stderr, "ggml_metal_mega: graph of %d dispatches, %d steps, %d of them in the megakernel\n", nd, ns, nok);
             for (int i = 0; i < nd && nf == 1; ++i) {
                 if (!dok[i]) {
-                    fprintf(stderr, "  not in it: %s (grid %d %d %d, threads %d %d %d, case %d, flags 0x%x)\n", r->d[i].pl->base,
+                    ggml_metal_mega_entry tmp;
+                    ggml_metal_mega_layout(&r->d[i], &tmp);
+                    fprintf(stderr, "  not in it (%s, nb %d, tg %zu %zu): %s (grid %d %d %d, threads %d %d %d, case %d, flags 0x%x)\n",
+                            g_mega_why, r->d[i].nb, r->d[i].tg[0], r->d[i].tg[1], r->d[i].pl->base,
                             r->d[i].grid[0], r->d[i].grid[1], r->d[i].grid[2], r->d[i].tptg[0], r->d[i].tptg[1], r->d[i].tptg[2],
                             r->d[i].pl->mega_case, r->d[i].pl->mega_flags);
                 }

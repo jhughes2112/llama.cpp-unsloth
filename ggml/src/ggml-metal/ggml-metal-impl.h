@@ -192,7 +192,7 @@
 #define OP_SSM_SCAN_SSD_NSG 4  // Metal-specific; Number of SimdGroups per threadgroup; NSG*32 == threads dispatched per threadgroup
 
 // GGML_METAL_MEGA (see ggml-metal-mega.h): a dispatch of a step run by the persistent kernel
-#define GGML_METAL_MEGA_NB 12 // bindings a dispatch
+#define GGML_METAL_MEGA_NB 16 // bindings a dispatch (flash attention has 14)
 
 #if defined(__METAL_VERSION__)
 #define GGML_METAL_MEGA_PTR device char *
