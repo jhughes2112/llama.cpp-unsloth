@@ -932,6 +932,22 @@ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * g
 
     auto * res = &gsmpl->cur_p;
 
+    // the dist sampler leaves the probabilities of a large vocabulary out (NaN in the first): the softmax of the logits
+    if (res->size > 0 && std::isnan(res->data[0].p)) {
+        float max_l = -INFINITY;
+        for (size_t i = 0; i < res->size; ++i) {
+            max_l = std::max(max_l, res->data[i].logit);
+        }
+        double sum = 0.0;
+        for (size_t i = 0; i < res->size; ++i) {
+            res->data[i].p = expf(res->data[i].logit - max_l);
+            sum += res->data[i].p;
+        }
+        for (size_t i = 0; i < res->size; ++i) {
+            res->data[i].p = (float) (res->data[i].p/sum);
+        }
+    }
+
     if (do_sort && !res->sorted) {
         // remember the selected token before sorting
         const llama_token id = res->data[res->selected].id;

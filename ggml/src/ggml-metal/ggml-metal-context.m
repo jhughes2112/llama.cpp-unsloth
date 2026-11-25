@@ -768,6 +768,15 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     g_profile_t_wake = 0.0;
                 }
 
+                if (getenv("GGML_METAL_PROFILE")) {
+                    // commit to kernel start to GPU start, a graph
+                    const double t_commit = [[NSProcessInfo processInfo] systemUptime];
+                    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                        static double s_k = 0, s_g = 0; static int n = 0;
+                        s_k += [cb kernelStartTime] - t_commit; s_g += [cb GPUStartTime] - t_commit; n++;
+                        if (n % 500 == 0) fprintf(stderr, "ggml_metal_profile: commit to kernel start %.0f us, to GPU start %.0f us (%d)\n", s_k*1e6/n, s_g*1e6/n, n);
+                    }];
+                }
                 [cmd_buf commit];
                 ctx->cmd_buf_last = cmd_buf;
 
