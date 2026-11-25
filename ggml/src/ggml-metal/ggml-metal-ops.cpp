@@ -202,6 +202,7 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
 }
 
 static const ggml_tensor * ggml_metal_op_root(const ggml_tensor * t);
+static bool ggml_metal_op_q5k_situ_fusable(ggml_metal_op_t ctx, int idx, int * n2_out);
 static void ggml_metal_op_fused_concurrency(ggml_metal_op_t ctx, int idx, int n);
 
 static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
@@ -3623,6 +3624,86 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                     }
                     return 1 + n2;
                 }
+            }
+        }
+
+        {
+            int n2 = 0;
+            if (ggml_metal_op_q5k_situ_fusable(ctx, idx, &n2)) {
+                const ggml_tensor * g_in  = ctx->node(idx + 1 + 0);
+                const ggml_tensor * g_out = ctx->node(idx + 1 + 2);
+                const ggml_tensor * u_in  = ctx->node(idx + 1 + 5);
+                const ggml_tensor * u_out = ctx->node(idx + 1 + 7);
+                ggml_tensor *       dsta  = ctx->node(idx + 1 + n2 - 1);
+                const ggml_tensor * gate  = g_in->src[0];
+                const ggml_tensor * up    = u_in->src[0];
+                const int nh  = (int) dsta->ne[0];
+                static const int nsg = getenv("GGML_METAL_Q5K_SITU_NSG") ? atoi(getenv("GGML_METAL_Q5K_SITU_NSG")) : 4;
+
+                const bool topk = ctx->topk_node == idx;
+                if (topk && ctx->mem_ranges) {
+                    bool conflict = !ggml_mem_ranges_check_read(ctx->mem_ranges, ctx->topk_logits) ||
+                        (ctx->topk_pbias && !ggml_mem_ranges_check_read(ctx->mem_ranges, ctx->topk_pbias)) ||
+                        !ggml_mem_ranges_check_write(ctx->mem_ranges, ctx->topk_ids) ||
+                        !ggml_mem_ranges_check_write(ctx->mem_ranges, ctx->topk_weights);
+                    if (conflict) {
+                        ggml_metal_op_concurrency_reset(ctx);
+                    }
+                }
+                ggml_metal_op_fused_concurrency(ctx, idx, 1 + n2);
+
+                ggml_metal_kargs_mul_mv_id_situ args = {
+                    /*.nei0 =*/ ne20,
+                    /*.nei1 =*/ ne21,
+                    /*.nbi1 =*/ nb21,
+                    /*.ne00 =*/ ne00,
+                    /*.ne0  =*/ ne0,
+                    /*.nb01 =*/ nb01,
+                    /*.nb02 =*/ nb02,
+                    /*.ne11 =*/ ne11,
+                    /*.nh   =*/ nh,
+                    /*.nb11 =*/ nb11,
+                    /*.nb12 =*/ nb12,
+                    /*.goff =*/ (int32_t) (gate->view_offs/sizeof(float)),
+                    /*.uoff =*/ (int32_t) (up->view_offs/sizeof(float)),
+                    /*.ga   =*/ ggml_get_op_params_f32(g_in,  0),
+                    /*.gb   =*/ ggml_get_op_params_f32(g_out, 0),
+                    /*.ua   =*/ ggml_get_op_params_f32(u_in,  0),
+                    /*.ub   =*/ ggml_get_op_params_f32(u_out, 0),
+                };
+
+                auto pipeline = ggml_metal_library_get_pipeline_named(lib, topk ? "kernel_mul_mv_id_q5_K_situ_topk" : "kernel_mul_mv_id_q5_K_situ");
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+                ggml_metal_encoder_set_buffer  (enc, bid_src2, 4);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dsta), 6);
+                if (topk) {
+                    ggml_metal_encoder_set_bytes (enc, &ctx->topk_args, sizeof(ctx->topk_args), 7);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(ctx->topk_logits), 8);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(ctx->topk_pbias ? ctx->topk_pbias : ctx->topk_logits), 9);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(ctx->topk_weights), 10);
+                }
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(int32_t), 0);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (nh + nsg - 1)/nsg, 1, ne20*ne21, 32, nsg, 1);
+
+                if (topk) {
+                    if (ctx->mem_ranges) {
+                        ggml_mem_ranges_add_read(ctx->mem_ranges, ctx->topk_logits);
+                        if (ctx->topk_pbias) {
+                            ggml_mem_ranges_add_read(ctx->mem_ranges, ctx->topk_pbias);
+                        }
+                        ggml_mem_ranges_add_write(ctx->mem_ranges, ctx->topk_ids);
+                        ggml_mem_ranges_add_write(ctx->mem_ranges, ctx->topk_weights);
+                    }
+                    ctx->topk_node = -1;
+                }
+
+                return 1 + n2;
             }
         }
 
@@ -7984,6 +8065,43 @@ static bool ggml_metal_op_situ_fusable(ggml_metal_op_t ctx, int idx) {
         dsta->ne[1] == ne20 && dsta->ne[2] == ne21 && ggml_is_contiguous(dsta) && ggml_is_contiguous(op);
 }
 
+// the mul_mat_id at idx is a Q5_K gate_up of one token with a plain SITU of its halves right behind it
+// (kernel_mul_mv_id_q5_K_situ). GGML_METAL_NO_Q5K_SITU=1 turns it off
+static bool ggml_metal_op_q5k_situ_fusable(ggml_metal_op_t ctx, int idx, int * n2_out) {
+    static const bool off = getenv("GGML_METAL_NO_Q5K_SITU") != nullptr;
+    const ggml_tensor * op = ctx->node(idx);
+    if (off || !ctx->use_fusion() || op->op != GGML_OP_MUL_MAT_ID || idx + 1 >= ctx->n_nodes()) {
+        return false;
+    }
+    const int64_t ne00 = op->src[0]->ne[0];
+    const int64_t ne20 = op->src[2]->ne[0];
+    const int64_t ne21 = op->src[2]->ne[1];
+    if (op->src[0]->type != GGML_TYPE_Q5_K || op->src[1]->type != GGML_TYPE_F32 || ne00 % 256 != 0 ||
+        op->ne[1] != ne20 || op->ne[2] != ne21 || ne21 != 1 || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    int n2 = 0;
+    const ggml_metal_fusion * fusion = ctx->can_fuse(idx + 1, GGML_METAL_FUSION_FULL, &n2);
+    if (!fusion || ggml_metal_fusion_get_id(fusion) != GGML_METAL_FUSION_SITU) {
+        return false;
+    }
+    const ggml_tensor * g_in = ctx->node(idx + 1 + 0);
+    const ggml_tensor * u_in = ctx->node(idx + 1 + 5);
+    const ggml_tensor * dsta = ctx->node(idx + 1 + n2 - 1);
+    const ggml_tensor * gate = g_in->src[0];
+    const ggml_tensor * up   = u_in->src[0];
+    const int nh = (int) dsta->ne[0];
+    if (ggml_metal_op_root(gate) != op || ggml_metal_op_root(up) != op || gate->view_offs % sizeof(float) != 0 ||
+        up->view_offs % sizeof(float) != 0 || gate->ne[0] != nh || up->ne[0] != nh || nh % 4 != 0 ||
+        dsta->ne[1] != ne20 || dsta->ne[2] != ne21 || !ggml_is_contiguous(dsta) || gate->nb[1] != op->nb[1] || up->nb[1] != op->nb[1]) {
+        return false;
+    }
+    if (n2_out) {
+        *n2_out = n2;
+    }
+    return true;
+}
+
 int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -8073,7 +8191,7 @@ int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
             }
         }
         if (ok && first >= 0 && ctx->node(first)->op == GGML_OP_MUL_MAT_ID && ctx->node(first)->src[2] == ids &&
-            ggml_metal_op_situ_fusable(ctx, first)) {
+            (ggml_metal_op_situ_fusable(ctx, first) || ggml_metal_op_q5k_situ_fusable(ctx, first, nullptr))) {
             ctx->topk_node    = first;
             ctx->topk_args    = {
                 /*.n_expert  =*/ (int32_t) n_expert,

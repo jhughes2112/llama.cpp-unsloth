@@ -2978,6 +2978,23 @@ void ggml_metal_fusion_add_alloc_deps(
                         break;
                     }
                 }
+                // a SiTU of the halves of an expert mat-mul: the mat-mul may apply it in its epilogue
+                // (kernel_mul_mv_id_q5_K_situ): the input of the mat-mul stays until the SiTU is done
+                if (fusion.id == GGML_METAL_FUSION_SITU) {
+                    const int last = i + (int) fusion.ops_all.size() - 1;
+                    for (int j = i; j <= last; ++j) {
+                        ggml_tensor * t = gf->nodes[j]->src[0];
+                        while (t && t->view_src) {
+                            t = t->view_src;
+                        }
+                        if (t && t->op == GGML_OP_MUL_MAT_ID) {
+                            for (ggml_tensor * u = t->src[1]; u != nullptr; u = u->view_src) {
+                                add_alloc_dep(user_data, u, gf->nodes[last]);
+                            }
+                            break;
+                        }
+                    }
+                }
                 if (fusion.id == GGML_METAL_FUSION_REDUCE_CONV) {
                     const int last = i + (int) fusion.ops_all.size() - 1;
                     for (int j = i; j <= last; ++j) {
