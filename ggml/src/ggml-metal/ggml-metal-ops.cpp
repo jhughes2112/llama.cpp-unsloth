@@ -6690,12 +6690,21 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
                 /*.hi       =*/ is_k ? ggml_get_op_params_f32(ctx->node(j2 + 6), 1) : 0.0f,
             };
 
-            // the skipped groups run now: check them against what runs, add their ranges after
-            for (int j = j2; j < j2 + n2; ++j) {
-                if (!ggml_metal_op_concurrency_check(ctx, ctx->node(j))) { ggml_metal_op_concurrency_reset(ctx); break; }
-            }
-            if (!ggml_metal_op_concurrency_check(ctx, set)) {
-                ggml_metal_op_concurrency_reset(ctx);
+            // the skipped groups run now: what the kernel reads and writes against what runs (only that: the tensors in
+            // between are never written), and added after
+            const ggml_tensor * reads[5]  = { past, cur, w, taps, set->src[1] };
+            const ggml_tensor * writes[2] = { cell, set };
+            if (ctx->mem_ranges) {
+                bool conflict = false;
+                for (const ggml_tensor * t : reads) {
+                    conflict = conflict || !ggml_mem_ranges_check_read(ctx->mem_ranges, t);
+                }
+                for (const ggml_tensor * t : writes) {
+                    conflict = conflict || !ggml_mem_ranges_check_write(ctx->mem_ranges, t);
+                }
+                if (conflict) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                }
             }
 
             auto pl = ggml_metal_library_get_pipeline_named(lib, "kernel_kv_conv_store_dyn_f32");
@@ -6711,10 +6720,14 @@ int ggml_metal_op_short_conv(ggml_metal_op_t ctx, int idx, int n) {
             ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float), 0);
             ggml_metal_encoder_dispatch_threadgroups(enc, args.C/D, 1, 1, D, 1, 1);
 
-            for (int j = j2; j < j2 + n2; ++j) {
-                ggml_metal_op_concurrency_add(ctx, ctx->node(j));
+            if (ctx->mem_ranges) {
+                for (const ggml_tensor * t : reads) {
+                    ggml_mem_ranges_add_read(ctx->mem_ranges, t);
+                }
+                for (const ggml_tensor * t : writes) {
+                    ggml_mem_ranges_add_write(ctx->mem_ranges, t);
+                }
             }
-            ggml_metal_op_concurrency_add(ctx, set);
             ctx->skip_nodes[j2] = n2;
             ctx->skip_nodes[j3] = 1;
 
