@@ -44,6 +44,7 @@ static const NSUInteger MTLLanguageVersion4_0_GGML = 4 << 16;
 struct ggml_metal_library;
 static void ggml_metal_mega_set_library(struct ggml_metal_library * lib);
 static void ggml_metal_mega_forget_library(struct ggml_metal_library * lib);
+static bool ggml_metal_mega_included(const char * base);
 
 //
 // MTLFunctionConstantValues wrapper
@@ -1346,7 +1347,7 @@ static struct {
         id<MTLBuffer> buf;
         id<MTLCommandBuffer> cmd;
         size_t n_ctr;
-        size_t ctr[64]; // offsets of the barrier counters written last time
+        size_t ctr[1024]; // offsets of the barrier counters written last time
     } ring[GGML_METAL_MEGA_RING];
     int ring_i;
     long long n_steps_mega, n_steps_plain, n_disp; // statistics
@@ -1462,7 +1463,7 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
     for (int i = 0; i < r->n && !missing; ++i) {
         ggml_metal_pipeline_t pl = r->d[i].pl;
         if (pl->mega_never || pl->mega_gen == g_mega.gen) continue;
-        if (pl->kind < 0 || !ggml_metal_mega_kind_ok(pl->kind) || !g_mega.lib) { pl->mega_never = true; continue; }
+        if (pl->kind < 0 || !ggml_metal_mega_kind_ok(pl->kind) || !g_mega.lib || !ggml_metal_mega_included(pl->base)) { pl->mega_never = true; continue; }
         missing = true;
     }
     if (getenv("GGML_METAL_MEGA_VERBOSE") && r->n > 0) {
@@ -1584,11 +1585,42 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
 // layout of a dispatch in the persistent kernel; false if it cannot run there
 static const char * g_mega_why = "";
 
+// GGML_METAL_MEGA_INCLUDE=prefix,prefix: only these kernels go in (to find a wrong or slow one); also kept out of the generated source
+static bool ggml_metal_mega_included(const char * base) {
+    static const char * in = (const char *) -1;
+    if (in == (const char *) -1) in = getenv("GGML_METAL_MEGA_INCLUDE");
+    if (!in) return true;
+    const char * p = in;
+    while (*p) {
+        const char * q = strchr(p, 0x2c);
+        const size_t n = q ? (size_t) (q - p) : strlen(p);
+        if (n > 0 && strncmp(base, p, n) == 0) return true;
+        if (!q) break;
+        p = q + 1;
+    }
+    return false;
+}
+
 static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_metal_mega_entry * e) {
     const ggml_metal_pipeline_t pl = d->pl;
     if (pl->mega_gen != g_mega.gen || pl->mega_case < 0 || !(pl->mega_flags & GGML_METAL_MEGA_FLAG_OK)) { g_mega_why = "r1"; return false; }
     {
         // GGML_METAL_MEGA_EXCLUDE=prefix,prefix: kernels kept out (encoded as usual)
+        // GGML_METAL_MEGA_INCLUDE=prefix,prefix: only these kernels go in (to find a wrong one)
+        static const char * in = (const char *) -1;
+        if (in == (const char *) -1) in = getenv("GGML_METAL_MEGA_INCLUDE");
+        if (in) {
+            bool hit = false;
+            const char * p = in;
+            while (*p) {
+                const char * q = strchr(p, ',');
+                const size_t n = q ? (size_t) (q - p) : strlen(p);
+                if (n > 0 && strncmp(pl->base, p, n) == 0) { hit = true; break; }
+                if (!q) break;
+                p = q + 1;
+            }
+            if (!hit) { g_mega_why = "include"; return false; }
+        }
         static const char * ex = (const char *) -1;
         if (ex == (const char *) -1) ex = getenv("GGML_METAL_MEGA_EXCLUDE");
         if (ex) {
@@ -1615,12 +1647,23 @@ static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_m
     }
     memset(e, 0, sizeof(*e));
     e->pipe = pl->mega_case;
+    e->reps = 1;
     if (t == T) {
         // as dispatched, any shape
         e->lanes = 1; e->width = T;
         e->tptg[0] = d->tptg[0]; e->tptg[1] = d->tptg[1]; e->tptg[2] = d->tptg[2];
+    } else if (t > T && nob) {
+        // wider than the persistent threadgroup and no barrier inside: each thread runs several of its threads, the
+        // kernel sees its own width (kernel_get_rows has a thread an element: run narrower it copied a quarter)
+        e->lanes = 1; e->width = T;
+        e->reps = (t + T - 1)/T;
+        e->tptg[0] = d->tptg[0]; e->tptg[1] = d->tptg[1]; e->tptg[2] = d->tptg[2];
     } else if (t > T) {
-        if (d->tptg[1] != 1 || d->tptg[2] != 1) { g_mega_why = "r5"; return false; }
+        // with barriers it can only run narrower: only for kernels that stride over their threads
+        static const char * gen[] = { "kernel_rms_norm", "kernel_depth_mix", "kernel_ctrl_down", "kernel_norm_router" };
+        bool ok = false;
+        for (size_t k = 0; k < sizeof(gen)/sizeof(gen[0]); ++k) if (strncmp(pl->base, gen[k], strlen(gen[k])) == 0) ok = true;
+        if (!ok || d->tptg[1] != 1 || d->tptg[2] != 1) { g_mega_why = "r5"; return false; }
         e->lanes = 1; e->width = T;
         e->tptg[0] = T; e->tptg[1] = 1; e->tptg[2] = 1;
     } else {
@@ -1725,7 +1768,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
     }
     g_mega.ring[ri].n_ctr = 0;
     // its size: every dispatch an entry, every step one, all the bytes, a counter a run, alignment
-    size_t need = 256 + nd*sizeof(ggml_metal_mega_entry) + ns*sizeof(ggml_metal_mega_step) + r->n_bytes + 64*1024 + 16*nd;
+    size_t need = 256 + nd*sizeof(ggml_metal_mega_entry) + ns*sizeof(ggml_metal_mega_step) + r->n_bytes + 1024*ns + 1024 + 16*nd;
     if (!g_mega.ring[ri].buf || [g_mega.ring[ri].buf length] < need) {
         if (g_mega.ring[ri].buf) [g_mega.ring[ri].buf release];
         id<MTLDevice> device = [cmd device];
@@ -1741,7 +1784,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
     while (s < ns) {
         int t = s;
         while (t < ns && sok[t]) ++t;
-        if (t - s >= g_mega.min_steps && g_mega.ring[ri].n_ctr < 64) {
+        if (t - s >= g_mega.min_steps && g_mega.ring[ri].n_ctr < 1024) {
             // steps [s, t) in one persistent dispatch
             const int e0 = sfirst[s], e1 = sfirst[t];
             const size_t o_ctr = MEGA_ALLOC(16);
@@ -1787,6 +1830,20 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             }
             res[n_res++] = rb;
             ggml_metal_mega_params prm = { (uint32_t) (t - s), { 0, 0, 0 } };
+            {
+                // profiling, results are garbage: GGML_METAL_MEGA_STOP=1 (return at once), 2 (steps and barriers
+                // only), 3 (no kernel calls); GGML_METAL_MEGA_UPTO=n: work only in the first n steps of the graph
+                static int stop = -1, upto = -1;
+                if (stop < 0) {
+                    stop = getenv("GGML_METAL_MEGA_STOP") ? atoi(getenv("GGML_METAL_MEGA_STOP")) : 0;
+                    upto = getenv("GGML_METAL_MEGA_UPTO") ? atoi(getenv("GGML_METAL_MEGA_UPTO")) : -1;
+                }
+                prm.pad[1] = (uint32_t) stop;
+                if (upto >= 0) {
+                    const int n_exec = MAX(0, MIN(upto - s, t - s));
+                    prm.pad[2] = (uint32_t) n_exec + 1;
+                }
+            }
 
             int slot = -1;
             id<MTLComputeCommandEncoder> enc = ggml_metal_new_compute_encoder(cmd, encoder->concurrent, &slot);

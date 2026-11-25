@@ -288,10 +288,14 @@ kernel void kernel_mega(
     // a wait that timed out (a threadgroup that never started: the GPU is shared) ends the whole dispatch at the
     // next barrier, so that it never holds the GPU for more than one wait
     threadgroup uint aborted;
+    if (P.pad[1] == 1) {
+        return; // GGML_METAL_MEGA_STOP=1: the dispatch alone
+    }
     for (uint s = 0; s < P.n_steps; ++s) {
         const uint e0 = S[s].e0;
         const uint ni = S[s].n_items;
-        for (uint g = tg; g < ni; g += R) {
+        const bool work = P.pad[1] != 2 && (P.pad[2] == 0 || s + 1 < P.pad[2]); // STOP=2: steps and barriers only; UPTO
+        for (uint g = tg; g < ni && work; g += R) {
             uint e  = e0;
             uint gi = g;
             while (gi >= (uint) E[e].n_items) { gi -= E[e].n_items; ++e; }
@@ -308,7 +312,12 @@ kernel void kernel_mega(
                 }
                 v = en->n_vtg - 1;
             }
-            const uint lt = ti - lane*w;
+            const uint tt = en->tptg[0]*en->tptg[1]*en->tptg[2]; // threads the kernel sees
+            for (uint rp = 0; rp < (uint) en->reps; ++rp) {
+            const uint lt = ti - lane*w + rp*w;
+            if (lt >= tt) {
+                break;
+            }
             mega_ctx c;
             c.argblob = argblob;
             c.e       = en;
@@ -321,10 +330,11 @@ kernel void kernel_mega(
             c.tiitg   = lt;
             c.sgitg   = lt/32;
             c.tiisg   = lt%32;
-            c.nsg     = (w + 31)/32;
-            switch (en->pipe) {
+            c.nsg     = (tt + 31)/32;
+            if (P.pad[1] != 3) switch (en->pipe) { // STOP=3: no kernel call
 MEGA_CASES
                 default: break;
+            }
             }
         }
         if (s + 1 < P.n_steps) {

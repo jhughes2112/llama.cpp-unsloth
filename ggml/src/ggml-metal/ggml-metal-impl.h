@@ -207,10 +207,12 @@ typedef struct {
     int32_t  n_vtg;     // threadgroups of the dispatch
     int32_t  n_items;   // ceil(n_vtg/lanes)
     int32_t  idle_ok;   // a lane past the end sits out (else it runs the last threadgroup again)
+    int32_t  reps;      // a threadgroup wider than the persistent one: each thread runs this many of its threads (no barrier inside)
     int32_t  grid[3];
     int32_t  tptg[3];   // threads a threadgroup as the kernel sees them
     int32_t  smem0;     // bytes of threadgroup(0) a lane
     int32_t  smem_lane; // bytes a lane
+    int32_t  pad0;      // keeps p 8-byte aligned the same way in C and MSL
     uint32_t a[GGML_METAL_MEGA_NB];            // binding as argument bytes: offset in the argument buffer
     GGML_METAL_MEGA_PTR p[GGML_METAL_MEGA_NB]; // binding as buffer: its GPU address
 } ggml_metal_mega_entry;
