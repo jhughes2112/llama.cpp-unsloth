@@ -4405,3 +4405,85 @@ kernel void kernel_mul_mv_id_q5_K_situ_topk(
         ushort NSG  [[simdgroups_per_threadgroup]]) {
     kernel_mul_mv_id_q5_K_situ_impl<true>(args, src0s, src1, dst, ids, act, &ta, logits, pbias, weights, shmem, tgpig, tiisg, sgitg, NSG);
 }
+
+
+// the output mat-vec (Q8_0, one token) with the soft cap of the logits and the copy without the padding rows in its
+// epilogue (kernel_softcap_f32), and with has_pad the padded copy of the backend sampler (a PAD of zeros)
+[[host_name("kernel_mul_mv_q8_0_f32_softcap")]]
+kernel void kernel_mul_mv_q8_0_f32_softcap(
+        constant ggml_metal_kargs_mul_mv     & args,
+        device const char  * src0,
+        device const char  * src1,
+        constant ggml_metal_kargs_softcap_epi & sa,
+        device       float * cdst,
+        device       float * pdst,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = N_R0_Q8_0;
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+    const int r0 = tgpig.x*NR0;
+
+    device const float * y = (device const float *) src1;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + (uint64_t) (r0 + row)*args.nb01);
+    }
+
+    float sumf[NR0] = { 0.f };
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+    float yl[NQ];
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+        yb += NSG*NQ*QK8_0;
+    }
+
+    threadgroup float * sh = (threadgroup float *) shmem;
+    if (sgitg == 0) {
+        for (short row = 0; row < NR0; ++row) {
+            sh[NW*row + tiisg] = 0.0f;
+        }
+    }
+    for (short row = 0; row < NR0; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        for (short row = 0; row < NR0; ++row) {
+            sh[NW*row + sgitg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; ++row) {
+        const float x = simd_sum(sh[NW*row + tiisg]);
+        const int   r = r0 + row;
+        if (sgitg == 0 && tiisg == row && r < sa.n) {
+            const float v = sa.b*precise::tanh(sa.a*x);
+            cdst[r] = v;
+            if (sa.has_pad) {
+                pdst[r]        = v;
+                pdst[sa.n + r] = 0.0f;
+            }
+        }
+    }
+}

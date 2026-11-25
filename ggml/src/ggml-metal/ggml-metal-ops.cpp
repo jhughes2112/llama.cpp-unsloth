@@ -3033,6 +3033,68 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
+    // the output mat-vec of one token with the soft cap right behind it (and the PAD of the backend sampler after that):
+    // both in its epilogue (kernel_mul_mv_q8_0_f32_softcap). GGML_METAL_NO_MV_SOFTCAP=1 turns it off
+    static const bool no_mv_softcap = getenv("GGML_METAL_NO_MV_SOFTCAP") != nullptr;
+    if (!no_mv_softcap && ctx->use_fusion() && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32 &&
+        ne11 == 1 && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 && ggml_is_contiguous(op) && idx + 1 < ctx->n_nodes()) {
+        int n2 = 0;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx + 1, GGML_METAL_FUSION_FULL, &n2);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SOFTCAP) {
+            const ggml_tensor * s1   = ctx->node(idx + 1);
+            const ggml_tensor * s2   = ctx->node(idx + 1 + 2);
+            ggml_tensor *       cdst = ctx->node(idx + n2);
+            // the only reader of the raw logits must be the cap
+            bool ok = s1->src[0] == op && cdst->ne[1] == 1 && ggml_is_contiguous(cdst) && cdst->ne[0] <= ne01;
+            for (int j = idx + 1 + n2; ok && j < ctx->n_nodes(); ++j) {
+                const ggml_tensor * t = ctx->node(j);
+                for (int k = 0; ok && k < GGML_MAX_SRC; ++k) {
+                    ok = !(t->src[k] && ggml_metal_op_root(t->src[k]) == op);
+                }
+            }
+            ggml_tensor * pad = nullptr;
+            if (ok && idx + 1 + n2 < ctx->n_nodes()) {
+                ggml_tensor * t = ctx->node(idx + 1 + n2);
+                if (t->op == GGML_OP_PAD && t->src[0] == cdst && t->ne[0] == cdst->ne[0] && t->ne[1] == 2 && t->ne[2] == 1 &&
+                    ggml_is_contiguous(t) && ggml_get_op_params_i32(t, 0) == 0 && ggml_get_op_params_i32(t, 2) == 0 &&
+                    ggml_get_op_params_i32(t, 3) == 1) {
+                    pad = t;
+                }
+            }
+            if (ok) {
+                ctx->count_fusions(fusion);
+                ggml_metal_op_fused_concurrency(ctx, idx, 1 + n2 + (pad ? 1 : 0));
+
+                auto pipeline = ggml_metal_library_get_pipeline_mul_mv_variant(lib, op, "_softcap");
+
+                ggml_metal_kargs_mul_mv args = {
+                    /*.ne00 =*/ ne00, /*.ne01 =*/ ne01, /*.ne02 =*/ ne02, /*.nb00 =*/ nb00, /*.nb01 =*/ nb01, /*.nb02 =*/ nb02,
+                    /*.nb03 =*/ nb03, /*.ne10 =*/ ne10, /*.ne11 =*/ ne11, /*.ne12 =*/ ne12, /*.nb10 =*/ nb10, /*.nb11 =*/ nb11,
+                    /*.nb12 =*/ nb12, /*.nb13 =*/ nb13, /*.ne0  =*/ ne0, /*.ne1  =*/ ne1, /*.nr0  =*/ pipeline.nr0,
+                    /*.r2   =*/ r2, /*.r3   =*/ r3,
+                };
+                ggml_metal_kargs_softcap_epi sa = {
+                    /*.n       =*/ (int32_t) cdst->ne[0],
+                    /*.has_pad =*/ pad ? 1 : 0,
+                    /*.a       =*/ ggml_get_op_params_f32(s1, 0),
+                    /*.b       =*/ ggml_get_op_params_f32(s2, 0),
+                };
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+                ggml_metal_encoder_set_bytes   (enc, &sa, sizeof(sa), 3);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cdst), 4);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(pad ? pad : cdst), 5);
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + pipeline.nr0 - 1)/pipeline.nr0, 1, 1, 32, pipeline.nsg, 1);
+
+                return 1 + n2 + (pad ? 1 : 0);
+            }
+        }
+    }
+
     // a Q8_0 mat-vec of one token whose output is the input of a plain short conv right behind it: the conv in the
     // epilogue (kernel_mul_mv_q8_0_f32_conv), one step. GGML_METAL_NO_MV_CONV=1 turns it off
     static const bool no_mv_conv = getenv("GGML_METAL_NO_MV_CONV") != nullptr;

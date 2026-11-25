@@ -958,6 +958,14 @@ typedef struct {
     float   b;
 } ggml_metal_kargs_ctrl;
 
+// the soft cap of the logits in the epilogue of the output mat-vec (kernel_mul_mv_q8_0_f32_softcap)
+typedef struct {
+    int32_t n;       // logits kept (the rows past it are padding)
+    int32_t has_pad; // also the padded copy for the backend sampler: row 0 the logits, row 1 zeros
+    float   a;       // b*tanh(a*x)
+    float   b;
+} ggml_metal_kargs_softcap_epi;
+
 // the draw of the dist sampler on the GPU (kernel_dist_stats_f32 + kernel_dist_pick_f32): the first index whose
 // cumulative probability passes the uniform u
 typedef struct {

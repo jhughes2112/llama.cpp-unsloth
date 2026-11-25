@@ -2995,6 +2995,22 @@ void ggml_metal_fusion_add_alloc_deps(
                         }
                     }
                 }
+                // the soft cap of the output mat-mul in its epilogue: the input of the mat-mul stays until the cap is done
+                if (fusion.id == GGML_METAL_FUSION_SOFTCAP) {
+                    const int last = i + (int) fusion.ops_all.size() - 1;
+                    ggml_tensor * t = gf->nodes[i]->src[0];
+                    if (t && t->op == GGML_OP_MUL_MAT) {
+                        for (ggml_tensor * u = t->src[1]; u != nullptr; u = u->view_src) {
+                            add_alloc_dep(user_data, u, gf->nodes[last]);
+                        }
+                        // and past the PAD of the backend sampler right behind
+                        if (last + 1 < gf->n_nodes && gf->nodes[last + 1]->op == GGML_OP_PAD) {
+                            for (ggml_tensor * u = t->src[1]; u != nullptr; u = u->view_src) {
+                                add_alloc_dep(user_data, u, gf->nodes[last + 1]);
+                            }
+                        }
+                    }
+                }
                 if (fusion.id == GGML_METAL_FUSION_REDUCE_CONV) {
                     const int last = i + (int) fusion.ops_all.size() - 1;
                     for (int j = i; j <= last; ++j) {
