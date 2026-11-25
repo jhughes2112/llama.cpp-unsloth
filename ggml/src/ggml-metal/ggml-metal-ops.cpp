@@ -325,6 +325,15 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                 return 1;
             }
         }
+        // GGML_METAL_PROFILE_ONLY_OPS=,MUL_MAT,MUL_MAT_ID,: the opposite, only the kernels of the named ops
+        static const char * only = getenv("GGML_METAL_PROFILE_ONLY_OPS");
+        if (only) {
+            char key[64];
+            snprintf(key, sizeof(key), ",%s,", ggml_op_name(node->op));
+            if (!strstr(only, key)) {
+                return 1;
+            }
+        }
     }
 
     switch (node->op) {
