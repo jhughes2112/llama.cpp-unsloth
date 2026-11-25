@@ -36,6 +36,23 @@ struct ggml_metal_mega_pipe {
 char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, int n_kinds,
                               const struct ggml_metal_mega_pipe * pipes, int n_pipes, int * out_case, int * out_flags);
 
+// GGML_METAL_MEGA_BAKED: a dispatch of a step with its layout fixed in the generated code
+struct ggml_metal_mega_sched_entry {
+    int pipe;     // index in pipes
+    int lanes, width, n_vtg, n_items, idle_ok, reps;
+    int grid[3];
+    int tptg[3];
+    int smem0, smem_lane;
+};
+
+// the same source, plus a kernel "kernel_seg_<i>" for every segment i: its steps seg_s0[i] .. seg_s0[i+1]-1 written
+// out, the entries of step s being step_e0[s] .. step_e0[s+1]-1; the table E of a segment kernel starts at the entry
+// step_e0[seg_s0[i]] and holds only the bindings. NULL if a pipeline has no case
+char * ggml_metal_mega_source_baked(const char * hdr, const char * const * kind_srcs, int n_kinds,
+                                    const struct ggml_metal_mega_pipe * pipes, int n_pipes, int * out_case, int * out_flags,
+                                    const struct ggml_metal_mega_sched_entry * ents, const int * step_e0,
+                                    const int * seg_s0, int n_segs);
+
 #ifdef __cplusplus
 }
 #endif

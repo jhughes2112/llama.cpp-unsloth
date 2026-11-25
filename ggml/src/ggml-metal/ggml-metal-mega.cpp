@@ -480,11 +480,114 @@ static std::string replace_all(std::string s, const std::string & a, const std::
     return s;
 }
 
+// the call of each case, filled by ggml_metal_mega_source (for the baked schedule)
+static std::vector<std::string> g_case_call;
+
+// the schedule ggml_metal_mega_source_baked writes out (null: none)
+static struct {
+    const ggml_metal_mega_sched_entry * ents;
+    const int * step_e0;
+    const int * seg_s0;
+    int n_segs;
+} g_sched = {};
+
+// a grid barrier between two steps of a baked segment kernel (as in kernel_mega)
+static const char * k_seg_barrier = R"(
+#define MEGA_SEG_BARRIER(S) { \
+    threadgroup_barrier(mem_flags::mem_device); \
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
+    if (ti == 0) { \
+        atomic_fetch_add_explicit(bar, 1u, memory_order_relaxed); \
+        const uint want = (S)*R; \
+        const uint lim  = P.pad[0] ? P.pad[0] : (1u << 22); \
+        uint it = 0; \
+        aborted = 0; \
+        while (atomic_load_explicit(bar, memory_order_relaxed) < want) { \
+            if (atomic_load_explicit(bar + 1, memory_order_relaxed) != 0 || ++it > lim) { \
+                atomic_fetch_add_explicit(bar + 1, 1u, memory_order_relaxed); \
+                aborted = 1; \
+                break; \
+            } \
+        } \
+    } \
+    threadgroup_barrier(mem_flags::mem_device); \
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
+    if (aborted) { return; } \
+}
+)";
+
+// a baked segment: its steps written out, every count and size a constant; the table E has only the bindings
+static std::string seg_kernel(int si, const ggml_metal_mega_sched_entry * ents, const int * step_e0, int s0, int s1,
+                              const std::vector<int> & case_of_pipe, const int * pipe_case_ok) {
+    (void) pipe_case_ok;
+    std::string k;
+    k += "kernel void kernel_seg_" + std::to_string(si) + "(\n"
+         "        constant char                      * argblob [[buffer(0)]],\n"
+         "        constant ggml_metal_mega_entry     * E       [[buffer(1)]],\n"
+         "        device atomic_uint                 * bar     [[buffer(3)]],\n"
+         "        constant ggml_metal_mega_params    & P       [[buffer(4)]],\n"
+         "        threadgroup char                   * shmem   [[threadgroup(0)]],\n"
+         "        uint   tg [[threadgroup_position_in_grid]],\n"
+         "        uint   R  [[threadgroups_per_grid]],\n"
+         "        ushort ti [[thread_index_in_threadgroup]]) {\n"
+         "    threadgroup uint aborted;\n";
+    const int e_base = step_e0[s0];
+    for (int s = s0; s < s1; ++s) {
+        if (s > s0) {
+            k += "    MEGA_SEG_BARRIER(" + std::to_string(s - s0) + ")\n";
+        }
+        int off = 0; // items of the step before this entry
+        for (int ei = step_e0[s]; ei < step_e0[s + 1]; ++ei) {
+            const auto & e = ents[ei];
+            const int tt = e.tptg[0]*e.tptg[1]*e.tptg[2];
+            char buf[4096];
+            snprintf(buf, sizeof(buf),
+                "    for (uint gi = (tg + R - (%du %% R)) %% R; gi < %du; gi += R) {\n"
+                "        const uint lane = ti/%du;\n"
+                "        if (lane < %du) {\n"
+                "            uint v = gi*%du + lane;\n"
+                "            bool run = true;\n"
+                "            if (v >= %du) { %s }\n"
+                "            for (uint rp = 0; run && rp < %du; ++rp) {\n"
+                "                const uint lt = ti - lane*%du + rp*%du;\n"
+                "                if (lt >= %du) { break; }\n"
+                "                mega_ctx c;\n"
+                "                c.argblob = argblob;\n"
+                "                c.e       = E + %d;\n"
+                "                c.shmem0  = shmem + lane*%du;\n"
+                "                c.shmem1  = c.shmem0 + %du;\n"
+                "                c.ngrid   = uint3(%du, %du, %du);\n"
+                "                c.tgpig   = uint3(v %% %du, (v/%du) %% %du, v/%du);\n"
+                "                c.ntg     = uint3(%du, %du, %du);\n"
+                "                c.tpitg   = uint3(lt %% %du, (lt/%du) %% %du, lt/%du);\n"
+                "                c.tiitg   = lt;\n"
+                "                c.sgitg   = lt/32;\n"
+                "                c.tiisg   = lt%%32;\n"
+                "                c.nsg     = %du;\n"
+                "                %s(c);\n"
+                "            }\n"
+                "        }\n"
+                "    }\n",
+                off, e.n_items, e.width, e.lanes, e.lanes, e.n_vtg,
+                e.idle_ok ? "run = false;" : ("v = " + std::to_string(e.n_vtg - 1) + "u;").c_str(),
+                e.reps, e.width, e.width, tt, ei - e_base, e.smem_lane, e.smem0,
+                e.grid[0], e.grid[1], e.grid[2], e.grid[0], e.grid[0], e.grid[1], e.grid[0]*e.grid[1],
+                e.tptg[0], e.tptg[1], e.tptg[2], e.tptg[0], e.tptg[0], e.tptg[1], e.tptg[0]*e.tptg[1],
+                (tt + 31)/32, g_case_call[case_of_pipe[e.pipe]].c_str());
+            k += buf;
+            off += e.n_items;
+        }
+    }
+    k += "}\n";
+    return k;
+}
+
 } // namespace
 
 char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, int n_kinds,
                               const struct ggml_metal_mega_pipe * pipes, int n_pipes, int * out_case, int * out_flags) {
     std::string src;
+    g_case_call.clear();
     src += "#include <metal_stdlib>\nusing namespace metal;\n";
     // GGML_METAL_MEGA_NOCOH: plain pointers (results are wrong: a threadgroup can read a stale line of what another
     // wrote in the step before; for timing the cost of the coherent loads only)
@@ -585,6 +688,7 @@ char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, 
         }
         cases += "                case " + std::to_string(k) + ": mega_ns" + std::to_string(pipe_ns[i]) + "::mega_call_" +
                  std::to_string(k) + "(c); break;\n";
+        g_case_call.push_back("mega_ns" + std::to_string(pipe_ns[i]) + "::mega_call_" + std::to_string(k));
         out_case[i]  = k;
         int cmask = 0;
         for (const auto & q : c.params) {
@@ -616,7 +720,43 @@ char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, 
     kern = replace_all(kern, "MEGA_CASES\n", cases);
     src += kern;
 
+    bool sched_ok = g_sched.ents != nullptr;
+    for (int s = 0; sched_ok && s < g_sched.seg_s0[g_sched.n_segs]; ++s) {
+        for (int e = g_sched.step_e0[s]; e < g_sched.step_e0[s + 1]; ++e) {
+            if (out_case[g_sched.ents[e].pipe] < 0) sched_ok = false;
+        }
+    }
+    if (sched_ok) {
+        // the baked segments
+        std::string segs = k_seg_barrier;
+        std::vector<int> case_of_pipe(n_pipes);
+        for (int i = 0; i < n_pipes; ++i) case_of_pipe[i] = out_case[i];
+        for (int si = 0; si < g_sched.n_segs; ++si) {
+            segs += seg_kernel(si, g_sched.ents, g_sched.step_e0, g_sched.seg_s0[si], g_sched.seg_s0[si + 1], case_of_pipe, nullptr);
+        }
+        src += cohstore ? coherent_stores(segs) : segs;
+    }
+
     char * res = (char *) malloc(src.size() + 1);
     memcpy(res, src.c_str(), src.size() + 1);
+    return res;
+}
+
+char * ggml_metal_mega_source_baked(const char * hdr, const char * const * kind_srcs, int n_kinds,
+                                    const struct ggml_metal_mega_pipe * pipes, int n_pipes, int * out_case, int * out_flags,
+                                    const struct ggml_metal_mega_sched_entry * ents, const int * step_e0,
+                                    const int * seg_s0, int n_segs) {
+    g_sched.ents    = ents;
+    g_sched.step_e0 = step_e0;
+    g_sched.seg_s0  = seg_s0;
+    g_sched.n_segs  = n_segs;
+    char * res = ggml_metal_mega_source(hdr, kind_srcs, n_kinds, pipes, n_pipes, out_case, out_flags);
+    g_sched = {};
+    // every entry needs a case
+    for (int s = 0; res && s < seg_s0[n_segs]; ++s) {
+        for (int e = step_e0[s]; e < step_e0[s + 1]; ++e) {
+            if (out_case[ents[e].pipe] < 0) { free(res); return nullptr; }
+        }
+    }
     return res;
 }

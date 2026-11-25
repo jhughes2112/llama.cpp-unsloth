@@ -1563,6 +1563,136 @@ static struct ggml_metal_mega_lib * ggml_metal_mega_lib_get(ggml_metal_pipeline_
     return L;
 }
 
+// GGML_METAL_MEGA_BAKED: the segments of a plan, each a kernel with its steps written out (the plan of a decode graph
+// is the same every token: built once, kept while the signature matches)
+static struct {
+    uint64_t sig;
+    int      n_segs;
+    id<MTLComputePipelineState> * psos;
+    bool     failed;
+} g_baked = { 0 };
+
+static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml_metal_mega_entry * ent, const int * sfirst,
+                                      const int * plan_s, const int * plan_t, int n_plan) {
+    if (n_plan == 0) return false;
+    // signature: the steps and the layout of every dispatch of the plan
+    uint64_t sig = 1469598103934665603ull ^ (uint64_t) n_plan;
+    #define MIX(x) sig = (sig ^ (uint64_t) (x))*1099511628211ull
+    for (int p = 0; p < n_plan; ++p) {
+        MIX(plan_s[p]); MIX(plan_t[p]);
+        for (int i = sfirst[plan_s[p]]; i < sfirst[plan_t[p]]; ++i) {
+            const ggml_metal_mega_entry * e = &ent[i];
+            MIX((uintptr_t) r->d[i].pl); MIX(r->d[i].step);
+            MIX(e->lanes); MIX(e->width); MIX(e->n_vtg); MIX(e->n_items); MIX(e->idle_ok); MIX(e->reps);
+            MIX(e->grid[0]); MIX(e->grid[1]); MIX(e->grid[2]); MIX(e->tptg[0]); MIX(e->tptg[1]); MIX(e->tptg[2]);
+            MIX(e->smem0); MIX(e->smem_lane);
+        }
+    }
+    #undef MIX
+    if (g_baked.psos && g_baked.sig == sig && g_baked.n_segs == n_plan) return true;
+    if (g_baked.failed && g_baked.sig == sig) return false;
+
+    const int64_t t0 = ggml_time_us();
+    ggml_metal_pipeline_t * pl = NULL;
+    int n_pl = 0, cap_pl = 0;
+    int n_ent = 0, n_stp = 0;
+    for (int p = 0; p < n_plan; ++p) { n_ent += sfirst[plan_t[p]] - sfirst[plan_s[p]]; n_stp += plan_t[p] - plan_s[p]; }
+    struct ggml_metal_mega_sched_entry * se = calloc(n_ent, sizeof(*se));
+    int * step_e0 = malloc((n_stp + 1)*sizeof(int));
+    int * seg_s0  = malloc((n_plan + 1)*sizeof(int));
+    int ie = 0, is = 0;
+    for (int p = 0; p < n_plan; ++p) {
+        seg_s0[p] = is;
+        for (int k = plan_s[p]; k < plan_t[p]; ++k) {
+            step_e0[is++] = ie;
+            for (int i = sfirst[k]; i < sfirst[k + 1]; ++i) {
+                int q = 0;
+                while (q < n_pl && pl[q] != r->d[i].pl) ++q;
+                if (q == n_pl) {
+                    if (n_pl == cap_pl) { cap_pl = cap_pl ? 2*cap_pl : 64; pl = realloc(pl, cap_pl*sizeof(*pl)); }
+                    pl[n_pl++] = r->d[i].pl;
+                }
+                const ggml_metal_mega_entry * e = &ent[i];
+                struct ggml_metal_mega_sched_entry * x = &se[ie++];
+                x->pipe = q; x->lanes = e->lanes; x->width = e->width; x->n_vtg = e->n_vtg; x->n_items = e->n_items;
+                x->idle_ok = e->idle_ok; x->reps = e->reps;
+                for (int j = 0; j < 3; ++j) { x->grid[j] = e->grid[j]; x->tptg[j] = e->tptg[j]; }
+                x->smem0 = e->smem0; x->smem_lane = e->smem_lane;
+            }
+        }
+    }
+    step_e0[is] = ie;
+    seg_s0[n_plan] = is;
+
+    ggml_metal_library_t lib = g_mega.lib;
+    char * hdr = ggml_metal_mega_kind_text(lib, GGML_METAL_LIB_QUANTIZE, true);
+    const char * ksrc[GGML_METAL_LIB_COUNT] = { 0 };
+    struct ggml_metal_mega_pipe * mp = calloc(n_pl, sizeof(*mp));
+    int * cases = calloc(n_pl, sizeof(int));
+    int * flags = calloc(n_pl, sizeof(int));
+    for (int i = 0; i < n_pl; ++i) {
+        mp[i].base = pl[i]->base;
+        mp[i].kind = pl[i]->kind;
+        mp[i].n_fc = pl[i]->n_fc;
+        for (int j = 0; j < pl[i]->n_fc; ++j) { mp[i].fc_idx[j] = pl[i]->fc_idx[j]; mp[i].fc_type[j] = pl[i]->fc_type[j]; mp[i].fc_val[j] = pl[i]->fc_val[j]; }
+        if (!ksrc[pl[i]->kind]) ksrc[pl[i]->kind] = ggml_metal_mega_kind_text(lib, pl[i]->kind, false);
+    }
+    char * src = hdr ? ggml_metal_mega_source_baked(hdr, ksrc, GGML_METAL_LIB_COUNT, mp, n_pl, cases, flags, se, step_e0, seg_s0, n_plan) : NULL;
+    if (src && getenv("GGML_METAL_MEGA_DUMP")) {
+        FILE * f = fopen(getenv("GGML_METAL_MEGA_DUMP"), "w");
+        if (f) { fputs(src, f); fclose(f); }
+    }
+    id<MTLComputePipelineState> * psos = calloc(n_plan, sizeof(id));
+    bool ok = src != NULL;
+    if (ok) {
+        @autoreleasepool {
+            id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
+            MTLCompileOptions * options = [MTLCompileOptions new];
+            options.preprocessorMacros = lib->prep;
+            options.languageVersion = ggml_metal_device_get_props(lib->dev)->has_tensor ?
+                (MTLLanguageVersion) MTLLanguageVersion4_0_GGML : MTLLanguageVersion3_2;
+            NSError * error = nil;
+            id<MTLLibrary> mlib = [device newLibraryWithSource:[NSString stringWithUTF8String:src] options:options error:&error];
+            [options release];
+            if (!mlib) {
+                const char * msg = [[error description] UTF8String];
+                fprintf(stderr, "ggml_metal_mega: the baked kernels do not compile: %.3000s\n", msg ? msg : "?");
+                ok = false;
+            }
+            for (int p = 0; ok && p < n_plan; ++p) {
+                id<MTLFunction> fn = [mlib newFunctionWithName:[NSString stringWithFormat:@"kernel_seg_%d", p]];
+                psos[p] = fn ? ggml_metal_mega_pipeline(device, fn, &error) : nil;
+                [fn release];
+                if (!psos[p]) { fprintf(stderr, "ggml_metal_mega: no pipeline for segment %d\n", p); ok = false; }
+                else if (!ggml_metal_mega_probe(ggml_metal_device_get_queue(lib->dev), psos[p], g_mega.R)) {
+                    fprintf(stderr, "ggml_metal_mega: segment %d is not resident with %d threadgroups\n", p, g_mega.R);
+                    ok = false;
+                }
+            }
+            [mlib release];
+        }
+    }
+    if (ok) {
+        // the old ones may still be in command buffers in flight: kept
+        if (g_baked.psos) for (int p = 0; p < g_baked.n_segs; ++p) if (g_baked.psos[p]) [g_mega.old_psos addObject:g_baked.psos[p]];
+        free(g_baked.psos);
+        g_baked.psos   = psos;
+        g_baked.n_segs = n_plan;
+        g_baked.sig    = sig;
+        g_baked.failed = false;
+    } else {
+        for (int p = 0; p < n_plan; ++p) if (psos[p]) [psos[p] release];
+        free(psos);
+        g_baked.sig    = sig;
+        g_baked.failed = true;
+    }
+    fprintf(stderr, "ggml_metal_mega: baked %d segments of %d steps, %d kernels, in %.2f s%s\n", n_plan, n_stp, n_pl,
+            (ggml_time_us() - t0)/1e6, ok ? "" : " (failed, as usual)");
+    free(src); free(hdr); free(mp); free(cases); free(flags); free(se); free(step_e0); free(seg_s0); free(pl);
+    for (int k = 0; k < GGML_METAL_LIB_COUNT; ++k) free((void *) ksrc[k]);
+    return ok;
+}
+
 // make sure the megakernel has a case for every pipeline of the recording that it can have one for
 static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
     [g_mega_lock lock];
@@ -1933,9 +2063,24 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
         }
     }
 
+    // GGML_METAL_MEGA_BAKED: plan the segments first (pass 0), build a kernel for each with its steps written out (once
+    // a plan), then encode them (pass 1)
+    static int baked = -1;
+    if (baked < 0) baked = getenv("GGML_METAL_MEGA_BAKED") != NULL;
+    int   n_plan = 0;
+    int * plan_s = baked ? malloc((ns + 1)*sizeof(int)) : NULL;
+    int * plan_t = baked ? malloc((ns + 1)*sizeof(int)) : NULL;
+    int   seg_idx = 0;
+    for (int pass = baked ? 0 : 1; pass < 2; ++pass) {
+    if (pass == 1 && baked) {
+        if (!ggml_metal_mega_baked_get(r, ent, sfirst, plan_s, plan_t, n_plan)) {
+            n_plan = 0; // could not build: everything as usual
+        }
+    }
     int s = 0;
     while (s < ns) {
         int t = s;
+        int seg_cur = -1;
         static int cut_every = -1;
         if (cut_every < 0) cut_every = getenv("GGML_METAL_MEGA_CUT_EVERY") ? atoi(getenv("GGML_METAL_MEGA_CUT_EVERY")) : 0;
         while (t < ns && sok[t] && !(nocoh && t > s && cut[t]) && !(cut_every > 0 && t - s >= cut_every)) ++t;
@@ -1966,11 +2111,30 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             }
             t = u;
             if (n_set > 0) {
-                L = ggml_metal_mega_lib_get(set, n_set);
-                if (!L->pso) t = s; // run as usual
+                if (!baked) {
+                    L = ggml_metal_mega_lib_get(set, n_set);
+                    if (!L->pso) t = s; // run as usual
+                }
             } else {
                 t = s;
             }
+        }
+        if (baked && pass == 1) {
+            // the plan of pass 0 (built or not)
+            const bool is_seg = seg_idx < n_plan && plan_s[seg_idx] == s;
+            t = is_seg ? plan_t[seg_idx] : s;
+            seg_cur = is_seg ? seg_idx++ : -1;
+        }
+        if (pass == 0) {
+            if (t - s >= g_mega.min_steps) {
+                plan_s[n_plan] = s;
+                plan_t[n_plan] = t;
+                n_plan++;
+                s = t;
+            } else {
+                s = t > s ? t : s + 1;
+            }
+            continue;
         }
         if (t - s >= g_mega.min_steps && g_mega.ring[ri].n_ctr < 1024) {
             // steps [s, t) in one persistent dispatch
@@ -2062,7 +2226,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             }
             int slot = -1;
             id<MTLComputeCommandEncoder> enc = ggml_metal_new_compute_encoder(cmd, encoder->concurrent, &slot);
-            [enc setComputePipelineState:L ? L->pso : g_mega.pso];
+            [enc setComputePipelineState:seg_cur >= 0 ? g_baked.psos[seg_cur] : (L ? L->pso : g_mega.pso)];
             [enc setBuffer:rb offset:o_arg atIndex:0];
             [enc setBuffer:rb offset:o_ent atIndex:1];
             [enc setBuffer:rb offset:o_stp atIndex:2];
@@ -2085,6 +2249,8 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             s = t1;
         }
     }
+    } // pass
+    free(plan_s); free(plan_t);
     #undef MEGA_ALLOC
     const int64_t t_flush3 = ggml_time_us();
     g_mega.ring[ri].cmd = [cmd retain];
