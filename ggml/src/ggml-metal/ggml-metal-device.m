@@ -1618,7 +1618,8 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
     int * seg_smem = malloc(n_plan*sizeof(int));
     int * seg_R    = malloc(n_plan*sizeof(int));
     static int segt = -1;
-    if (segt < 0) segt = getenv("GGML_METAL_MEGA_SEGT") != NULL;
+    if (segt < 0) segt = getenv("GGML_METAL_MEGA_SEGT") != NULL || getenv("GGML_METAL_MEGA_FOLD") != NULL;
+    const bool foldm = getenv("GGML_METAL_MEGA_FOLD") != NULL;
     for (int p = 0; p < n_plan; ++p) {
         seg_s0[p] = is;
         // GGML_METAL_MEGA_SEGT: the segment's threadgroups as wide as its widest kernel (a kernel of 64 threads is not
@@ -1632,7 +1633,7 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
             // the candidate widths: those of its kernels; SEGT=1 the widest, SEGT=2 the narrowest every kernel can run at
             // (barrier-free wide kernels loop over virtual threads, the whitelisted norms stride)
             static int segt_mode = -1;
-            if (segt_mode < 0) segt_mode = atoi(getenv("GGML_METAL_MEGA_SEGT"));
+            if (segt_mode < 0) segt_mode = getenv("GGML_METAL_MEGA_SEGT") ? atoi(getenv("GGML_METAL_MEGA_SEGT")) : 1;
             int cand[64], nc = 0;
             for (int i = i0; i < i1; ++i) {
                 const int t = MIN((r->d[i].tptg[0]*r->d[i].tptg[1]*r->d[i].tptg[2] + 31) & ~31, 1024);
@@ -1665,6 +1666,12 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
             max_items = MAX(max_items, n);
         }
         seg_R[p] = (segt && plan_t[p] - plan_s[p] == 1) ? max_items : (segt ? -max_items : g_mega.R);
+        if (foldm) {
+            // a fold: a threadgroup an item of its first step
+            int n0 = 0;
+            for (int i = sfirst[plan_s[p]]; i < sfirst[plan_s[p] + 1]; ++i) n0 += lay[i - i0].n_items;
+            seg_R[p] = MAX(1, n0);
+        }
         for (int k = plan_s[p]; k < plan_t[p]; ++k) {
             step_e0[is++] = ie;
             for (int i = sfirst[k]; i < sfirst[k + 1]; ++i) {
@@ -1761,7 +1768,7 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
                     if (seg_R[p] > 0) {
                         // a segment of one step has no grid barrier: its threadgroups need not all be resident at once
                         ups_R[f] = seg_R[p];
-                        if (plan_t[p] - plan_s[p] > 1 && !ggml_metal_mega_probe_t(queue, ups[f], seg_R[p], seg_T[p], seg_smem[p])) {
+                        if (!foldm && plan_t[p] - plan_s[p] > 1 && !ggml_metal_mega_probe_t(queue, ups[f], seg_R[p], seg_T[p], seg_smem[p])) {
                             fprintf(stderr, "ggml_metal_mega: segment %d is not resident with %d threadgroups\n", p, seg_R[p]);
                             ok = false;
                             break;
@@ -2113,6 +2120,34 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
         if (!dok[i]) sok[r->d[i].step] = false;
     }
 
+    // GGML_METAL_MEGA_BYTES: the weight bytes the mat-vecs of this graph read (once a graph size), by kernel
+    if (getenv("GGML_METAL_MEGA_BYTES")) {
+        static int last_nd = -1;
+        if (nd != last_nd) {
+            last_nd = nd;
+            double tot = 0, by_id = 0, by_mv = 0;
+            int n_id = 0, n_mv = 0;
+            for (int i = 0; i < nd; ++i) {
+                const struct ggml_metal_mega_disp * d = &r->d[i];
+                const char * nm = d->pl->base;
+                if (strncmp(nm, "kernel_mul_mv", 13) != 0 || d->nb < 2 || d->b[0].bytes_off < 0) continue;
+                if (strstr(nm, "_id") && d->b[0].bytes_size == (int) sizeof(ggml_metal_kargs_mul_mv_id)) {
+                    ggml_metal_kargs_mul_mv_id ka;
+                    memcpy(&ka, r->bytes + d->b[0].bytes_off, sizeof(ka));
+                    const double b = (double) ka.nb02*ka.nei0*ka.nei1; // a matrix an expert used (upper bound: no dedup)
+                    by_id += b; tot += b; n_id++;
+                } else if (d->b[0].bytes_size == (int) sizeof(ggml_metal_kargs_mul_mv)) {
+                    ggml_metal_kargs_mul_mv ka;
+                    memcpy(&ka, r->bytes + d->b[0].bytes_off, sizeof(ka));
+                    const double b = (double) ka.ne01*ka.nb01*ka.ne02;
+                    by_mv += b; tot += b; n_mv++;
+                }
+            }
+            fprintf(stderr, "ggml_metal_mega: graph of %d dispatches: weights read %.1f MB (mat-vec %d: %.1f MB, expert %d: %.1f MB)\n",
+                    nd, tot/1e6, n_mv, by_mv/1e6, n_id, by_id/1e6);
+        }
+    }
+
     const int64_t t_flush1 = ggml_time_us();
     bool any_ok = false;
     for (int k = 0; k < ns && !any_ok; ++k) any_ok = sok[k];
@@ -2247,6 +2282,24 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
                 t = s;
             }
         }
+        // GGML_METAL_MEGA_FOLD=N (with GGML_METAL_MEGA_BAKED): a segment is one step and the steps right after it of at
+        // most N threadgroups; the last threadgroup of the first step to finish runs those (no grid barrier, nobody
+        // waits: no residency limit, the first step keeps a threadgroup an item)
+        static int fold = -1;
+        if (fold < 0) fold = getenv("GGML_METAL_MEGA_FOLD") ? atoi(getenv("GGML_METAL_MEGA_FOLD")) : 0;
+        if (fold > 0 && baked && pass == 0) {
+            t = s;
+            if (sok[s]) {
+                t = s + 1;
+                while (t < ns && sok[t] && !(nocoh && cut[t])) {
+                    int n = 0;
+                    for (int i = sfirst[t]; i < sfirst[t + 1]; ++i) n += r->d[i].grid[0]*r->d[i].grid[1]*r->d[i].grid[2];
+                    if (n > fold) break;
+                    ++t;
+                }
+                if (t - s < 2) t = s;
+            }
+        }
         if (baked && pass == 1) {
             // the plan of pass 0 (built or not)
             const bool is_seg = seg_idx < n_plan && plan_s[seg_idx] == s;
@@ -2254,7 +2307,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             seg_cur = is_seg ? seg_idx++ : -1;
         }
         if (pass == 0) {
-            if (t - s >= g_mega.min_steps) {
+            if (t - s >= (fold > 0 ? 2 : g_mega.min_steps)) {
                 plan_s[n_plan] = s;
                 plan_t[n_plan] = t;
                 n_plan++;
@@ -2264,7 +2317,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             }
             continue;
         }
-        if (t - s >= g_mega.min_steps && g_mega.ring[ri].n_ctr < 1024) {
+        if ((seg_cur >= 0 || t - s >= g_mega.min_steps) && t > s && g_mega.ring[ri].n_ctr < 1024) {
             // steps [s, t) in one persistent dispatch
             const int e0 = sfirst[s], e1 = sfirst[t];
             const size_t ctr_sz = 256 + 4*(size_t) (t - s); // counter, timeouts, (at +128) the flag of GGML_METAL_MEGA_FLAGBAR, (at +256) the item counters of GGML_METAL_MEGA_DYNAMIC

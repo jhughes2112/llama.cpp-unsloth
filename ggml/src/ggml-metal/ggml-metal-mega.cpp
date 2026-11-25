@@ -624,8 +624,26 @@ static std::string seg_kernel(int si, const ggml_metal_mega_sched_entry * ents, 
     static const int  T   = getenv("GGML_METAL_MEGA_TPT") ? atoi(getenv("GGML_METAL_MEGA_TPT")) : 256;
     static const uint64_t pf_max = getenv("GGML_METAL_MEGA_PF") ? strtoull(getenv("GGML_METAL_MEGA_PF"), nullptr, 0) : 0;
     const int e_base = step_e0[s0];
+    // GGML_METAL_MEGA_FOLD: after the first step, the last threadgroup to finish it runs the rest alone (as threadgroup 0
+    // of 1); the others return
+    static const bool fold = getenv("GGML_METAL_MEGA_FOLD") != nullptr;
+    if (fold) {
+        k += "    threadgroup uint mega_last;\n";
+    }
     for (int s = s0; s < s1; ++s) {
-        if (s > s0) {
+        if (fold && s > s0) {
+            if (s == s0 + 1) {
+                k += "    threadgroup_barrier(mem_flags::mem_device);\n"
+                     "    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);\n"
+                     "    if (ti == 0) { mega_last = atomic_fetch_add_explicit(bar, 1u, memory_order_relaxed) == R - 1 ? 1u : 0u; }\n"
+                     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                     "    if (mega_last == 0) { return; }\n"
+                     "    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);\n";
+            } else {
+                k += "    threadgroup_barrier(mem_flags::mem_device);\n";
+            }
+            k += "    {\n    const uint tg = 0; const uint R = 1; (void) tg; (void) R;\n";
+        } else if (s > s0) {
             const std::string pf = pf_max ? seg_prefetch(ents, step_e0, s, e_base, pf_max) : std::string();
             if (pf.empty()) {
                 k += "    MEGA_SEG_BARRIER(" + std::to_string(s - s0) + ")\n";
@@ -707,6 +725,9 @@ static std::string seg_kernel(int si, const ggml_metal_mega_sched_entry * ents, 
             }
             k += item;
             off += e.n_items;
+        }
+        if (fold && s > s0) {
+            k += "    }\n";
         }
     }
     k += "    if (pf_sink == 0x9e3779b9u && ti == 7) { atomic_fetch_add_explicit(bar + 2, 0u, memory_order_relaxed); }\n";
