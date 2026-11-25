@@ -3531,7 +3531,8 @@ template [[host_name("kernel_mul_mv_id_nvfp4_f32")]]   kernel kernel_mul_mv_id_t
 // kernel_expert_situ_f32 gone). a simdgroup computes 2 gate rows and the 2 up rows of the same channels, with the
 // lane layout of kernel_mul_mv_nvfp4_f32_impl (the same sums in the same order); it writes the raw rows too (dst) and
 // the activation (act). threadgroup memory: the byte table, 1 KB
-kernel void kernel_mul_mv_id_nvfp4_situ(
+template <bool TOPK>
+static inline void kernel_mul_mv_id_nvfp4_situ_impl(
         constant ggml_metal_kargs_mul_mv_id_situ & args,
         device const char  * src0s,
         device const char  * src1,
@@ -3539,21 +3540,115 @@ kernel void kernel_mul_mv_id_nvfp4_situ(
         device const char  * ids,
         device const float * scale,
         device       float * act,
-        threadgroup  char  * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]],
-        ushort NSG  [[simdgroups_per_threadgroup]]) {
+        constant ggml_metal_kargs_situ_topk * tap,
+        device const float * logits,
+        device const float * pbias,
+        device       float * weights,
+        threadgroup  char  * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort NSG) {
     threadgroup half2 * lut = (threadgroup half2 *) shmem;
+    threadgroup int   * sh_ids = (threadgroup int *) (shmem + 1024);
     for (short j = sgitg*32 + tiisg; j < 256; j += NSG*32) {
         lut[j] = half2((half) kvalues_mxfp4_f[j & 15], (half) kvalues_mxfp4_f[j >> 4]);
     }
+
+    if (TOPK && sgitg == 0) {
+        constant ggml_metal_kargs_situ_topk & ta = *tap;
+        // the router top-k of kernel_topk_moe_f32 (one token, at most 128 experts: 4 a lane); every threadgroup
+        // selects for itself, threadgroup 0 of slot 0 also writes the ids and the weights for the later kernels
+        const int lane = tiisg;
+        float wt[4];
+        float sel[4];
+        float ow = 0.0f;
+        FOR_UNROLL (int i = 0; i < 4; ++i) {
+            const int e = lane + 32*i;
+            const float v = e < ta.n_expert ? logits[e] : -INFINITY;
+            wt[i] = isnan(v) ? -FLT_MAX : v;
+        }
+        if (ta.gating == 1) {
+            FOR_UNROLL (int i = 0; i < 4; ++i) {
+                const float v = wt[i];
+                wt[i] = sqrt(v > 20.0f ? v : log(1.0f + exp(v)));
+            }
+        } else if (ta.gating == 2) {
+            FOR_UNROLL (int i = 0; i < 4; ++i) {
+                wt[i] = 1.0f / (1.0f + exp(-wt[i]));
+            }
+        } else {
+            float mx = -INFINITY;
+            FOR_UNROLL (int i = 0; i < 4; ++i) {
+                mx = max(mx, wt[i]);
+            }
+            mx = simd_max(mx);
+            float sm = 0.0f;
+            FOR_UNROLL (int i = 0; i < 4; ++i) {
+                wt[i] = exp(wt[i] - mx);
+                sm += wt[i];
+            }
+            sm = simd_sum(sm);
+            FOR_UNROLL (int i = 0; i < 4; ++i) {
+                wt[i] *= 1.0f/sm;
+            }
+        }
+        FOR_UNROLL (int i = 0; i < 4; ++i) {
+            const int e = lane + 32*i;
+            sel[i] = e < ta.n_expert ? (ta.pbias ? wt[i] + pbias[e] : wt[i]) : -INFINITY;
+        }
+        float wt_sum = 0.0f;
+        for (int k = 0; k < ta.top_k; ++k) {
+            float best_val = -INFINITY;
+            float best_key = -INFINITY;
+            int   best_expert = -1;
+            FOR_UNROLL (int i = 0; i < 4; ++i) {
+                const int e = lane + 32*i;
+                if (e < ta.n_expert && (sel[i] > best_key || (sel[i] == best_key && e < best_expert))) {
+                    best_val = wt[i];
+                    best_key = sel[i];
+                    best_expert = e;
+                }
+            }
+            FOR_UNROLL (int mask = 16; mask > 0; mask >>= 1) {
+                const float val = simd_shuffle_xor(best_val, mask);
+                const float key = simd_shuffle_xor(best_key, mask);
+                const int   ex  = simd_shuffle_xor(best_expert, mask);
+                if (key > best_key || (key == best_key && ex < best_expert)) {
+                    best_val = val;
+                    best_key = key;
+                    best_expert = ex;
+                }
+            }
+            if ((best_expert & 31) == lane) {
+                sel[best_expert/32] = -INFINITY;
+            }
+            if (k == lane) {
+                ow = best_val;
+            }
+            if (lane == 0) {
+                sh_ids[k] = best_expert;
+            }
+            wt_sum += best_val;
+        }
+        if (tgpig.x == 0 && tgpig.z == 0) {
+            float inv = 1.0f;
+            if (ta.with_norm) {
+                inv = 1.0f/(max(wt_sum, ta.clamp) + ta.bias);
+            }
+            if (lane < ta.top_k) {
+                ((device int32_t *) ids)[lane] = sh_ids[lane];
+                weights[lane] = ow*inv*ta.scale;
+            }
+        }
+    }
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int iid1 = tgpig.z/args.nei0; // token
     const int idx  = tgpig.z%args.nei0; // expert slot
 
-    const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+    const int32_t i02 = TOPK ? sh_ids[idx] : ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
 
     const int ch = (tgpig.x*NSG + sgitg)*2; // first of the 2 channels
 
@@ -3636,6 +3731,44 @@ kernel void kernel_mul_mv_id_nvfp4_situ(
             act_cur[ch + k] = a*(args.ub*precise::tanh(args.ua*u));
         }
     }
+}
+
+[[host_name("kernel_mul_mv_id_nvfp4_situ")]]
+kernel void kernel_mul_mv_id_nvfp4_situ(
+        constant ggml_metal_kargs_mul_mv_id_situ & args,
+        device const char  * src0s,
+        device const char  * src1,
+        device       char  * dst,
+        device const char  * ids,
+        device const float * scale,
+        device       float * act,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort NSG  [[simdgroups_per_threadgroup]]) {
+    kernel_mul_mv_id_nvfp4_situ_impl<false>(args, src0s, src1, dst, ids, scale, act, nullptr, nullptr, nullptr, nullptr, shmem, tgpig, tiisg, sgitg, NSG);
+}
+
+[[host_name("kernel_mul_mv_id_nvfp4_situ_topk")]]
+kernel void kernel_mul_mv_id_nvfp4_situ_topk(
+        constant ggml_metal_kargs_mul_mv_id_situ & args,
+        device const char  * src0s,
+        device const char  * src1,
+        device       char  * dst,
+        device       char  * ids,
+        device const float * scale,
+        device       float * act,
+        constant ggml_metal_kargs_situ_topk & ta,
+        device const float * logits,
+        device const float * pbias,
+        device       float * weights,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort NSG  [[simdgroups_per_threadgroup]]) {
+    kernel_mul_mv_id_nvfp4_situ_impl<true>(args, src0s, src1, dst, ids, scale, act, &ta, logits, pbias, weights, shmem, tgpig, tiisg, sgitg, NSG);
 }
 
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;

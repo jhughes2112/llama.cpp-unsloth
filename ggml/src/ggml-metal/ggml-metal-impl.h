@@ -1537,6 +1537,18 @@ typedef struct {
     float    scale;
 } ggml_metal_kargs_topk_moe;
 
+// the top-k of the MoE router inside the expert gate_up kernel (kernel_mul_mv_id_nvfp4_situ_topk), one token
+typedef struct {
+    int32_t n_expert;  // <= 128
+    int32_t top_k;     // <= 32
+    int32_t gating;    // 0 softmax, 1 sqrt(softplus), 2 sigmoid
+    int32_t pbias;     // selection bias
+    int32_t with_norm;
+    float   clamp;
+    float   bias;
+    float   scale;
+} ggml_metal_kargs_situ_topk;
+
 typedef struct {
     int32_t ne00; // n_embd
     int32_t ne02; // n_tokens

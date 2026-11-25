@@ -351,6 +351,22 @@ static bool ggml_mem_ranges_check_dst(ggml_mem_ranges_t mrs, const ggml_tensor *
     return res;
 }
 
+bool ggml_mem_ranges_add_read(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+    return ggml_mem_ranges_add_src(mrs, tensor);
+}
+
+bool ggml_mem_ranges_check_read(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+    return ggml_mem_ranges_check_src(mrs, tensor);
+}
+
+bool ggml_mem_ranges_add_write(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+    return ggml_mem_ranges_add_dst(mrs, tensor);
+}
+
+bool ggml_mem_ranges_check_write(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+    return ggml_mem_ranges_check_dst(mrs, tensor);
+}
+
 bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (tensor->src[i]) {
