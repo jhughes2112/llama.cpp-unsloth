@@ -289,6 +289,20 @@ static const char * k_kernel = R"(
 #undef threadgroup
 MEGA_UNDEF_ATTRS
 
+// the next item of a threadgroup: every R-th, or (dyn) the next free one of the step's counter (all threads of the
+// threadgroup call it, also the ones that sat out an item)
+static inline uint mega_next(uint g, uint R, bool dyn, device atomic_uint * ctr, threadgroup uint * tgn, ushort ti) {
+    if (!dyn) {
+        return g + R;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ti == 0) {
+        *tgn = R + atomic_fetch_add_explicit(ctr, 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return *tgn;
+}
+
 // the persistent kernel: walks the steps, the threadgroups of a step's dispatches shared out over its own
 // threadgroups, a grid barrier between two steps
 kernel void kernel_mega(
@@ -304,6 +318,7 @@ kernel void kernel_mega(
     // a wait that timed out (a threadgroup that never started: the GPU is shared) ends the whole dispatch at the
     // next barrier, so that it never holds the GPU for more than one wait
     threadgroup uint aborted;
+    threadgroup uint next_item;
     if ((P.pad[1] & 0xff) == 1) {
         return; // GGML_METAL_MEGA_STOP=1: the dispatch alone
     }
@@ -313,7 +328,10 @@ kernel void kernel_mega(
         const bool work = (P.pad[1] & 0xff) != 2 && (P.pad[2] == 0 || s + 1 < P.pad[2]); // STOP=2: steps and barriers only; UPTO
         // STOP=4: each threadgroup only its first item of a step; STOP=5: only item 0, on threadgroup 0
         const uint g_end = (P.pad[1] & 0xff) == 4 ? min(ni, tg + 1) : (P.pad[1] & 0xff) == 5 ? (tg == 0 ? min(ni, 1u) : 0u) : ni;
-        for (uint g = tg; g < g_end && work; g += R) {
+        // GGML_METAL_MEGA_DYNAMIC: after its first item a threadgroup takes the next free one from a counter of the
+        // step (instead of every R-th), so that one that finishes early does more
+        const bool dyn = (P.pad[1] & 0x400) != 0;
+        for (uint g = tg; g < g_end && work; g = mega_next(g, R, dyn, bar + 64 + s, &next_item, ti)) {
             uint e  = e0;
             uint gi = g;
             while (gi >= (uint) E[e].n_items) { gi -= E[e].n_items; ++e; }
