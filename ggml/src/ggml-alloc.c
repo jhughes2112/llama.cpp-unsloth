@@ -625,8 +625,15 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         hn->allocated = true;
         assert(hn->addr.offset == 0);
 
+        // GGML_ALLOC_NO_REUSE: every tensor of a graph gets memory of its own, never a parent's or a freed one, on
+        // a 256-byte boundary (GGML_METAL_MEGA: plain cached loads then never see a line that another core rewrote)
+        static int no_reuse = -1;
+        if (no_reuse < 0) {
+            no_reuse = getenv("GGML_ALLOC_NO_REUSE") != NULL;
+        }
+
         // try to reuse a parent's buffer (inplace)
-        if (ggml_op_can_inplace(node->op)) {
+        if (!no_reuse && ggml_op_can_inplace(node->op)) {
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 struct ggml_tensor * parent = node->src[i];
                 if (parent == NULL) {
@@ -680,12 +687,23 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
         ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
+        if (no_reuse) {
+            size = (size + 255) & ~(size_t) 255;
+        }
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
     }
 }
 
 static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
+    // GGML_ALLOC_NO_REUSE: nothing is freed within a graph
+    static int no_reuse = -1;
+    if (no_reuse < 0) {
+        no_reuse = getenv("GGML_ALLOC_NO_REUSE") != NULL;
+    }
+    if (no_reuse) {
+        return;
+    }
     // graph outputs are never freed
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
         AT_PRINTF("not freeing output %s\n", node->name);

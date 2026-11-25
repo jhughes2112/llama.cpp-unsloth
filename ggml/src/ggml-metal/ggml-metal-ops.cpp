@@ -627,7 +627,31 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
         ggml_metal_timeline_label(lab);
     }
 
+    const int n_disp0 = ggml_metal_encoder_mega_n_disp(ctx->enc);
+
     int res = ggml_metal_op_encode_impl(ctx, idx);
+
+    if (n_disp0 >= 0 && res > 0) {
+        // GGML_METAL_MEGA: the memory the dispatches of these nodes read and write (weights left out: never written)
+        // all the nodes of a fused group (fusions here merge up to GGML_METAL_FUSION_MAX nodes)
+        std::vector<uint64_t> rr(2*GGML_MAX_SRC*(size_t) res);
+        std::vector<uint64_t> ww(2*(size_t) res);
+        int nr = 0, nw = 0;
+        for (int i = 0; i < res; ++i) {
+            const ggml_tensor * t = ctx->node(idx + i);
+            if (t->data) {
+                ww[2*nw] = (uint64_t) (uintptr_t) t->data; ww[2*nw + 1] = ww[2*nw] + ggml_nbytes(t); nw++;
+            }
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                const ggml_tensor * s = t->src[j];
+                if (!s || !s->data) continue;
+                const ggml_tensor * b = s->view_src ? s->view_src : s;
+                if (b->buffer && ggml_backend_buffer_get_usage(b->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) continue;
+                rr[2*nr] = (uint64_t) (uintptr_t) s->data; rr[2*nr + 1] = rr[2*nr] + ggml_nbytes(s); nr++;
+            }
+        }
+        ggml_metal_encoder_mega_ranges(ctx->enc, n_disp0, rr.data(), nr, ww.data(), nw);
+    }
 
     {
         // profiling aid: GGML_METAL_PROFILE_DUP=,CONCAT*8,MUL_MAT*1, runs the kernels of the named ops (with the number

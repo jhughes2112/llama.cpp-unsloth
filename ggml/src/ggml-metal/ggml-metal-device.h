@@ -109,6 +109,11 @@ void ggml_metal_timeline_label(const char * s);
 // GGML_METAL_MEGA: the next encoder made on this thread records its graph for the persistent kernel
 void ggml_metal_mega_next_encoder(void);
 
+// GGML_METAL_MEGA: dispatches recorded so far (-1: not a recording encoder), and the memory that the ones from
+// first_disp on read (rr) and write (ww), as [lo, hi) pairs
+int  ggml_metal_encoder_mega_n_disp(ggml_metal_encoder_t encoder);
+void ggml_metal_encoder_mega_ranges(ggml_metal_encoder_t encoder, int first_disp, const uint64_t * rr, int nr, const uint64_t * ww, int nw);
+
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
 //

@@ -104,6 +104,17 @@ static std::string drop_kernels(const std::string & src) {
 }
 
 // function constants become compile-time constants of the namespace
+// GGML_METAL_MEGA_COHSTORE: every device pointer that is not const becomes coherent (stores), const ones stay plain
+static std::string coherent_stores(const std::string & src) {
+    // "const device T" is the same type as "device const T": spell it that way first
+    static const std::regex re_cd(R"(\bconst(\s+)device\b)");
+    static const std::regex re(R"(\bdevice\b(?!\s+const\b))");
+    // "device const T * p = (device T *)(...)": a cast that only drops const to read, keep it plain
+    static const std::regex re_rd(R"((device\s+const\s+[\w:<>]+\s*\*\s*\w+\s*=\s*\()coherent\(device\) device(\s+[\w:<>]+\s*\*\s*\)))");
+    std::string s = std::regex_replace(std::regex_replace(src, re_cd, "device$1const"), re, "coherent(device) device");
+    return std::regex_replace(s, re_rd, "$1device const$2");
+}
+
 static std::string rewrite_fc(const std::string & src) {
     static const std::regex re(R"(constant[ \t]+(\w+)[ \t]+(\w+)[ \t]*\[\[[ \t]*function_constant\((.*)\)[ \t]*\]\][ \t]*;)");
     return std::regex_replace(src, re, "constant constexpr $1 $2 = ($1) mega_fc($3);");
@@ -234,6 +245,7 @@ struct mega_bind {
     template<typename T> operator constant T & () const { return *(constant T *) a; }
     template<typename T> operator constant T * () const { return (constant T *) a; }
     template<typename T> operator device   T * () const { return (device T *) p; }
+    template<typename T> operator device const T * () const { return (device const T *) p; }
 };
 struct mega_tg {
     threadgroup char * p;
@@ -458,11 +470,17 @@ char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, 
     src += "#include <metal_stdlib>\nusing namespace metal;\n";
     // GGML_METAL_MEGA_NOCOH: plain pointers (results are wrong: a threadgroup can read a stale line of what another
     // wrote in the step before; for timing the cost of the coherent loads only)
-    if (!getenv("GGML_METAL_MEGA_NOCOH")) {
+    // GGML_METAL_MEGA_COHSTORE: only the pointers a kernel can write through are coherent; device const pointers are
+    // plain, cached loads. measured (stepbench/coh3.m): plain stores leave a core with a line that has its own part new
+    // and other cores' parts old (rows written by several threadgroups share lines), coherent stores do not, and plain
+    // loads are then right as long as nothing was read or written at those addresses earlier in the dispatch
+    // (GGML_ALLOC_NO_REUSE, and the stale-line cut of ggml_metal_mega_stale)
+    const bool cohstore = getenv("GGML_METAL_MEGA_COHSTORE") != nullptr;
+    if (!getenv("GGML_METAL_MEGA_NOCOH") && !cohstore) {
         src += "#define device coherent(device) device\n";
     }
-    src += hdr;
-    src += k_prelude;
+    src += cohstore ? coherent_stores(hdr) : std::string(hdr);
+    src += cohstore ? coherent_stores(k_prelude) : std::string(k_prelude);
     for (const char * a : k_attrs) {
         src += std::string("#define ") + a + "\n";
     }
@@ -496,6 +514,9 @@ char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, 
             ns_kind.push_back(p.kind);
             if (kind_proc[p.kind].empty()) {
                 kind_proc[p.kind] = rewrite_fc(drop_kernels(kind_srcs[p.kind]));
+                if (getenv("GGML_METAL_MEGA_COHSTORE")) {
+                    kind_proc[p.kind] = coherent_stores(kind_proc[p.kind]);
+                }
             }
             ns_src.push_back(kind_proc[p.kind]);
             pipe_ns[i] = n;
@@ -570,7 +591,7 @@ char * ggml_metal_mega_source(const char * hdr, const char * const * kind_srcs, 
     for (const char * a : k_attrs) {
         undef += std::string("#undef ") + a + "\n";
     }
-    std::string kern = replace_all(k_kernel, "MEGA_UNDEF_ATTRS", undef);
+    std::string kern = replace_all(cohstore ? coherent_stores(k_kernel) : std::string(k_kernel), "MEGA_UNDEF_ATTRS", undef);
     kern = replace_all(kern, "MEGA_CASES\n", cases);
     src += kern;
 

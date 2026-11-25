@@ -45,6 +45,8 @@ struct ggml_metal_library;
 static void ggml_metal_mega_set_library(struct ggml_metal_library * lib);
 static void ggml_metal_mega_forget_library(struct ggml_metal_library * lib);
 static bool ggml_metal_mega_included(const char * base);
+struct ggml_metal_mega_rec;
+static bool ggml_metal_mega_stale(const struct ggml_metal_mega_rec * r, int seg_d0, int d0, int d1);
 
 //
 // MTLFunctionConstantValues wrapper
@@ -1320,6 +1322,7 @@ struct ggml_metal_mega_disp {
     int    grid[3];
     int    tptg[3];
     int    step;
+    int    r0, r1;  // its memory ranges in rec->rng (GGML_METAL_MEGA_NOCOH: the stale-line check)
 };
 
 struct ggml_metal_mega_rec {
@@ -1331,6 +1334,8 @@ struct ggml_metal_mega_rec {
     bool step_used;     // the current step has a dispatch
     bool failed;        // something it cannot record: encode as usual
     struct ggml_metal_mega_disp cur;
+    struct { uint64_t lo, hi; int w; } * rng; // memory ranges of the dispatches (w: written)
+    int n_rng, cap_rng;
 };
 
 static struct {
@@ -1804,10 +1809,49 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
     #define MEGA_ALLOC(sz) ({ cursor = (cursor + 255) & ~(size_t) 255; size_t _o = cursor; cursor += (sz); _o; })
 
     const int64_t t_flush2 = ggml_time_us();
+
+    // GGML_METAL_MEGA_NOCOH: steps where a persistent dispatch must end so that no plain load can see a stale line.
+    // the same graph has the same ranges every token: worked out once a signature
+    static int nocoh = -1;
+    if (nocoh < 0) nocoh = (getenv("GGML_METAL_MEGA_NOCOH") != NULL || getenv("GGML_METAL_MEGA_COHSTORE") != NULL) && getenv("GGML_METAL_MEGA_NOSTALECHECK") == NULL;
+    static uint64_t cut_sig = 0;
+    static bool * cut = NULL;
+    static int cut_n = 0;
+    if (nocoh) {
+        uint64_t sig = 1469598103934665603ull ^ (uint64_t) nd ^ ((uint64_t) ns << 32);
+        for (int i = 0; i < r->n_rng; ++i) {
+            sig = (sig ^ r->rng[i].lo)*1099511628211ull;
+            sig = (sig ^ (r->rng[i].hi + (uint64_t) r->rng[i].w))*1099511628211ull;
+        }
+        for (int k = 0; k < ns; ++k) sig = (sig ^ (uint64_t) sok[k])*1099511628211ull;
+        if (sig != cut_sig || cut_n != ns) {
+            const int64_t tc = ggml_time_us();
+            free(cut);
+            cut = calloc(ns + 1, sizeof(bool));
+            cut_n = ns;
+            cut_sig = sig;
+            int seg = 0, n_cut = 0;
+            for (int k = 0; k < ns; ++k) {
+                if (!sok[k]) { seg = k + 1; continue; }
+                if (k > seg && ggml_metal_mega_stale(r, sfirst[seg], sfirst[k], sfirst[k + 1])) {
+                    cut[k] = true;
+                    seg = k;
+                    n_cut++;
+                }
+            }
+            int n_w = 0;
+            for (int i = 0; i < r->n_rng; ++i) n_w += r->rng[i].w;
+            fprintf(stderr, "ggml_metal_mega: plain loads: %d dispatch ends for stale lines (%d ranges, %d written; worked out in %.1f ms)\n",
+                    n_cut, r->n_rng, n_w, (ggml_time_us() - tc)/1e3);
+        }
+    }
+
     int s = 0;
     while (s < ns) {
         int t = s;
-        while (t < ns && sok[t]) ++t;
+        static int cut_every = -1;
+        if (cut_every < 0) cut_every = getenv("GGML_METAL_MEGA_CUT_EVERY") ? atoi(getenv("GGML_METAL_MEGA_CUT_EVERY")) : 0;
+        while (t < ns && sok[t] && !(nocoh && t > s && cut[t]) && !(cut_every > 0 && t - s >= cut_every)) ++t;
         if (t - s >= g_mega.min_steps && g_mega.ring[ri].n_ctr < 1024) {
             // steps [s, t) in one persistent dispatch
             const int e0 = sfirst[s], e1 = sfirst[t];
@@ -1962,13 +2006,66 @@ static struct ggml_metal_mega_rec * ggml_metal_mega_rec_init(void) {
 }
 
 static void ggml_metal_mega_rec_free(struct ggml_metal_mega_rec * r) {
-    const int64_t t0 = ggml_time_us();
     free(r->d);
     free(r->bytes);
+    free(r->rng);
     free(r);
-    static int64_t s = 0; static int n = 0;
-    s += ggml_time_us() - t0;
-    if (++n % 16 == 0 && getenv("GGML_METAL_PROFILE")) fprintf(stderr, "ggml_metal_mega: rec_free %.0f us\n", (double) s/n);
+}
+
+int ggml_metal_encoder_mega_n_disp(ggml_metal_encoder_t encoder) {
+    return encoder->mega ? encoder->mega->n : -1;
+}
+
+void ggml_metal_encoder_mega_ranges(ggml_metal_encoder_t encoder, int first_disp, const uint64_t * rr, int nr, const uint64_t * ww, int nw) {
+    struct ggml_metal_mega_rec * r = encoder->mega;
+    if (!r || first_disp >= r->n) return;
+    if (r->n_rng + nr + nw > r->cap_rng) {
+        r->cap_rng = MAX(2*r->cap_rng, r->n_rng + nr + nw + 4096);
+        r->rng = realloc(r->rng, r->cap_rng*sizeof(*r->rng));
+    }
+    const int r0 = r->n_rng;
+    for (int i = 0; i < nr; ++i) { r->rng[r->n_rng].lo = rr[2*i]; r->rng[r->n_rng].hi = rr[2*i + 1]; r->rng[r->n_rng].w = 0; r->n_rng++; }
+    for (int i = 0; i < nw; ++i) { r->rng[r->n_rng].lo = ww[2*i]; r->rng[r->n_rng].hi = ww[2*i + 1]; r->rng[r->n_rng].w = 1; r->n_rng++; }
+    for (int i = first_disp; i < r->n; ++i) {
+        r->d[i].r0 = r0;
+        r->d[i].r1 = r->n_rng;
+    }
+}
+
+// GGML_METAL_MEGA_NOCOH (plain cached loads): could a step read a stale line, given the steps before it in the same
+// persistent dispatch? that needs a range it reads, written by an earlier step j of the dispatch, and touched
+// (read or written) by a step before j: a core may still hold the line from that access. ranges are 128-byte lines
+static bool ggml_metal_mega_stale(const struct ggml_metal_mega_rec * r, int seg_d0, int d0, int d1) {
+    #define LN(x) ((x) & ~(uint64_t) 255)
+    #define HN(x) (((x) + 255) & ~(uint64_t) 255)
+    for (int i = d0; i < d1; ++i) {
+        const struct ggml_metal_mega_disp * d = &r->d[i];
+        for (int a = d->r0; a < d->r1; ++a) {
+            if (r->rng[a].w) continue;
+            const uint64_t lo = LN(r->rng[a].lo), hi = HN(r->rng[a].hi);
+            // writes in the dispatch before this step that overlap
+            for (int j = seg_d0; j < d0; ++j) {
+                const struct ggml_metal_mega_disp * dj = &r->d[j];
+                for (int b = dj->r0; b < dj->r1; ++b) {
+                    if (!r->rng[b].w) continue;
+                    const uint64_t wlo = MAX(lo, LN(r->rng[b].lo)), whi = MIN(hi, HN(r->rng[b].hi));
+                    if (wlo >= whi) continue;
+                    // anything touching [wlo, whi) in dj s step or before (an in-place op reads and writes in one step)
+                    for (int k = seg_d0; k < d0 && r->d[k].step <= dj->step; ++k) {
+                        const struct ggml_metal_mega_disp * dk = &r->d[k];
+                        for (int c = dk->r0; c < dk->r1; ++c) {
+                            // in the writer's own step only reads count (the write itself is not an earlier touch)
+                            if (dk->step == dj->step && r->rng[c].w) continue;
+                            if (MAX(wlo, LN(r->rng[c].lo)) < MIN(whi, HN(r->rng[c].hi))) return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #undef LN
+    #undef HN
+    return false;
 }
 
 // GGML_METAL_KERNEL_LIST=file,skip,count: every dispatch after the first skip ones: kernel, grid, threads, threadgroup
