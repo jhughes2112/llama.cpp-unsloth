@@ -454,9 +454,13 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 inputs[0] = inputs[1] = inputs[2] = ggml_reshape_2d(ctx0, mixed, n_embd, n_tokens);
             } else {
                 for (int j = 0; j < 3; ++j) {
-                    // a SWA layer reads the same column three times: copy it once
+                    // a SWA layer reads the same column three times: copy it once. one token is contiguous where it
+                    // is: no copy (3 copies in a step of their own a layer, ~0.1 ms a token)
+                    const int64_t col = (is_swa ? 0 : j);
                     inputs[j] = is_swa && j > 0 ? inputs[0] :
-                        ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+                        n_tokens == 1 ?
+                        ggml_view_2d(ctx0, mixed, n_embd, 1, mixed->nb[1], col*mixed->nb[1]) :
+                        ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], col*mixed->nb[1]));
                 }
             }
         }
