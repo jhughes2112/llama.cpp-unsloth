@@ -871,6 +871,17 @@ typedef struct {
     float    b;
 } ggml_metal_kargs_reduce_conv;
 
+// the NVFP4 expert down projection of one token with the weighted reduce and the conv in its epilogue
+typedef struct {
+    int32_t  ne00;  // inputs of a row
+    int32_t  ne0;   // rows (channels)
+    int32_t  nei0;  // experts used (= simdgroups of a threadgroup)
+    int32_t  pad;   // 1: the raw rows are not written (the output took their memory: nothing else reads them)
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb11;  // from one expert slot of the input to the next
+} ggml_metal_kargs_mul_mv_id_rc;
+
 typedef struct {
     int32_t  nc;       // taps
     int32_t  C;        // channels
