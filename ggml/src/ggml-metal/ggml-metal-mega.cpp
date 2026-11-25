@@ -556,7 +556,7 @@ static const char * k_seg_barrier = R"(
 #ifdef MEGA_NOCALL
 #define MEGA_CALL(x)
 #else
-#define MEGA_CALL(x) x
+#define MEGA_CALL(x) if (!probe) { x; }
 #endif
 )";
 
@@ -571,7 +571,7 @@ static std::string seg_prefetch(const ggml_metal_mega_sched_entry * ents, const 
         const auto & e = ents[ei];
         if (e.pf_bind >= 0 && e.pf_slice > 0) {
             if (!any) {
-                k += "    {\n        uint pf_acc = 0;\n        ulong pf_spent = 0;\n";
+                k += "    if (!probe) {\n        uint pf_acc = 0;\n        ulong pf_spent = 0;\n";
                 any = true;
             }
             char buf[2048];
@@ -616,7 +616,8 @@ static std::string seg_kernel(int si, const ggml_metal_mega_sched_entry * ents, 
          "        ushort ti [[thread_index_in_threadgroup]],\n"
          "        ushort T_ [[threads_per_threadgroup]]) {\n"
          "    threadgroup uint aborted;\n"
-         "    uint pf_sink = 0;\n";
+         "    uint pf_sink = 0;\n"
+         "    const bool probe = (P.pad[1] & 0xffff0000u) == 0x7e570000u; // the residency probe: barriers only\n";
     // GGML_METAL_MEGA_SEGRET: every segment kernel returns at once (timing the launches alone)
     if (getenv("GGML_METAL_MEGA_SEGRET")) k += "    return;\n";
     static const bool pfn = getenv("GGML_METAL_MEGA_PFN") != nullptr;
@@ -675,12 +676,19 @@ static std::string seg_kernel(int si, const ggml_metal_mega_sched_entry * ents, 
             // GGML_METAL_MEGA_PFN: before an item, load the lines of the next item of this threadgroup (gi + R) into
             // registers that are only used after the item: the loads are in flight while it computes
             std::string item = buf;
+            if (!e.idle_ok || e.smem_lane > 0) {
+                // a kernel with barriers (or threadgroup memory) ends without one: before the next item of this
+                // threadgroup writes threadgroup memory, every thread must be done with this item's (garbage, KLD 0.8-10,
+                // once a threadgroup ran several items of a step)
+                const size_t z = item.rfind("    }\n");
+                item.insert(z, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+            }
             if (pfn && e.pf_bind >= 0 && e.pf_slice > 0 && e.n_items > 1) {
                 const uint64_t ib = e.pf_slice*e.vl; // bytes an item
                 int nl = (int) ((ib + 128ull*T - 1)/(128ull*T));
                 if (nl > 8) nl = 8;
                 std::string pre = "        uint pfr[" + std::to_string(nl) + "] = {};\n"
-                                  "        if (gi + R < " + std::to_string(e.n_items) + "u) {\n"
+                                  "        if (!probe && gi + R < " + std::to_string(e.n_items) + "u) {\n"
                                   "            device const uchar * w = (device const uchar *) E[" + std::to_string(ei - e_base) + "].p[" + std::to_string(e.pf_bind) + "];\n"
                                   "            const ulong b0 = (ulong) (gi + R)*" + std::to_string(ib) + "ul;\n"
                                   "            const ulong b1 = min(b0 + " + std::to_string(ib) + "ul, " + std::to_string(e.pf_total) + "ul);\n";

@@ -1436,13 +1436,17 @@ static char * ggml_metal_mega_kind_text(ggml_metal_library_t lib, int kind, bool
 
 // can R threadgroups of the persistent kernel all be on the GPU at once? (else a grid barrier waits for one that never
 // starts) two empty steps with a barrier between them and a short spin limit
-static bool ggml_metal_mega_probe(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pso, int R) {
+// a baked segment kernel (GGML_METAL_MEGA_BAKED) told by P.pad[1] to run only its barriers
+#define GGML_METAL_MEGA_PROBE_MAGIC 0x7e570000u
+
+static bool ggml_metal_mega_probe_t(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pso, int R, int T, int smem) {
     id<MTLBuffer> b = [[queue device] newBufferWithLength:4096 options:MTLResourceStorageModeShared];
     memset([b contents], 0, 4096);
     ggml_metal_mega_step * st = (ggml_metal_mega_step *) ((char *) [b contents] + 256);
     st[0].e0 = st[0].e1 = st[0].n_items = 0;
     st[1].e0 = st[1].e1 = st[1].n_items = 0;
-    ggml_metal_mega_params prm = { 2, { 1u << 14, 0, 0 } };
+    // STOP=2 for kernel_mega (barriers only), the probe flag for a baked segment kernel
+    ggml_metal_mega_params prm = { 2, { 1u << 14, GGML_METAL_MEGA_PROBE_MAGIC | 2u, 0 } };
     id<MTLCommandBuffer> cmd = [queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:pso];
@@ -1452,14 +1456,18 @@ static bool ggml_metal_mega_probe(id<MTLCommandQueue> queue, id<MTLComputePipeli
     [enc setBuffer:b offset:0    atIndex:3];
     [enc setBytes:&prm length:sizeof(prm) atIndex:4];
     // as much threadgroup memory as a dispatch may take (see ggml_metal_mega_layout): fewer threadgroups fit with more
-    [enc setThreadgroupMemoryLength:32768 atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(R, 1, 1) threadsPerThreadgroup:MTLSizeMake(GGML_METAL_MEGA_THREADS, 1, 1)];
+    [enc setThreadgroupMemoryLength:(smem + 15) & ~15 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(R, 1, 1) threadsPerThreadgroup:MTLSizeMake(T, 1, 1)];
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
     const bool ok = ((const uint32_t *) [b contents])[1] == 0 && [cmd status] == MTLCommandBufferStatusCompleted;
     [b release];
     return ok;
+}
+
+static bool ggml_metal_mega_probe(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pso, int R) {
+    return ggml_metal_mega_probe_t(queue, pso, R, GGML_METAL_MEGA_THREADS, 32768);
 }
 
 // a pipeline of the megakernel library that is told how many threads a threadgroup it is dispatched with: by default the
@@ -1569,8 +1577,13 @@ static struct {
     uint64_t sig;
     int      n_segs;
     id<MTLComputePipelineState> * psos;
+    int    * T;      // threads a threadgroup of each segment
+    int    * R;      // threadgroups of each segment
+    int    * smem;   // threadgroup memory of each segment
     bool     failed;
 } g_baked = { 0 };
+
+static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_metal_mega_entry * e);
 
 static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml_metal_mega_entry * ent, const int * sfirst,
                                       const int * plan_s, const int * plan_t, int n_plan) {
@@ -1601,8 +1614,57 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
     int * step_e0 = malloc((n_stp + 1)*sizeof(int));
     int * seg_s0  = malloc((n_plan + 1)*sizeof(int));
     int ie = 0, is = 0;
+    int * seg_T    = malloc(n_plan*sizeof(int));
+    int * seg_smem = malloc(n_plan*sizeof(int));
+    int * seg_R    = malloc(n_plan*sizeof(int));
+    static int segt = -1;
+    if (segt < 0) segt = getenv("GGML_METAL_MEGA_SEGT") != NULL;
     for (int p = 0; p < n_plan; ++p) {
         seg_s0[p] = is;
+        // GGML_METAL_MEGA_SEGT: the segment's threadgroups as wide as its widest kernel (a kernel of 64 threads is not
+        // packed 8 to a threadgroup of 512: such a threadgroup starts only when a core has room for all 512 threads
+        // and ends with its slowest lane), laid out again for that width
+        const int i0 = sfirst[plan_s[p]], i1 = sfirst[plan_t[p]];
+        ggml_metal_mega_entry * lay = malloc((i1 - i0)*sizeof(*lay));
+        int T_seg = GGML_METAL_MEGA_THREADS;
+        bool relaid = false;
+        if (segt) {
+            // the candidate widths: those of its kernels; SEGT=1 the widest, SEGT=2 the narrowest every kernel can run at
+            // (barrier-free wide kernels loop over virtual threads, the whitelisted norms stride)
+            static int segt_mode = -1;
+            if (segt_mode < 0) segt_mode = atoi(getenv("GGML_METAL_MEGA_SEGT"));
+            int cand[64], nc = 0;
+            for (int i = i0; i < i1; ++i) {
+                const int t = MIN((r->d[i].tptg[0]*r->d[i].tptg[1]*r->d[i].tptg[2] + 31) & ~31, 1024);
+                bool have = false;
+                for (int c = 0; c < nc; ++c) if (cand[c] == t) have = true;
+                if (!have && nc < 64) cand[nc++] = t;
+            }
+            for (int a = 0; a < nc; ++a) for (int b = a + 1; b < nc; ++b) {
+                if (segt_mode == 2 ? cand[b] < cand[a] : cand[b] > cand[a]) { const int x = cand[a]; cand[a] = cand[b]; cand[b] = x; }
+            }
+            const int T_old = g_mega_T;
+            for (int c = 0; c < nc && !relaid; ++c) {
+                g_mega_T = cand[c];
+                bool ok_all = true;
+                for (int i = i0; i < i1 && ok_all; ++i) ok_all = ggml_metal_mega_layout(&r->d[i], &lay[i - i0]);
+                if (ok_all) { T_seg = cand[c]; relaid = true; }
+            }
+            g_mega_T = T_old;
+        }
+        if (!relaid) memcpy(lay, ent + i0, (i1 - i0)*sizeof(*lay));
+        seg_T[p] = T_seg;
+        seg_smem[p] = 16;
+        int max_items = 1;
+        for (int i = i0; i < i1; ++i) { seg_smem[p] = MAX(seg_smem[p], lay[i - i0].lanes*lay[i - i0].smem_lane); }
+        // threadgroups: a segment of one step has no barrier, so one an item (GGML_METAL_MEGA_SEGT); otherwise as many
+        // as are resident (worked out when its pipeline is built)
+        for (int k = plan_s[p]; k < plan_t[p]; ++k) {
+            int n = 0;
+            for (int i = sfirst[k]; i < sfirst[k + 1]; ++i) n += lay[i - i0].n_items;
+            max_items = MAX(max_items, n);
+        }
+        seg_R[p] = (segt && plan_t[p] - plan_s[p] == 1) ? max_items : (segt ? -max_items : g_mega.R);
         for (int k = plan_s[p]; k < plan_t[p]; ++k) {
             step_e0[is++] = ie;
             for (int i = sfirst[k]; i < sfirst[k + 1]; ++i) {
@@ -1612,7 +1674,7 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
                     if (n_pl == cap_pl) { cap_pl = cap_pl ? 2*cap_pl : 64; pl = realloc(pl, cap_pl*sizeof(*pl)); }
                     pl[n_pl++] = r->d[i].pl;
                 }
-                const ggml_metal_mega_entry * e = &ent[i];
+                const ggml_metal_mega_entry * e = &lay[i - i0];
                 struct ggml_metal_mega_sched_entry * x = &se[ie++];
                 x->pipe = q; x->lanes = e->lanes; x->width = e->width; x->n_vtg = e->n_vtg; x->n_items = e->n_items;
                 x->idle_ok = e->idle_ok; x->reps = e->reps;
@@ -1641,6 +1703,7 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
                 }
             }
         }
+        free(lay);
     }
     step_e0[is] = ie;
     seg_s0[n_plan] = is;
@@ -1681,24 +1744,48 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
                 ok = false;
             }
             id<MTLComputePipelineState> * ups = calloc(n_plan, sizeof(id)); // by function
+            int * ups_R = calloc(n_plan, sizeof(int));
             int n_fn = 0;
             for (int p = 0; ok && p < n_plan; ++p) {
                 const int f = ggml_metal_mega_seg_fn(p);
                 if (f < 0 || f >= n_plan) { ok = false; break; }
                 if (!ups[f]) {
                     id<MTLFunction> fn = [mlib newFunctionWithName:[NSString stringWithFormat:@"kernel_seg_%d", f]];
+                    const int T_old = g_mega_T;
+                    g_mega_T = seg_T[p];
                     ups[f] = fn ? ggml_metal_mega_pipeline(device, fn, &error) : nil;
+                    g_mega_T = T_old;
                     [fn release];
                     if (!ups[f]) { fprintf(stderr, "ggml_metal_mega: no pipeline for segment %d\n", p); ok = false; break; }
-                    if (!ggml_metal_mega_probe(ggml_metal_device_get_queue(lib->dev), ups[f], g_mega.R)) {
-                        fprintf(stderr, "ggml_metal_mega: segment %d is not resident with %d threadgroups\n", p, g_mega.R);
-                        ok = false;
-                        break;
+                    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(lib->dev);
+                    if (seg_R[p] > 0) {
+                        // a segment of one step has no grid barrier: its threadgroups need not all be resident at once
+                        ups_R[f] = seg_R[p];
+                        if (plan_t[p] - plan_s[p] > 1 && !ggml_metal_mega_probe_t(queue, ups[f], seg_R[p], seg_T[p], seg_smem[p])) {
+                            fprintf(stderr, "ggml_metal_mega: segment %d is not resident with %d threadgroups\n", p, seg_R[p]);
+                            ok = false;
+                            break;
+                        }
+                    } else {
+                        // the most threadgroups that are all resident, at most the items of its largest step
+                        int want = MIN(-seg_R[p], 4096);
+                        int got = 0;
+                        while (want >= 1 && !got) {
+                            if (ggml_metal_mega_probe_t(queue, ups[f], want, seg_T[p], seg_smem[p])) got = want; else want = want > 1 ? want*3/4 : 0;
+                        }
+                        if (!got) { fprintf(stderr, "ggml_metal_mega: segment %d: no resident threadgroup count\n", p); ok = false; break; }
+                        // at run time the previous dispatch still holds cores while this one starts: a margin
+                        // (GGML_METAL_MEGA_RMARGIN=percent of the probed count, default 50)
+                        static int margin = -1;
+                        if (margin < 0) margin = getenv("GGML_METAL_MEGA_RMARGIN") ? atoi(getenv("GGML_METAL_MEGA_RMARGIN")) : 50;
+                        ups_R[f] = MAX(1, got*margin/100);
                     }
                     n_fn++;
                 }
                 psos[p] = [ups[f] retain];
+                seg_R[p] = ups_R[f];
             }
+            free(ups_R);
             for (int f = 0; f < n_plan; ++f) if (ups[f]) [ups[f] release];
             free(ups);
             fprintf(stderr, "ggml_metal_mega: %d distinct segment kernels\n", n_fn);
@@ -1708,14 +1795,20 @@ static bool ggml_metal_mega_baked_get(struct ggml_metal_mega_rec * r, const ggml
     if (ok) {
         // the old ones may still be in command buffers in flight: kept
         if (g_baked.psos) for (int p = 0; p < g_baked.n_segs; ++p) if (g_baked.psos[p]) [g_mega.old_psos addObject:g_baked.psos[p]];
-        free(g_baked.psos);
+        free(g_baked.psos); free(g_baked.T); free(g_baked.R); free(g_baked.smem);
         g_baked.psos   = psos;
+        g_baked.T      = seg_T;
+        g_baked.R      = seg_R;
+        g_baked.smem   = seg_smem;
         g_baked.n_segs = n_plan;
         g_baked.sig    = sig;
         g_baked.failed = false;
+        if (getenv("GGML_METAL_MEGA_VERBOSE")) {
+            for (int p = 0; p < n_plan; ++p) fprintf(stderr, "ggml_metal_mega: segment %d: steps %d, %d x %d threads\n", p, plan_t[p] - plan_s[p], seg_R[p], seg_T[p]);
+        }
     } else {
         for (int p = 0; p < n_plan; ++p) if (psos[p]) [psos[p] release];
-        free(psos);
+        free(psos); free(seg_T); free(seg_R); free(seg_smem);
         g_baked.sig    = sig;
         g_baked.failed = true;
     }
@@ -1821,8 +1914,9 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
             }
         }
     }
-    if (pso) {
-        // the most threadgroups that are all resident, from the asked number down
+    if (pso && !getenv("GGML_METAL_MEGA_BAKED")) {
+        // the most threadgroups that are all resident, from the asked number down (GGML_METAL_MEGA_BAKED: each segment
+        // of several steps is probed on its own)
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(lib->dev);
         const int want = g_mega.R;
         const int tries[] = { want, want*3/4, want/2, want/4 };
@@ -1942,7 +2036,8 @@ static bool ggml_metal_mega_layout(const struct ggml_metal_mega_disp * d, ggml_m
         static const char * gen[] = { "kernel_rms_norm", "kernel_depth_mix", "kernel_ctrl_down", "kernel_norm_router" };
         bool ok = false;
         for (size_t k = 0; k < sizeof(gen)/sizeof(gen[0]); ++k) if (strncmp(pl->base, gen[k], strlen(gen[k])) == 0) ok = true;
-        if (!ok || d->tptg[1] != 1 || d->tptg[2] != 1) { g_mega_why = "r5"; return false; }
+        // not below 256: kernel_depth_mix keeps n_embd/threads values a thread in an array of 16 (garbage at 64)
+        if (!ok || d->tptg[1] != 1 || d->tptg[2] != 1 || T < 256) { g_mega_why = "r5"; return false; }
         e->lanes = 1; e->width = T;
         e->tptg[0] = T; e->tptg[1] = 1; e->tptg[2] = 1;
     } else {
@@ -2265,9 +2360,11 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             [enc setBuffer:rb offset:o_stp atIndex:2];
             [enc setBuffer:rb offset:o_ctr atIndex:3];
             [enc setBytes:&prm length:sizeof(prm) atIndex:4];
+            if (seg_cur >= 0) smem = g_baked.smem[seg_cur];
             [enc setThreadgroupMemoryLength:(smem + 15) & ~15 atIndex:0];
             if (!getenv("GGML_METAL_MEGA_NOUSE")) [enc useResources:res count:n_res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-            [enc dispatchThreadgroups:MTLSizeMake(g_mega.R, 1, 1) threadsPerThreadgroup:MTLSizeMake(GGML_METAL_MEGA_THREADS, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(seg_cur >= 0 ? g_baked.R[seg_cur] : g_mega.R, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(seg_cur >= 0 ? g_baked.T[seg_cur] : GGML_METAL_MEGA_THREADS, 1, 1)];
             [enc endEncoding];
             g_mega.n_steps_mega += t - s;
             g_mega.n_disp++;
