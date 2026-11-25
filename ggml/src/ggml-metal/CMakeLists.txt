@@ -13,6 +13,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-fusion.cpp
                          ggml-metal-ops.cpp
                          ggml-metal-tuning.cpp
+                         ggml-metal-mega.cpp
                         )
 
 target_link_libraries(ggml-metal PRIVATE
@@ -104,6 +105,8 @@ if (GGML_METAL_EMBED_LIBRARY)
         if(_has_quantize)
             list(APPEND HEADERS_FOR_SRC ${METALLIB_KERNELS_QUANTIZE})
         endif()
+        # GGML_METAL_MEGA splits the embedded source here: shared headers before, the kind's own source after
+        list(APPEND HEADERS_FOR_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernels/mega-split.h")
         file(STRINGS ${SRC} _has_fa_common REGEX "#include \"fa_common\\.metal\"")
         file(STRINGS ${SRC} _has_fa_vec_common REGEX "#include \"fa_vec_common\\.metal\"")
         if(_has_fa_common)

@@ -191,6 +191,42 @@
 #define OP_SSM_SCAN_SSD_HD  64 // Metal-specific; Head Dim the MMA kernel is specialized for (Mamba-2); use_mma gates on d_inner == this
 #define OP_SSM_SCAN_SSD_NSG 4  // Metal-specific; Number of SimdGroups per threadgroup; NSG*32 == threads dispatched per threadgroup
 
+// GGML_METAL_MEGA (see ggml-metal-mega.h): a dispatch of a step run by the persistent kernel
+#define GGML_METAL_MEGA_NB 12 // bindings a dispatch
+
+#if defined(__METAL_VERSION__)
+#define GGML_METAL_MEGA_PTR device char *
+#else
+#define GGML_METAL_MEGA_PTR uint64_t
+#endif
+
+typedef struct {
+    int32_t  pipe;      // case of the kernel
+    int32_t  lanes;     // threadgroups of the dispatch one threadgroup of the persistent kernel runs at once
+    int32_t  width;     // threads a lane
+    int32_t  n_vtg;     // threadgroups of the dispatch
+    int32_t  n_items;   // ceil(n_vtg/lanes)
+    int32_t  idle_ok;   // a lane past the end sits out (else it runs the last threadgroup again)
+    int32_t  grid[3];
+    int32_t  tptg[3];   // threads a threadgroup as the kernel sees them
+    int32_t  smem0;     // bytes of threadgroup(0) a lane
+    int32_t  smem_lane; // bytes a lane
+    uint32_t a[GGML_METAL_MEGA_NB];            // binding as argument bytes: offset in the argument buffer
+    GGML_METAL_MEGA_PTR p[GGML_METAL_MEGA_NB]; // binding as buffer: its GPU address
+} ggml_metal_mega_entry;
+
+typedef struct {
+    uint32_t e0;      // first entry of the step
+    uint32_t e1;
+    uint32_t n_items; // items of all its entries
+    uint32_t pad;
+} ggml_metal_mega_step;
+
+typedef struct {
+    uint32_t n_steps;
+    uint32_t pad[3];
+} ggml_metal_mega_params;
+
 // kernel argument structs
 //
 // - element counters (e.g. ne00) typically use int32_t to reduce register usage

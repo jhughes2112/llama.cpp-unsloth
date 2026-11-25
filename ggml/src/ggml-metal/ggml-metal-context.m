@@ -650,6 +650,7 @@ static id<MTLCommandBuffer> ggml_metal_encode_whole(ggml_metal_t ctx, struct ggm
     id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
     [cmd_buf retain];
 
+    ggml_metal_mega_next_encoder();
     ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, 0, gf->n_nodes, ctx->use_concurrency, false, ctx->debug_graph);
     for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
         const int res = ggml_metal_op_encode(ctx_op, idx);

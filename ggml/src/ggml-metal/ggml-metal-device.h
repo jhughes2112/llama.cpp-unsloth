@@ -106,6 +106,9 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 // GGML_METAL_TIMELINE: the label of the op being encoded on this thread
 void ggml_metal_timeline_label(const char * s);
 
+// GGML_METAL_MEGA: the next encoder made on this thread records its graph for the persistent kernel
+void ggml_metal_mega_next_encoder(void);
+
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
 //
