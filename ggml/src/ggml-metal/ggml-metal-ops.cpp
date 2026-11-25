@@ -6639,6 +6639,18 @@ int ggml_metal_op_depth_mix_impl(ggml_metal_op_t ctx, int idx, int n, bool norm)
         nth *= 2;
     }
 
+    // at most 3 values a thread: the specialized kernel (GGML_METAL_NO_MIX_FAST=1: the generic one)
+    static const bool no_mix_fast = getenv("GGML_METAL_NO_MIX_FAST") != nullptr;
+    if (!no_mix_fast && nth*3 >= args.n_embd) {
+        pipeline = ggml_metal_library_get_pipeline_named(lib, norm ? "kernel_depth_mix_fast_norm_f32" : "kernel_depth_mix_fast_f32");
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        if (nth*3 < args.n_embd) {
+            pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_depth_mix_f32");
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+        }
+    }
+
     ggml_metal_encoder_set_threadgroup_memory_size(enc, (2*8 + 1)*32*sizeof(float), 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, args.nq, args.n_tokens, 1, nth, 1, 1);

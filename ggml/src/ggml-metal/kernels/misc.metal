@@ -1928,3 +1928,132 @@ typedef decltype(kernel_top_k_mask<float, float4>) kernel_top_k_mask_f_t;
 
 template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_h_t kernel_top_k_mask<half,  half4>;
 template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t kernel_top_k_mask<float, float4>;
+
+
+// kernel_depth_mix_f32 for rows of at most 3 values a thread, specialized (its time is all latency, and the generic
+// kernel carried the code of both paths): everything a thread needs (states, query, weight) is loaded at once, the
+// partial sums go through threadgroup memory with one barrier (lanes past the simdgroup count read 0, no zeroing)
+template <bool NORM>
+kernel void kernel_depth_mix_fast_f32(
+        constant ggml_metal_kargs_depth_mix & args,
+        device const char  * src,
+        device const float * query,
+        device       float * dst,
+        device const float * weight,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg3  [[threads_per_threadgroup]]) {
+    const int tid = tpitg.x;
+    const int ntg = ntg3.x;
+    const int iq  = tgpig.x;
+    const int it  = tgpig.y;
+    const int n   = args.n_embd;
+    const int nsg = ntg/N_SIMDWIDTH;
+
+    device const float * q = query + (ulong) iq*n;
+
+    float qv[3];
+    float wv[3];
+    float xv[8][3];
+    FOR_UNROLL (short j = 0; j < 3; ++j) {
+        const int i = tid + j*ntg;
+        qv[j] = i < n ? q[i] : 0.0f;
+        wv[j] = (NORM && i < n) ? weight[i] : 0.0f;
+    }
+    FOR_UNROLL (short s = 0; s < 8; ++s) {
+        device const float * x = (device const float *) (src + args.offs[s < args.n_states ? s : 0]) + (ulong) it*n;
+        FOR_UNROLL (short j = 0; j < 3; ++j) {
+            const int i = tid + j*ntg;
+            xv[s][j] = (s < args.n_states && i < n) ? x[i] : 0.0f;
+        }
+    }
+
+    float nrm[8];
+    float coef[8];
+    FOR_UNROLL (short s = 0; s < 8; ++s) {
+        float sumf = 0.0f;
+        float dotf = 0.0f;
+        FOR_UNROLL (short j = 0; j < 3; ++j) {
+            sumf += xv[s][j]*xv[s][j];
+            dotf += xv[s][j]*qv[j];
+        }
+        nrm[s]  = simd_sum(sumf);
+        coef[s] = simd_sum(dotf);
+    }
+
+    if (tiisg == 0) {
+        FOR_UNROLL (short s = 0; s < 8; ++s) {
+            shmem[(2*s + 0)*N_SIMDWIDTH + sgitg] = nrm[s];
+            shmem[(2*s + 1)*N_SIMDWIDTH + sgitg] = coef[s];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float smax = -INFINITY;
+    FOR_UNROLL (short s = 0; s < 8; ++s) {
+        if (s < args.n_states) {
+            const float sumf = simd_sum(tiisg < nsg ? shmem[(2*s + 0)*N_SIMDWIDTH + tiisg] : 0.0f);
+            const float dotf = simd_sum(tiisg < nsg ? shmem[(2*s + 1)*N_SIMDWIDTH + tiisg] : 0.0f);
+            nrm[s]  = 1.0f/sqrt(sumf/n + args.eps);
+            coef[s] = dotf*nrm[s]*args.scale;
+            smax = max(smax, coef[s]);
+        }
+    }
+    float sum = 0.0f;
+    FOR_UNROLL (short s = 0; s < 8; ++s) {
+        if (s < args.n_states) {
+            coef[s] = exp(coef[s] - smax);
+            sum += coef[s];
+        }
+    }
+    FOR_UNROLL (short s = 0; s < 8; ++s) {
+        coef[s] = s < args.n_states ? coef[s]/sum*nrm[s] : 0.0f;
+    }
+
+    device float * y = dst + ((ulong) it*args.nq + iq)*n;
+
+    float yv[3];
+    float sy = 0.0f;
+    FOR_UNROLL (short j = 0; j < 3; ++j) {
+        float v = 0.0f;
+        FOR_UNROLL (short s = 0; s < 8; ++s) {
+            v += coef[s]*xv[s][j];
+        }
+        yv[j] = v;
+        sy += v*v;
+    }
+
+    if (!NORM) {
+        FOR_UNROLL (short j = 0; j < 3; ++j) {
+            const int i = tid + j*ntg;
+            if (i < n) {
+                y[i] = yv[j];
+            }
+        }
+        return;
+    }
+
+    sy = simd_sum(sy);
+    if (tiisg == 0) {
+        shmem[16*N_SIMDWIDTH + sgitg] = sy;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sy = simd_sum(tiisg < nsg ? shmem[16*N_SIMDWIDTH + tiisg] : 0.0f);
+
+    const float sc = 1.0f/sqrt(sy/n + args.eps_out);
+    FOR_UNROLL (short j = 0; j < 3; ++j) {
+        const int i = tid + j*ntg;
+        if (i < n) {
+            y[i] = yv[j]*sc*wv[j];
+        }
+    }
+}
+
+typedef decltype(kernel_depth_mix_fast_f32<false>) kernel_depth_mix_fast_t;
+
+template [[host_name("kernel_depth_mix_fast_f32")]]      kernel kernel_depth_mix_fast_t kernel_depth_mix_fast_f32<false>;
+template [[host_name("kernel_depth_mix_fast_norm_f32")]] kernel kernel_depth_mix_fast_t kernel_depth_mix_fast_f32<true>;
