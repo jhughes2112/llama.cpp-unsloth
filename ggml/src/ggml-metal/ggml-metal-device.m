@@ -1008,6 +1008,7 @@ struct ggml_metal_encoder {
     bool   barrier;
 
     id<MTLComputePipelineState> obj_pso; // the pipeline last set (for GGML_METAL_KERNEL_LIST)
+    const char * pl_name; // its kernel (GGML_METAL_DOUBLE)
     int    tl_slot; // GGML_METAL_TIMELINE: the sample pair of this encoder, -1 if none
 
     struct ggml_metal_mega_rec * mega; // GGML_METAL_MEGA: dispatches are recorded, encoded at the end
@@ -2647,6 +2648,7 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
 }
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
+    encoder->pl_name = pipeline.pipeline ? pipeline.pipeline->base : NULL;
     if (!pipeline.pipeline) {
         GGML_ABORT("%s: nil Metal pipeline (missing kernel; see compile_pipeline log above)\n", __func__);
     }
@@ -2854,6 +2856,24 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
         }
     }
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+    // GGML_METAL_DOUBLE=prefix[,prefix]: profiling only (results garbage for kernels that update state): every kernel
+    // whose name starts with a prefix runs twice, a barrier between; the added GPU time is what one more such step costs
+    static const char * dbl = (const char *) -1;
+    if (dbl == (const char *) -1) dbl = getenv("GGML_METAL_DOUBLE");
+    if (dbl && encoder->pl_name) {
+        const char * p = dbl;
+        while (*p) {
+            const char * q = strchr(p, ',');
+            const size_t n = q ? (size_t) (q - p) : strlen(p);
+            if (n > 0 && strncmp(encoder->pl_name, p, n) == 0) {
+                [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+                break;
+            }
+            if (!q) break;
+            p = q + 1;
+        }
+    }
 }
 
 static int g_bar_every = 0;
@@ -4889,3 +4909,4 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
 
     return res;
 }
+
