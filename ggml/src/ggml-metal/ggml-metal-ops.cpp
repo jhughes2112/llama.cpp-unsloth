@@ -3467,6 +3467,80 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
         }
     } else {
+        // the Q8_0 down projection of one token with a MoE reduce and a short conv right after it: both in its epilogue
+        // (kernel_mul_mv_id_q8_0_reduce_conv), two steps fewer. GGML_METAL_NO_DOWN_RC8=1 (or GGML_METAL_NO_DOWN_RC=1) turns it off
+        static const bool no_down_rc8 = getenv("GGML_METAL_NO_DOWN_RC") != nullptr || getenv("GGML_METAL_NO_DOWN_RC8") != nullptr;
+        if (!no_down_rc8 && ctx->use_fusion() && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32 &&
+            ne00 % 32 == 0 && ne21 == 1 && ne20 <= 8 && ne1 == ne20 && op->ne[2] == 1 && ne0 % 4 == 0 && ggml_is_contiguous(op) &&
+            idx + 1 < ctx->n_nodes()) {
+            int nm = 0, nc = 0;
+            const ggml_metal_fusion * fm = ctx->can_fuse(idx + 1, GGML_METAL_FUSION_FULL, &nm);
+            const ggml_metal_fusion * fc = fm && ggml_metal_fusion_get_id(fm) == GGML_METAL_FUSION_MOE_REDUCE && idx + 1 + nm < ctx->n_nodes() ?
+                ctx->can_fuse(idx + 1 + nm, GGML_METAL_FUSION_FULL, &nc) : nullptr;
+            if (fc && ggml_metal_fusion_get_id(fc) == GGML_METAL_FUSION_SHORT_CONV && (nc == 5 || nc == 6)) {
+                const ggml_tensor * mul   = ctx->node(idx + 1);
+                const ggml_tensor * mred  = ctx->node(idx + nm);
+                const int jc = idx + 1 + nm;
+                const ggml_tensor * cat   = ctx->node(jc + 0);
+                const ggml_tensor * cpy   = ctx->node(jc + 1);
+                const ggml_tensor * conv  = ctx->node(jc + 2);
+                const ggml_tensor * add   = ctx->node(jc + 3);
+                const ggml_tensor * scale = ctx->node(jc + 4);
+                ggml_tensor *       cdst  = ctx->node(jc + nc - 1);
+                const ggml_tensor * res   = nc == 6 ? (cdst->src[0] == scale ? cdst->src[1] : cdst->src[0]) : nullptr;
+                const ggml_tensor * w     = conv->src[1];
+                if (mul->src[0] == op && add->src[0] == mred && conv->ne[1] == 1 && conv->ne[2] == 1 && w->ne[1] == ne0 &&
+                    w->ne[0] <= 9 && ggml_is_contiguous(mul->src[1]) && ggml_is_contiguous(cdst) && (!res || ggml_is_contiguous(res)) &&
+                    ggml_is_contiguous(op->src[2])) {
+                    ctx->count_fusions(fc);
+                    ggml_metal_op_fused_concurrency(ctx, idx, 1 + nm + nc);
+
+                    ggml_metal_kargs_mul_mv_id_rc args = {
+                        /*.ne00 =*/ ne00,
+                        /*.ne0  =*/ (int32_t) ne0,
+                        /*.nei0 =*/ (int32_t) ne20,
+                        /*.pad  =*/ ((const char *) cdst->data < (const char *) op->data + ggml_nbytes(op) &&
+                                     (const char *) op->data < (const char *) cdst->data + ggml_nbytes(cdst)) ? 1 : 0,
+                        /*.nb01 =*/ nb01,
+                        /*.nb02 =*/ nb02,
+                        /*.nb11 =*/ nb11,
+                    };
+                    ggml_metal_kargs_short_conv cargs = {
+                        /*.nc       =*/ (int32_t) w->ne[0],
+                        /*.C        =*/ (int32_t) w->ne[1],
+                        /*.n_t      =*/ 1,
+                        /*.n_s      =*/ 1,
+                        /*.nb_past2 =*/ cat->src[0]->nb[2],
+                        /*.nb_cell1 =*/ cpy->src[1]->nb[1],
+                        /*.s        =*/ ggml_get_op_params_f32(scale, 0),
+                        /*.b        =*/ ggml_get_op_params_f32(scale, 1),
+                        /*.has_res  =*/ res ? 1 : 0,
+                        /*.n_heads  =*/ 0,
+                    };
+
+                    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_mul_mv_id_q8_0_reduce_conv");
+
+                    ggml_metal_encoder_set_pipeline(enc, pipeline);
+                    ggml_metal_encoder_set_bytes   (enc, &args,  sizeof(args),  0);
+                    ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                    ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                    ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+                    ggml_metal_encoder_set_buffer  (enc, bid_src2, 4);
+                    ggml_metal_encoder_set_bytes   (enc, &cargs, sizeof(cargs), 5);
+                    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[1]), 6);
+                    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cat->src[0]), 7);
+                    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),           8);
+                    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cpy->src[1]), 9);
+                    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res ? res : cdst), 10);
+                    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cdst),        11);
+                    ggml_metal_encoder_set_threadgroup_memory_size(enc, 4*8*sizeof(float), 0);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, ne0/4, 1, 1, 32, ne20, 1);
+
+                    return 1 + nm + nc;
+                }
+            }
+        }
+
         // the NVFP4 down projection of one token with the reduce conv right after it (GGML_METAL_FUSION_REDUCE_CONV on
         // this output): the reduce and the conv in its epilogue (kernel_mul_mv_id_nvfp4_reduce_conv), one step.
         // GGML_METAL_NO_DOWN_RC=1 turns it off

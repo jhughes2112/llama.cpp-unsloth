@@ -4033,3 +4033,110 @@ kernel void kernel_mul_mv_id_nvfp4_reduce_conv(
         q[nh - 1] = xt;
     }
 }
+
+
+// the Q8_0 expert down projection of one token with the MoE reduce (the router weights, no expert scale) and the short
+// conv (with or without a residual) in the epilogue: a simdgroup for each expert slot, all on the same 4 rows (the lane
+// layout of kernel_mul_mv_q8_0_f32_impl, the K dimension split over the lanes only); lane r of simdgroup 0 reduces row
+// r over the slots in their order (kernel_moe_reduce_f32) and convolves it (kernel_short_conv_f32)
+[[host_name("kernel_mul_mv_id_q8_0_reduce_conv")]]
+kernel void kernel_mul_mv_id_q8_0_reduce_conv(
+        constant ggml_metal_kargs_mul_mv_id_rc & a,
+        device const char    * src0,
+        device const char    * src1,
+        device       float   * xraw,
+        device const int32_t * ids,
+        constant ggml_metal_kargs_short_conv   & ca,
+        device const float   * wt,
+        device const char    * past,
+        device const float   * w,
+        device       char    * cell,
+        device const float   * res,
+        device       float   * dst,
+        threadgroup  char    * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort NSG  [[simdgroups_per_threadgroup]]) {
+    constexpr short NR0 = 4;
+    constexpr short NQ  = 8;
+
+    threadgroup float * part = (threadgroup float *) shmem;
+
+    const int k   = sgitg;
+    const int r0  = tgpig.x*NR0;
+    const int i02 = ids[k];
+
+    const int nb = a.ne00/QK8_0;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) (src0 + (ulong) i02*a.nb02 + (ulong) min(r0 + row, a.ne0 - 1)*a.nb01);
+    }
+    device const float * y = (device const float *) (src1 + (ulong) k*a.nb11);
+
+    const short ix = tiisg/4;   // 8 blocks at a time
+    const short il = tiisg%4;   // 8 values of a block each
+
+    float sumf[NR0] = { 0.f };
+    float yl[NQ];
+
+    for (int ib = ix; ib < nb; ib += 8) {
+        device const float * yb = y + ib*QK8_0 + il*NQ;
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i]*yl[i];
+            }
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+    }
+
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && r0 + row < a.ne0) {
+            if (a.pad == 0) {
+                xraw[(ulong) k*a.ne0 + r0 + row] = tot;
+            }
+            part[k*NR0 + row] = tot;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg < NR0 && r0 + tiisg < a.ne0) {
+#pragma clang fp contract(off)
+        const int c  = r0 + tiisg;
+        const int nh = ca.nc - 1;
+
+        float xt = 0.0f;
+        for (int e = 0; e < a.nei0; ++e) {
+            xt += part[e*NR0 + tiisg]*wt[e];
+        }
+
+        float h[8];
+        device const float * pp = (device const float *) past + c*nh;
+        for (int j = 0; j < nh; ++j) {
+            h[j] = pp[j];
+        }
+        device const float * wc = w + c*ca.nc;
+        float acc = 0.0f;
+        for (int j = 0; j < nh; ++j) {
+            acc += h[j]*wc[j];
+        }
+        acc += xt*wc[nh];
+
+        const float r = ca.has_res ? res[c] : 0.0f;
+        dst[c] = ca.s*(xt + acc) + ca.b + r;
+
+        device float * q = (device float *) cell + c*nh;
+        for (int j = 0; j < nh - 1; ++j) {
+            q[j] = h[j + 1];
+        }
+        q[nh - 1] = xt;
+    }
+}
