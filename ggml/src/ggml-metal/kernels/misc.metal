@@ -2128,3 +2128,151 @@ kernel void kernel_kv_conv_store_dyn_f32(
     }
     q[nh - 1] = xt;
 }
+
+
+// the dist sampler on the GPU, two kernels in place of soft_max cumsum sub step sum clamp scale cpy: a threadgroup a
+// chunk of the logits keeps its max and the sum of exp(x - max) (stats), then one threadgroup rescales the chunks to the
+// largest max, finds the chunk where the cumulative sum passes u*S and the index inside it (a prefix sum)
+kernel void kernel_dist_stats_f32(
+        constant ggml_metal_kargs_dist & args,
+        device const float * x,
+        device       float * stats,
+        threadgroup  float * sh [[threadgroup(0)]],
+        uint   tg    [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg   [[threads_per_threadgroup]]) {
+    const int i0 = tg*args.cs;
+    const int i1 = min(args.n, i0 + args.cs);
+    const int nsg = ntg/N_SIMDWIDTH;
+
+    float m = -INFINITY;
+    for (int i = i0 + tid; i < i1; i += ntg) {
+        m = max(m, x[i]);
+    }
+    m = simd_max(m);
+    if (tiisg == 0) {
+        sh[sgitg] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = simd_max(tiisg < nsg ? sh[tiisg] : -INFINITY);
+
+    float sm = 0.0f;
+    for (int i = i0 + tid; i < i1; i += ntg) {
+        sm += exp(x[i] - m);
+    }
+    sm = simd_sum(sm);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        sh[sgitg] = sm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < nsg; ++i) {
+            t += sh[i];
+        }
+        stats[2*tg + 0] = m;
+        stats[2*tg + 1] = t;
+    }
+}
+
+// an inclusive prefix sum over a threadgroup (all threads, in order); sh: a float a simdgroup
+static inline float dist_tg_scan(float v, threadgroup float * sh, ushort sgitg, ushort tiisg, int nsg) {
+    float p = simd_prefix_inclusive_sum(v);
+    if (tiisg == N_SIMDWIDTH - 1) {
+        sh[sgitg] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const float t = tiisg < nsg ? sh[tiisg] : 0.0f;
+        const float q = simd_prefix_exclusive_sum(t);
+        if (tiisg < nsg) {
+            sh[32 + tiisg] = q;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float res = p + sh[32 + sgitg];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return res;
+}
+
+kernel void kernel_dist_pick_f32(
+        constant ggml_metal_kargs_dist & args,
+        device const float * x,
+        device const float * stats,
+        device const float * u,
+        device       int32_t * out,
+        threadgroup  float * sh [[threadgroup(0)]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg   [[threads_per_threadgroup]]) {
+    const int nsg = ntg/N_SIMDWIDTH;
+    threadgroup int * shi = (threadgroup int *) (sh + 64);
+
+    // the largest chunk max
+    const float mc = tid < args.nchunk ? stats[2*tid + 0] : -INFINITY;
+    float M = simd_max(mc);
+    if (tiisg == 0) {
+        sh[sgitg] = M;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    M = simd_max(tiisg < nsg ? sh[tiisg] : -INFINITY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // the chunk sums on the scale of M, their prefix
+    const float w = tid < args.nchunk ? stats[2*tid + 1]*exp(mc - M) : 0.0f;
+    const float pw = dist_tg_scan(w, sh, sgitg, tiisg, nsg);
+    // the total: the prefix of the last chunk
+    if (tid == args.nchunk - 1) {
+        sh[96] = pw;
+    }
+    if (tid == 0) {
+        shi[0] = args.nchunk - 1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float S   = sh[96];
+    const float tgt = u[0]*S;
+    // the first chunk whose inclusive prefix passes the target
+    if (tid < args.nchunk && pw > tgt && (tid == 0 || pw - w <= tgt)) {
+        shi[0] = tid;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int c = shi[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // the prefix before chunk c: the inclusive prefix of c minus its own sum (thread c has both)
+    if (tid == c) {
+        sh[97] = pw - w;
+    }
+    if (tid == 0) {
+        shi[2] = 0x7fffffff;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float before = sh[97];
+
+    // inside the chunk: exp(x - M), a prefix sum, the first element whose cumulative sum passes the target
+    const int i0 = c*args.cs;
+    const int i1 = min(args.n, i0 + args.cs);
+    float acc = before;
+    for (int b0 = i0; b0 < i1; b0 += ntg) {
+        const int i = b0 + tid;
+        const float e = i < i1 ? exp(x[i] - M) : 0.0f;
+        const float pe = dist_tg_scan(e, sh, sgitg, tiisg, nsg) + acc;
+        if (i < i1 && pe > tgt && pe - e <= tgt) {
+            atomic_fetch_min_explicit((threadgroup atomic_int *) &shi[2], i, memory_order_relaxed);
+        }
+        // the running total for the next block: the last thread's prefix
+        if (tid == ntg - 1) {
+            sh[98] = pe;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = sh[98];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        const int r = shi[2];
+        out[0] = r < args.n ? r : min(args.n - 1, i1 - 1);
+    }
+}

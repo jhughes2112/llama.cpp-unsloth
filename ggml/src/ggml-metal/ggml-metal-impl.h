@@ -958,6 +958,15 @@ typedef struct {
     float   b;
 } ggml_metal_kargs_ctrl;
 
+// the draw of the dist sampler on the GPU (kernel_dist_stats_f32 + kernel_dist_pick_f32): the first index whose
+// cumulative probability passes the uniform u
+typedef struct {
+    int32_t n;      // logits
+    int32_t cs;     // logits a chunk (a threadgroup of the stats kernel)
+    int32_t nchunk;
+    int32_t pad;
+} ggml_metal_kargs_dist;
+
 typedef struct {
     int32_t nr;   // rows of the bias table (the relative features)
     int32_t nc;   // its columns, without the zero one

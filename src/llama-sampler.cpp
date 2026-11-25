@@ -1501,7 +1501,13 @@ static void llama_sampler_dist_backend_apply(
     }
 
     data->sampled = sampled_token;
-    data->probs = probs;
+    // the probabilities and the logits only when asked for: each is a vocabulary-sized copy to the host a token
+    static const bool want_probs = getenv("LLAMA_BACKEND_DIST_PROBS") != nullptr;
+    if (want_probs) {
+        data->probs = probs;
+    } else {
+        data->logits = nullptr;
+    }
 }
 
 static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {

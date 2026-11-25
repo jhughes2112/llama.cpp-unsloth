@@ -1986,6 +1986,69 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // the dist sampler of the backend sampling: soft_max cumsum sub step sum clamp scale cpy of one row is a draw from the
+    // softmax, done by two kernels (kernel_dist_stats_f32, kernel_dist_pick_f32). the probabilities are not written.
+    // GGML_METAL_NO_DIST_FUSE=1 turns it off
+    static const bool no_dist = getenv("GGML_METAL_NO_DIST_FUSE") != nullptr;
+    if (!no_dist && ctx->use_fusion() && idx + 7 < ctx->n_nodes() && op->src[1] == nullptr && op->type == GGML_TYPE_F32 &&
+        op->src[0]->type == GGML_TYPE_F32 && ggml_nrows(op) == 1 && ggml_is_contiguous(op->src[0]) && op->ne[0] >= 1024) {
+        const ggml_tensor * cs  = ctx->node(idx + 1);
+        const ggml_tensor * sb  = ctx->node(idx + 2);
+        const ggml_tensor * st  = ctx->node(idx + 3);
+        const ggml_tensor * sm  = ctx->node(idx + 4);
+        const ggml_tensor * cl  = ctx->node(idx + 5);
+        const ggml_tensor * sc  = ctx->node(idx + 6);
+        const ggml_tensor * cp  = ctx->node(idx + 7);
+        float scale_sm, max_bias_sm;
+        memcpy(&scale_sm,    ((const int32_t *) op->op_params) + 0, sizeof(float));
+        memcpy(&max_bias_sm, ((const int32_t *) op->op_params) + 1, sizeof(float));
+        if (cs->op == GGML_OP_CUMSUM && cs->src[0] == op && sb->op == GGML_OP_SUB && sb->src[0] == cs &&
+            ggml_nelements(sb->src[1]) == 1 && sb->src[1]->type == GGML_TYPE_F32 &&
+            st->op == GGML_OP_UNARY && ggml_get_unary_op(st) == GGML_UNARY_OP_STEP && st->src[0] == sb &&
+            sm->op == GGML_OP_SUM && sm->src[0] == st && cl->op == GGML_OP_CLAMP && cl->src[0] == sm &&
+            sc->op == GGML_OP_SCALE && sc->src[0] == cl && cp->op == GGML_OP_CPY && cp->src[0] == sc &&
+            cp->type == GGML_TYPE_I32 && scale_sm == 1.0f && max_bias_sm == 0.0f &&
+            ggml_get_op_params_f32(sc, 0) == -1.0f && ggml_get_op_params_f32(sc, 1) == (float) op->ne[0]) {
+            ggml_metal_library_t lib = ctx->lib;
+            ggml_metal_encoder_t enc = ctx->enc;
+
+            ggml_metal_op_fused_concurrency(ctx, idx, 8);
+
+            const int nchunk = 256;
+            const int n      = (int) op->ne[0];
+            ggml_metal_kargs_dist args = {
+                /*.n      =*/ n,
+                /*.cs     =*/ (n + nchunk - 1)/nchunk,
+                /*.nchunk =*/ nchunk,
+                /*.pad    =*/ 0,
+            };
+            GGML_ASSERT(args.cs <= 1024*64);
+
+            // the stats in the memory of the probabilities (not written otherwise)
+            auto p1 = ggml_metal_library_get_pipeline_named(lib, "kernel_dist_stats_f32");
+            ggml_metal_encoder_set_pipeline(enc, p1);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float), 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, nchunk, 1, 1, 256, 1, 1);
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            auto p2 = ggml_metal_library_get_pipeline_named(lib, "kernel_dist_pick_f32");
+            ggml_metal_encoder_set_pipeline(enc, p2);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sb->src[1]), 3);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cp),         4);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, 128*sizeof(float), 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1024, 1, 1);
+
+            return 8;
+        }
+    }
+
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 

@@ -128,6 +128,7 @@ struct common_sampler {
     // pure temperature sampling drew straight from the logits (llama_sampler_dist_sample_logits): the candidates are
     // filled only when asked for (common_sampler_get_candidates)
     bool          fast_pending = false;
+    bool          bs_pending   = false; // a backend-sampled token whose candidates are not built yet
     llama_context * fast_ctx   = nullptr;
     int           fast_idx     = 0;
     llama_token   fast_id      = LLAMA_TOKEN_NULL;
@@ -563,10 +564,11 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
     dst->fast_pending = src->fast_pending;
+    dst->bs_pending   = src->bs_pending;
     dst->fast_ctx     = src->fast_ctx;
     dst->fast_idx     = src->fast_idx;
     dst->fast_id      = src->fast_id;
-    if (dst->fast_pending) {
+    if (dst->fast_pending || dst->bs_pending) {
         dst->cur_p = { dst->cur.data(), 0, -1, false };
     }
 }
@@ -656,6 +658,20 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
     gsmpl->fast_pending = false;
+
+    // a token the backend sampled: no candidates now (common_sampler_get_candidates builds them when asked)
+    if (!gsmpl->grmr && !gsmpl->rbudget) {
+        const llama_token bid = llama_get_sampled_token_ith(ctx, idx);
+        if (bid != LLAMA_TOKEN_NULL) {
+            gsmpl->bs_pending = true;
+            gsmpl->fast_ctx   = ctx;
+            gsmpl->fast_idx   = idx;
+            gsmpl->fast_id    = bid;
+            cur_p = { gsmpl->cur.data(), 0, -1, false };
+            return bid;
+        }
+    }
+
     if (common_sampler_pure_temp(gsmpl)) {
         const llama_model * model = llama_get_model(ctx);
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -979,6 +995,17 @@ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * g
     const auto tm = gsmpl->tm();
 
     auto * res = &gsmpl->cur_p;
+
+    if (gsmpl->bs_pending) {
+        gsmpl->bs_pending = false;
+        gsmpl->set_logits(gsmpl->fast_ctx, gsmpl->fast_idx);
+        for (size_t i = 0; i < res->size; ++i) {
+            if (res->data[i].id == gsmpl->fast_id) {
+                res->selected = i;
+                break;
+            }
+        }
+    }
 
     if (gsmpl->fast_pending) {
         // the candidates of the fast draw: the logits over the temperature and their softmax
