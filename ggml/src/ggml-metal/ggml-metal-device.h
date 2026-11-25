@@ -103,6 +103,9 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
+// GGML_METAL_TIMELINE: the label of the op being encoded on this thread
+void ggml_metal_timeline_label(const char * s);
+
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
 //

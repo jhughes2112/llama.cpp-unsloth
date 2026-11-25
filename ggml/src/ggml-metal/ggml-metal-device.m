@@ -932,7 +932,139 @@ struct ggml_metal_encoder {
     int    n_bind;
     size_t tg_size[2];
     bool   barrier;
+
+    int    tl_slot; // GGML_METAL_TIMELINE: the sample pair of this encoder, -1 if none
 };
+
+// GGML_METAL_TIMELINE=file[,skip[,count]]: GPU timestamps at the start and the end of every compute encoder (with an
+// encoder a serial step, that is every step), for the encoders after the first `skip` ones, up to `count`. written to
+// file at exit: slot, start ns, end ns, dispatches, label of the first op. CAUTION, measured on an M5 Ultra: sampled
+// tokens run ~25% slower (10.6 instead of 8.6 ms, even with GGML_METAL_TIMELINE_EVERY=2) and show ~300 us holes every
+// 80 encoders that are not there unsampled, so it gives the order and relative size of steps, not the idle time
+static int g_tl_on = -1;
+static id<MTLCounterSampleBuffer> g_tl_buf = nil;
+static id<MTLDevice> g_tl_dev = nil;
+static atomic_int g_tl_seen = 0;
+static int g_tl_skip = 0, g_tl_cap = 0;
+static char g_tl_path[512];
+static char (*g_tl_lab)[64] = NULL;
+static int * g_tl_ndisp = NULL;
+static MTLTimestamp g_tl_cpu0, g_tl_gpu0;
+static __thread char t_tl_label[64];
+
+void ggml_metal_timeline_label(const char * s) {
+    if (g_tl_on == 1) {
+        snprintf(t_tl_label, sizeof(t_tl_label), "%s", s);
+    }
+}
+
+static void ggml_metal_timeline_dump(void) {
+    if (g_tl_buf == nil) {
+        return;
+    }
+    int n = (atomic_load(&g_tl_seen) - g_tl_skip + (getenv("GGML_METAL_TIMELINE_EVERY") ? atoi(getenv("GGML_METAL_TIMELINE_EVERY")) : 1) - 1)/(getenv("GGML_METAL_TIMELINE_EVERY") ? atoi(getenv("GGML_METAL_TIMELINE_EVERY")) : 1);
+    if (n > g_tl_cap) n = g_tl_cap;
+    if (n <= 0) return;
+    MTLTimestamp cpu1, gpu1;
+    [g_tl_dev sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+    const double ns_per_tick = gpu1 > g_tl_gpu0 ? (double)(cpu1 - g_tl_cpu0)/(double)(gpu1 - g_tl_gpu0) : 1.0;
+    NSData * d = [g_tl_buf resolveCounterRange:NSMakeRange(0, 2*n)];
+    if (d == nil) {
+        fprintf(stderr, "ggml_metal_timeline: resolve failed\n");
+        return;
+    }
+    const MTLCounterResultTimestamp * ts = (const MTLCounterResultTimestamp *) [d bytes];
+    FILE * f = fopen(g_tl_path, "w");
+    if (!f) return;
+    fprintf(f, "# ns_per_tick %.6f\n", ns_per_tick);
+    for (int i = 0; i < n; ++i) {
+        fprintf(f, "%d %llu %llu %d %s\n", i, (unsigned long long) ts[2*i].timestamp, (unsigned long long) ts[2*i + 1].timestamp,
+                g_tl_ndisp[i], g_tl_lab[i][0] ? g_tl_lab[i] : "-");
+    }
+    fclose(f);
+    fprintf(stderr, "ggml_metal_timeline: %d encoders written to %s\n", n, g_tl_path);
+}
+
+static bool ggml_metal_timeline_init(id<MTLDevice> dev) {
+    if (g_tl_on >= 0) {
+        return g_tl_on == 1;
+    }
+    g_tl_on = 0;
+    const char * v = getenv("GGML_METAL_TIMELINE");
+    if (!v) return false;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", v);
+    char * c1 = strchr(tmp, ',');
+    int cap = 16384;
+    if (c1) {
+        *c1 = 0;
+        g_tl_skip = atoi(c1 + 1);
+        char * c2 = strchr(c1 + 1, ',');
+        if (c2) cap = atoi(c2 + 1);
+    }
+    snprintf(g_tl_path, sizeof(g_tl_path), "%s", tmp);
+    if (![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        fprintf(stderr, "ggml_metal_timeline: no stage-boundary sampling on this device\n");
+        return false;
+    }
+    id<MTLCounterSet> set = nil;
+    for (id<MTLCounterSet> cs in [dev counterSets]) {
+        if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) set = cs;
+    }
+    if (set == nil) {
+        fprintf(stderr, "ggml_metal_timeline: no timestamp counter set\n");
+        return false;
+    }
+    for (; cap >= 256; cap /= 2) {
+        MTLCounterSampleBufferDescriptor * desc = [[MTLCounterSampleBufferDescriptor alloc] init];
+        desc.counterSet  = set;
+        desc.storageMode = MTLStorageModeShared;
+        desc.sampleCount = 2*cap;
+        NSError * err = nil;
+        g_tl_buf = [dev newCounterSampleBufferWithDescriptor:desc error:&err];
+        [desc release];
+        if (g_tl_buf != nil) break;
+    }
+    if (g_tl_buf == nil) {
+        fprintf(stderr, "ggml_metal_timeline: no sample buffer\n");
+        return false;
+    }
+    g_tl_cap   = cap;
+    g_tl_dev   = [dev retain];
+    g_tl_lab   = calloc(cap, sizeof(*g_tl_lab));
+    g_tl_ndisp = calloc(cap, sizeof(int));
+    [dev sampleTimestamps:&g_tl_cpu0 gpuTimestamp:&g_tl_gpu0];
+    atexit(ggml_metal_timeline_dump);
+    fprintf(stderr, "ggml_metal_timeline: %d encoders after the first %d, to %s\n", cap, g_tl_skip, g_tl_path);
+    g_tl_on = 1;
+    return true;
+}
+
+// a compute encoder; with GGML_METAL_TIMELINE it samples the GPU clock at its start and end
+static id<MTLComputeCommandEncoder> ggml_metal_new_compute_encoder(id<MTLCommandBuffer> cmd, bool concurrent, int * slot) {
+    *slot = -1;
+    if (ggml_metal_timeline_init([cmd device])) {
+        static int every = -1;
+        if (every < 0) {
+            every = getenv("GGML_METAL_TIMELINE_EVERY") ? atoi(getenv("GGML_METAL_TIMELINE_EVERY")) : 1;
+            every = every < 1 ? 1 : every;
+        }
+        const int seen = atomic_fetch_add(&g_tl_seen, 1);
+        const int k = (seen - g_tl_skip)/every;
+        if (seen >= g_tl_skip && (seen - g_tl_skip) % every == 0 && k < g_tl_cap) {
+            MTLComputePassDescriptor * d = [MTLComputePassDescriptor computePassDescriptor];
+            d.dispatchType = concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+            d.sampleBufferAttachments[0].sampleBuffer              = g_tl_buf;
+            d.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2*k;
+            d.sampleBufferAttachments[0].endOfEncoderSampleIndex   = 2*k + 1;
+            *slot = k;
+            g_tl_lab[k][0] = 0;
+            g_tl_ndisp[k]  = 0;
+            return [cmd computeCommandEncoderWithDescriptor:d];
+        }
+    }
+    return concurrent ? [cmd computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent] : [cmd computeCommandEncoder];
+}
 
 // the next encoder made on this thread records to this
 static __thread ggml_metal_recording_t t_recording_next = NULL;
@@ -1098,11 +1230,7 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
-    if (concurrent) {
-        res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
-    } else {
-        res->obj = [cmd_buf computeCommandEncoder];
-    }
+    res->obj = ggml_metal_new_compute_encoder(cmd_buf, concurrent, &res->tl_slot);
 
     [res->obj retain];
 
@@ -1273,8 +1401,15 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
         encoder->barrier = false;
         return;
     }
+    if (encoder->tl_slot >= 0) {
+        if (g_tl_ndisp[encoder->tl_slot]++ == 0) {
+            memcpy(g_tl_lab[encoder->tl_slot], t_tl_label, sizeof(t_tl_label));
+        }
+    }
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
+
+static int g_bar_every = 0;
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
     if (encoder->rec) {
@@ -1288,12 +1423,24 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
     if (mode < 0) {
         const char * v = getenv("GGML_METAL_BARRIER");
         mode = v && strcmp(v, "scope") == 0 ? 0 : 1;
+        // GGML_METAL_BARRIER=none[,n]: profiling only, results are garbage: no step boundaries at all (or only every
+        // n-th one), so the kernels of a token overlap; the GPU time left is the work without the serial waits
+        if (v && strncmp(v, "none", 4) == 0) {
+            mode = 2;
+            g_bar_every = v[4] == 0x2c ? atoi(v + 5) : 0;
+        }
     }
-    if (mode == 1) {
+    if (mode == 2) {
+        static atomic_int n_bar = 0;
+        const int k = atomic_fetch_add(&n_bar, 1);
+        if (g_bar_every <= 0 || k % g_bar_every != 0) {
+            return;
+        }
+    }
+    if (mode >= 1) {
         [encoder->obj endEncoding];
         [encoder->obj release];
-        encoder->obj = encoder->concurrent ?
-            [encoder->cmd computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent] : [encoder->cmd computeCommandEncoder];
+        encoder->obj = ggml_metal_new_compute_encoder(encoder->cmd, encoder->concurrent, &encoder->tl_slot);
         [encoder->obj retain];
         return;
     }

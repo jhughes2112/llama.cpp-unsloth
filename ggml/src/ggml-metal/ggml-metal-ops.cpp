@@ -620,6 +620,13 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
 
+    static const bool tl = getenv("GGML_METAL_TIMELINE") != nullptr;
+    if (tl) {
+        char lab[64];
+        snprintf(lab, sizeof(lab), "%s:%s", ggml_op_desc(ctx->node(idx)), ctx->node(idx)->name);
+        ggml_metal_timeline_label(lab);
+    }
+
     int res = ggml_metal_op_encode_impl(ctx, idx);
 
     {
