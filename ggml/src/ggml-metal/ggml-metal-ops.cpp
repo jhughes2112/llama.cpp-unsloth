@@ -3201,6 +3201,8 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*(ne20*ne21 + ne02);
 }
 
+static void ggml_metal_op_fused_concurrency(ggml_metal_op_t ctx, int idx, int n);
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3344,6 +3346,71 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
         }
     } else {
+        // the NVFP4 gate_up with the expert-scaled SiTU right after it (GGML_METAL_FUSION_EXPERT_SITU on this output,
+        // the same ids): one kernel, the SiTU step gone (GGML_METAL_MUL_MV_ID_SITU_DISABLE to keep the two)
+        static const bool situ_off = getenv("GGML_METAL_MUL_MV_ID_SITU_DISABLE") != nullptr;
+        if (!situ_off && ctx->use_fusion() && op->src[0]->type == GGML_TYPE_NVFP4 && op->src[1]->type == GGML_TYPE_F32 &&
+            ne00 % 64 == 0 && ne1 == ne20 && op->ne[2] == ne21) {
+            int n2 = 0;
+            const ggml_metal_fusion * fusion = ctx->can_fuse(idx + 1, GGML_METAL_FUSION_FULL, &n2);
+            if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_EXPERT_SITU) {
+                const ggml_tensor * rep   = ctx->node(idx + 1 + 0);
+                const ggml_tensor * rows  = ctx->node(idx + 1 + 1);
+                const ggml_tensor * mul   = ctx->node(idx + 1 + 2);
+                const ggml_tensor * g_in  = ctx->node(idx + 1 + 3);
+                const ggml_tensor * g_out = ctx->node(idx + 1 + 5);
+                const ggml_tensor * u_in  = ctx->node(idx + 1 + 8);
+                const ggml_tensor * u_out = ctx->node(idx + 1 + 10);
+                ggml_tensor *       dsta  = ctx->node(idx + 1 + n2 - 1);
+                const ggml_tensor * gate  = g_in->src[0];
+                const ggml_tensor * up    = u_in->src[0];
+                const int nh = (int) dsta->ne[0];
+                const int nsg = 2;
+                if (mul->src[0] == op && rows->src[1] == op->src[2] && rep->src[0]->type == GGML_TYPE_F32 &&
+                    gate->view_offs % sizeof(float) == 0 && up->view_offs % sizeof(float) == 0 &&
+                    gate->ne[0] == nh && up->ne[0] == nh && nh % (2*nsg) == 0 &&
+                    dsta->ne[1] == ne20 && dsta->ne[2] == ne21 && ggml_is_contiguous(dsta) && ggml_is_contiguous(op)) {
+                    ctx->count_fusions(fusion);
+                    ggml_metal_op_fused_concurrency(ctx, idx, 1 + n2);
+
+                    ggml_metal_kargs_mul_mv_id_situ args = {
+                        /*.nei0 =*/ ne20,
+                        /*.nei1 =*/ ne21,
+                        /*.nbi1 =*/ nb21,
+                        /*.ne00 =*/ ne00,
+                        /*.ne0  =*/ ne0,
+                        /*.nb01 =*/ nb01,
+                        /*.nb02 =*/ nb02,
+                        /*.ne11 =*/ ne11,
+                        /*.nh   =*/ nh,
+                        /*.nb11 =*/ nb11,
+                        /*.nb12 =*/ nb12,
+                        /*.goff =*/ (int32_t) (gate->view_offs/sizeof(float)),
+                        /*.uoff =*/ (int32_t) (up->view_offs/sizeof(float)),
+                        /*.ga   =*/ ggml_get_op_params_f32(g_in,  0),
+                        /*.gb   =*/ ggml_get_op_params_f32(g_out, 0),
+                        /*.ua   =*/ ggml_get_op_params_f32(u_in,  0),
+                        /*.ub   =*/ ggml_get_op_params_f32(u_out, 0),
+                    };
+
+                    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_mul_mv_id_nvfp4_situ");
+
+                    ggml_metal_encoder_set_pipeline(enc, pipeline);
+                    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                    ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                    ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                    ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+                    ggml_metal_encoder_set_buffer  (enc, bid_src2, 4);
+                    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rep->src[0]), 5);
+                    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dsta), 6);
+                    ggml_metal_encoder_set_threadgroup_memory_size(enc, 1024, 0);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, nh/(2*nsg), 1, ne20*ne21, 32, nsg, 1);
+
+                    return 1 + n2;
+                }
+            }
+        }
+
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
 
         const int nr0 = pipeline.nr0;

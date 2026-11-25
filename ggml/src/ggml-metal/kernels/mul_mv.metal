@@ -3527,6 +3527,117 @@ template [[host_name("kernel_mul_mv_id_q5_1_f32")]]    kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4>>>;
 template [[host_name("kernel_mul_mv_id_nvfp4_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_nvfp4_f32_impl<N_R0_NVFP4>>>;
 
+// the NVFP4 expert gate_up mat-vec and, in the same simdgroup, the SiTU of the expert-scaled halves (the step of
+// kernel_expert_situ_f32 gone). a simdgroup computes 2 gate rows and the 2 up rows of the same channels, with the
+// lane layout of kernel_mul_mv_nvfp4_f32_impl (the same sums in the same order); it writes the raw rows too (dst) and
+// the activation (act). threadgroup memory: the byte table, 1 KB
+kernel void kernel_mul_mv_id_nvfp4_situ(
+        constant ggml_metal_kargs_mul_mv_id_situ & args,
+        device const char  * src0s,
+        device const char  * src1,
+        device       char  * dst,
+        device const char  * ids,
+        device const float * scale,
+        device       float * act,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort NSG  [[simdgroups_per_threadgroup]]) {
+    threadgroup half2 * lut = (threadgroup half2 *) shmem;
+    for (short j = sgitg*32 + tiisg; j < 256; j += NSG*32) {
+        lut[j] = half2((half) kvalues_mxfp4_f[j & 15], (half) kvalues_mxfp4_f[j >> 4]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int iid1 = tgpig.z/args.nei0; // token
+    const int idx  = tgpig.z%args.nei0; // expert slot
+
+    const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+
+    const int ch = (tgpig.x*NSG + sgitg)*2; // first of the 2 channels
+
+    device float * dst_cur = (device float *) dst + ((ulong) iid1*args.nei0 + idx)*args.ne0;
+    device float * act_cur = act + ((ulong) iid1*args.nei0 + idx)*args.nh;
+
+    if (i02 == -1) {
+        if (tiisg == 0) {
+            for (int k = 0; k < 2; ++k) {
+                dst_cur[args.goff + ch + k] = 0.0f;
+                dst_cur[args.uoff + ch + k] = 0.0f;
+                act_cur[ch + k] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const int rows[4] = { args.goff + ch, args.goff + ch + 1, args.uoff + ch, args.uoff + ch + 1 };
+
+    device const char  * w0 = src0s + (ulong) i02*args.nb02;
+    device const float * y  = (device const float *) (src1 + (idx % args.ne11)*args.nb11 + iid1*args.nb12);
+
+    const int nb = args.ne00/QK_NVFP4;
+
+    const short ix   = tiisg/4;
+    const short iq   = tiisg%4;
+    const short boff = 16*(iq/2) + 8*(iq%2);
+
+    float4 yl[4];
+    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };
+
+    device const float * yb = y + ix*QK_NVFP4 + iq*QK_NVFP4_SUB;
+
+    for (int ib = ix; ib < nb; ib += 8) {
+        device const float4 * y4 = (device const float4 *) yb;
+
+        FOR_UNROLL (short i = 0; i < 4; ++i) {
+            yl[i] = y4[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < 4; row++) {
+            device const block_nvfp4 & xb = ((device const block_nvfp4 *) (w0 + (ulong) rows[row]*args.nb01))[ib];
+            device const uint * qp = (device const uint *) (xb.qs + boff);
+            const uint lo = qp[0];
+            const uint hi = qp[1];
+
+            const half2 v0 = lut[lo & 255], v1 = lut[(lo >> 8) & 255], v2 = lut[(lo >> 16) & 255], v3 = lut[lo >> 24];
+            const half2 v4 = lut[hi & 255], v5 = lut[(hi >> 8) & 255], v6 = lut[(hi >> 16) & 255], v7 = lut[hi >> 24];
+
+            float4 acc1 = yl[0]*float4(v0.x, v1.x, v2.x, v3.x);
+            float4 acc2 = yl[1]*float4(v4.x, v5.x, v6.x, v7.x);
+            float4 acc3 = yl[2]*float4(v0.y, v1.y, v2.y, v3.y);
+            float4 acc4 = yl[3]*float4(v4.y, v5.y, v6.y, v7.y);
+
+            acc1 = (acc1 + acc3) + (acc2 + acc4);
+
+            sumf[row] += ue4m3_to_fp32(xb.d[iq]) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+        }
+
+        yb += 8 * QK_NVFP4;
+    }
+
+    float tot[4];
+    FOR_UNROLL (short row = 0; row < 4; row++) {
+        tot[row] = simd_sum(sumf[row]);
+    }
+
+    if (tiisg == 0) {
+        const float c = scale[i02];
+        FOR_UNROLL (short k = 0; k < 2; ++k) {
+            dst_cur[rows[k]]     = tot[k];
+            dst_cur[rows[k + 2]] = tot[k + 2];
+
+            // as kernel_expert_situ_f32
+            const float g = c*tot[k];
+            const float u = c*tot[k + 2];
+
+            const float a = (args.gb*precise::tanh(args.ga*g))*(1/(1 + exp(-g)));
+
+            act_cur[ch + k] = a*(args.ub*precise::tanh(args.ua*u));
+        }
+    }
+}
+
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
 template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
 template [[host_name("kernel_mul_mv_id_q4_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <N_R0_Q4_K>>>;

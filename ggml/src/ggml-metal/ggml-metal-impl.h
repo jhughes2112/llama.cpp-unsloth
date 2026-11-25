@@ -820,6 +820,27 @@ typedef struct {
     float    ub;
 } ggml_metal_kargs_expert_situ;
 
+// the NVFP4 expert gate_up mat-vec with the expert scale and SiTU of its two halves (kernel_mul_mv_id_nvfp4_situ)
+typedef struct {
+    int32_t  nei0;    // experts used
+    int32_t  nei1;    // tokens
+    uint64_t nbi1;    // stride of the ids
+    int32_t  ne00;    // inputs
+    int32_t  ne0;     // rows of the merged gate_up output
+    uint64_t nb01;    // weights: row and expert strides
+    uint64_t nb02;
+    int32_t  ne11;    // src1: rows, strides
+    int32_t  nh;      // of a half: rows (channels of the SiTU output)
+    uint64_t nb11;
+    uint64_t nb12;
+    int32_t  goff;    // first row of the gate and the up half in the merged output
+    int32_t  uoff;
+    float    ga;      // gate: gb*tanh(ga*x)*sigmoid(x)
+    float    gb;
+    float    ua;      // up: ub*tanh(ua*x)
+    float    ub;
+} ggml_metal_kargs_mul_mv_id_situ;
+
 typedef struct {
     int32_t  ne0;     // n_embd
     int32_t  ne1;     // experts used
