@@ -1339,6 +1339,7 @@ static struct {
     int min_steps;      // shortest run of steps worth a persistent dispatch
     int gen;            // generation of the compiled megakernel
     id<MTLComputePipelineState> pso;
+    id<MTLComputePipelineState> pso_one; // kernel_mega_one (GGML_METAL_MEGA_ONESHOT)
     NSMutableArray * old_psos; // kept: command buffers do not retain them
     ggml_metal_library_t lib;
     ggml_metal_pipeline_t * pipes;
@@ -1463,7 +1464,7 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
     for (int i = 0; i < r->n && !missing; ++i) {
         ggml_metal_pipeline_t pl = r->d[i].pl;
         if (pl->mega_never || pl->mega_gen == g_mega.gen) continue;
-        if (pl->kind < 0 || !ggml_metal_mega_kind_ok(pl->kind) || !g_mega.lib || !ggml_metal_mega_included(pl->base)) { pl->mega_never = true; continue; }
+        if (pl->kind < 0 || !ggml_metal_mega_kind_ok(pl->kind) || !g_mega.lib || (!ggml_metal_mega_included(pl->base) && !getenv("GGML_METAL_MEGA_LIB_ALL"))) { pl->mega_never = true; continue; }
         missing = true;
     }
     if (getenv("GGML_METAL_MEGA_VERBOSE") && r->n > 0) {
@@ -1533,6 +1534,14 @@ static void ggml_metal_mega_update(struct ggml_metal_mega_rec * r) {
                 id<MTLFunction> fn = [mlib newFunctionWithName:@"kernel_mega"];
                 pso = fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
                 [fn release];
+                id<MTLFunction> fn1 = [mlib newFunctionWithName:@"kernel_mega_one"];
+                if (g_mega.pso_one) [g_mega.old_psos addObject:g_mega.pso_one];
+                g_mega.pso_one = fn1 ? [device newComputePipelineStateWithFunction:fn1 error:&error] : nil;
+                [fn1 release];
+                if (pso) {
+                    fprintf(stderr, "ggml_metal_mega: kernel_mega max %d threads a threadgroup, kernel_mega_one %d\n",
+                            (int) pso.maxTotalThreadsPerThreadgroup, g_mega.pso_one ? (int) g_mega.pso_one.maxTotalThreadsPerThreadgroup : 0);
+                }
                 [mlib release];
                 if (pso && pso.maxTotalThreadsPerThreadgroup < GGML_METAL_MEGA_THREADS) {
                     fprintf(stderr, "ggml_metal_mega: the megakernel runs only %d threads a threadgroup, off\n", (int) pso.maxTotalThreadsPerThreadgroup);
@@ -1813,6 +1822,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             for (int i = e0; i < e1; ++i) {
                 ggml_metal_mega_entry * e = &en[i - e0];
                 *e = ent[i];
+                { static int os = -1; if (os < 0) os = getenv("GGML_METAL_MEGA_ONE_STOP") ? atoi(getenv("GGML_METAL_MEGA_ONE_STOP")) : 0; e->pad0 = os; }
                 const struct ggml_metal_mega_disp * d = &r->d[i];
                 for (int j = 0; j < d->nb && j < GGML_METAL_MEGA_NB; ++j) {
                     if (d->b[j].bytes_off >= 0) {
@@ -1845,6 +1855,28 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
                 }
             }
 
+            static int oneshot = -1;
+            if (oneshot < 0) oneshot = getenv("GGML_METAL_MEGA_ONESHOT") != NULL;
+            if (oneshot && g_mega.pso_one) {
+                // the generated code, launched as ordinary dispatches: an encoder a step, a threadgroup an item
+                for (int k = s; k < t; ++k) {
+                    int slot = -1;
+                    id<MTLComputeCommandEncoder> enc = ggml_metal_new_compute_encoder(cmd, encoder->concurrent, &slot);
+                    [enc setComputePipelineState:g_mega.pso_one];
+                    [enc setBuffer:rb offset:o_arg atIndex:0];
+                    if (!getenv("GGML_METAL_MEGA_NOUSE")) [enc useResources:res count:n_res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                    for (int i = sfirst[k]; i < sfirst[k + 1]; ++i) {
+                        const ggml_metal_mega_entry * e = &en[i - e0];
+                        [enc setBuffer:rb offset:o_ent + (i - e0)*sizeof(ggml_metal_mega_entry) atIndex:1];
+                        [enc setThreadgroupMemoryLength:MAX(16, (e->lanes*e->smem_lane + 15) & ~15) atIndex:0];
+                        [enc dispatchThreadgroups:MTLSizeMake(e->n_items, 1, 1) threadsPerThreadgroup:MTLSizeMake(GGML_METAL_MEGA_THREADS, 1, 1)];
+                    }
+                    [enc endEncoding];
+                }
+                g_mega.n_steps_mega += t - s;
+                s = t;
+                continue;
+            }
             int slot = -1;
             id<MTLComputeCommandEncoder> enc = ggml_metal_new_compute_encoder(cmd, encoder->concurrent, &slot);
             [enc setComputePipelineState:g_mega.pso];
@@ -1854,7 +1886,7 @@ static void ggml_metal_mega_flush(ggml_metal_encoder_t encoder) {
             [enc setBuffer:rb offset:o_ctr atIndex:3];
             [enc setBytes:&prm length:sizeof(prm) atIndex:4];
             [enc setThreadgroupMemoryLength:(smem + 15) & ~15 atIndex:0];
-            [enc useResources:res count:n_res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+            if (!getenv("GGML_METAL_MEGA_NOUSE")) [enc useResources:res count:n_res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
             [enc dispatchThreadgroups:MTLSizeMake(g_mega.R, 1, 1) threadsPerThreadgroup:MTLSizeMake(GGML_METAL_MEGA_THREADS, 1, 1)];
             [enc endEncoding];
             g_mega.n_steps_mega += t - s;

@@ -215,7 +215,7 @@ static const char * k_prelude = R"(
 // ---- megakernel: the kernels below are device functions ----
 struct mega_ctx {
     constant char * argblob;
-    device const ggml_metal_mega_entry * e;
+    constant ggml_metal_mega_entry * e;
     threadgroup char * shmem0;
     threadgroup char * shmem1;
     uint3  tgpig;
@@ -260,7 +260,11 @@ struct mega_u1 {
 static inline mega_bind mega_b(thread const mega_ctx & c, int i) {
     return mega_bind{ c.argblob + c.e->a[i], (device char *) c.e->p[i] };
 }
+#ifdef GGML_METAL_MEGA_NOINLINE_TEST
 #define kernel
+#else
+#define kernel
+#endif
 #define host_name(x)
 #define buffer(x)
 #define threadgroup(x)
@@ -277,8 +281,8 @@ MEGA_UNDEF_ATTRS
 // threadgroups, a grid barrier between two steps
 kernel void kernel_mega(
         constant char                         * argblob [[buffer(0)]],
-        device const ggml_metal_mega_entry    * E       [[buffer(1)]],
-        device const ggml_metal_mega_step     * S       [[buffer(2)]],
+        constant ggml_metal_mega_entry    * E       [[buffer(1)]],
+        constant ggml_metal_mega_step     * S       [[buffer(2)]],
         device atomic_uint                    * bar     [[buffer(3)]],
         constant ggml_metal_mega_params       & P       [[buffer(4)]],
         threadgroup char                      * shmem   [[threadgroup(0)]],
@@ -295,11 +299,13 @@ kernel void kernel_mega(
         const uint e0 = S[s].e0;
         const uint ni = S[s].n_items;
         const bool work = P.pad[1] != 2 && (P.pad[2] == 0 || s + 1 < P.pad[2]); // STOP=2: steps and barriers only; UPTO
-        for (uint g = tg; g < ni && work; g += R) {
+        // STOP=4: each threadgroup only its first item of a step; STOP=5: only item 0, on threadgroup 0
+        const uint g_end = P.pad[1] == 4 ? min(ni, tg + 1) : P.pad[1] == 5 ? (tg == 0 ? min(ni, 1u) : 0u) : ni;
+        for (uint g = tg; g < g_end && work; g += R) {
             uint e  = e0;
             uint gi = g;
             while (gi >= (uint) E[e].n_items) { gi -= E[e].n_items; ++e; }
-            device const ggml_metal_mega_entry * en = E + e;
+            constant ggml_metal_mega_entry * en = E + e;
             const uint w    = en->width;
             const uint lane = ti/w;
             if (lane >= (uint) en->lanes) {
@@ -311,6 +317,9 @@ kernel void kernel_mega(
                     continue;
                 }
                 v = en->n_vtg - 1;
+            }
+            if (P.pad[1] == 6) {
+                v = 0; // STOP=6: the same work, every item on the data of threadgroup 0 (cache-resident)
             }
             const uint tt = en->tptg[0]*en->tptg[1]*en->tptg[2]; // threads the kernel sees
             for (uint rp = 0; rp < (uint) en->reps; ++rp) {
@@ -359,6 +368,59 @@ MEGA_CASES
             if (aborted) {
                 return;
             }
+        }
+    }
+}
+
+// the same code as the persistent kernel runs for an item, launched as an ordinary dispatch: a threadgroup an item of
+// one entry (GGML_METAL_MEGA_ONESHOT, to tell the code it generates from the way the persistent kernel runs it)
+kernel void kernel_mega_one(
+        constant char                         * argblob [[buffer(0)]],
+        constant ggml_metal_mega_entry    * en      [[buffer(1)]],
+        threadgroup char                      * shmem   [[threadgroup(0)]],
+        uint   gi [[threadgroup_position_in_grid]],
+        ushort ti [[thread_index_in_threadgroup]]) {
+    if (en->pad0 == 2) {
+        return; // GGML_METAL_MEGA_ONE_STOP=2: nothing
+    }
+    const uint w    = en->width;
+    const uint lane = ti/w;
+    if (lane >= (uint) en->lanes) {
+        return;
+    }
+    uint v = gi*en->lanes + lane;
+    if (v >= (uint) en->n_vtg) {
+        if (en->idle_ok) {
+            return;
+        }
+        v = en->n_vtg - 1;
+    }
+    const uint tt = en->tptg[0]*en->tptg[1]*en->tptg[2];
+    for (uint rp = 0; rp < (uint) en->reps; ++rp) {
+        const uint lt = ti - lane*w + rp*w;
+        if (lt >= tt) {
+            break;
+        }
+        mega_ctx c;
+        c.argblob = argblob;
+        c.e       = en;
+        c.shmem0  = shmem + lane*en->smem_lane;
+        c.shmem1  = c.shmem0 + en->smem0;
+        c.ngrid   = uint3(en->grid[0], en->grid[1], en->grid[2]);
+        c.tgpig   = uint3(v % c.ngrid.x, (v/c.ngrid.x) % c.ngrid.y, v/(c.ngrid.x*c.ngrid.y));
+        c.ntg     = uint3(en->tptg[0], en->tptg[1], en->tptg[2]);
+        c.tpitg   = uint3(lt % c.ntg.x, (lt/c.ntg.x) % c.ntg.y, lt/(c.ntg.x*c.ntg.y));
+        c.tiitg   = lt;
+        c.sgitg   = lt/32;
+        c.tiisg   = lt%32;
+        c.nsg     = (tt + 31)/32;
+        if (en->pad0 == 1) {
+            if (c.tgpig.x == 0xffffffffu && (device char *) mega_b(c, 0).p == nullptr) shmem[0] = 0; // keep the prologue
+            return; // GGML_METAL_MEGA_ONE_STOP=1: the prologue only
+        }
+        switch (en->pipe) {
+MEGA_CASES
+            default: break;
         }
     }
 }
