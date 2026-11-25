@@ -226,6 +226,26 @@ struct common_speculative_impl {
         bool & on; double & tokens; int & bad; int & probes; size_t & idle;
     };
 
+    // measured costs (LLAMA_SPEC_FIXED_COST=1: the formula of row_breakeven only): the ms of a plain round after a
+    // plain round, the extra ms of the plain round after a verified one (the graph of another batch size), and the ms
+    // of this implementation's rounds by rows (drafting, verify and sampling: draft call to draft call)
+    static double & row_t_plain()  { static double t = 0.0; return t; }
+    static double & row_t_switch() { static double t = 0.0; return t; }
+    double row_t[33] = { 0.0 };
+    int    row_n[33] = { 0 };
+
+    // what a round of n rows costs, in plain tokens, from the measurements (0: not enough of them yet)
+    double row_measured(size_t n_rows) const {
+        static const bool fixed_only = getenv("LLAMA_SPEC_FIXED_COST") != nullptr;
+        const size_t k = std::min<size_t>(n_rows, 32);
+        if (fixed_only || row_t_plain() <= 0.0 || row_n[k] < 2) {
+            return 0.0;
+        }
+        // the switch of batch size is paid only when the drafts start or stop, not by back-to-back rounds: it goes
+        // into the threshold for turning on (row_update), not into the cost of a round
+        return row_t[k]/row_t_plain();
+    }
+
     row_switch row_state() { return { row_on, row_tokens, row_bad, row_probes, row_idle }; }
 
     // off: true when a shadow draft is due (every eighth round, every fourth for the first few after it went off)
@@ -236,12 +256,15 @@ struct common_speculative_impl {
 
     // the accepted rows of a round vary a lot around their mean (0 to 7 around 3.5 on code), so both directions go by
     // a decayed mean with a margin, not by single rounds: three poor rounds in a row happen in most requests
-    static void row_update(row_switch st, size_t n_drafted, size_t n_accepted, double fixed) {
+    static void row_update(row_switch st, size_t n_drafted, size_t n_accepted, double fixed, double measured = 0.0) {
         if (n_drafted == 0) {
             return;
         }
         const double tok  = 1.0 + (double) n_accepted;
-        const double cost = row_breakeven(n_drafted, fixed);
+        const double cost = measured > 0.0 ? measured : row_breakeven(n_drafted, fixed);
+        if (getenv("LLAMA_SPEC_COST_DEBUG")) {
+            fprintf(stderr, "spec-cost: on %d rows %zu acc %zu tok %.2f cost %.2f (measured %.2f, plain %.2f ms, switch %.2f ms)\n", (int) st.on, n_drafted, n_accepted, st.tokens, cost, measured, row_t_plain(), row_t_switch());
+        }
         if (st.on) {
             st.tokens = st.tokens > 0.0 ? 0.9*st.tokens + 0.1*tok : std::max(tok, cost + 1.0);
             st.bad    = n_accepted <= 1 ? st.bad + 1 : 0;
@@ -256,7 +279,8 @@ struct common_speculative_impl {
             // shadow drafts: their mean, and on after at least two of them
             st.tokens = st.probes > 0 ? 0.6*st.tokens + 0.4*tok : tok;
             st.probes++;
-            if (st.probes >= 2 && st.tokens >= cost + 0.25) {
+            const double sw = measured > 0.0 && row_t_plain() > 0.0 ? row_t_switch()/row_t_plain() : 0.0;
+            if (st.probes >= 2 && st.tokens >= cost + sw + 0.25) {
                 st.on     = true;
                 st.tokens = cost + 1.0;
                 st.probes = 0;
@@ -3147,7 +3171,7 @@ struct common_speculative_impl_ngram_stat : public common_speculative_impl {
                 }
                 if (ended || n_ok == st.shadow.size()) {
                     if (h.size() >= st.shadow_start) {
-                        row_update(cls_state(st.shadow_cls), st.shadow.size(), n_ok, row_fixed());
+                        row_update(cls_state(st.shadow_cls), st.shadow.size(), n_ok, row_fixed(), row_measured(st.shadow.size()));
                     }
                     st.shadow_cls = -1;
                 }
@@ -3214,7 +3238,7 @@ struct common_speculative_impl_ngram_stat : public common_speculative_impl {
     void observe_round(llama_seq_id seq_id, size_t n_drafted, size_t n_accepted) override {
         auto & st = seqs[seq_id];
         if (st.cls_last >= 0) {
-            row_update(cls_state(st.cls_last), n_drafted, n_accepted, row_fixed());
+            row_update(cls_state(st.cls_last), n_drafted, n_accepted, row_fixed(), row_measured(n_drafted));
         }
         st.cls_last = -1;
     }
@@ -3228,6 +3252,10 @@ struct common_speculative {
 
     // which implementaion was used for a given seq_id
     std::vector<common_speculative_impl *> impl_last;
+
+    // the rows and the implementation of the round in flight (one sequence), for the measured costs
+    size_t                    rc_rows = 0;
+    common_speculative_impl * rc_impl = nullptr;
 
     std::vector<double> synth_probs;
 
@@ -3968,6 +3996,33 @@ void common_speculative_draft(common_speculative * spec) {
     static int64_t trace_t = 0;
     static size_t  trace_rows = 0, trace_acc = 0;
     const int64_t trace_now = ggml_time_us();
+    {
+        static int64_t                   rc_t      = 0;
+        static size_t                    rc_rows_prev = 0; // the rows of the round before the one that ended
+        if (rc_t > 0 && dparams.size() == 1) {
+            const double dt = (trace_now - rc_t)/1000.0;
+            // a gap over 4x the plain round is the end of a request, not a round
+            const bool sane = common_speculative_impl::row_t_plain() <= 0.0 || dt < 4.0*common_speculative_impl::row_t_plain() + 40.0;
+            if (sane && spec->rc_rows == 0) {
+                double & tp = common_speculative_impl::row_t_plain();
+                if (rc_rows_prev == 0) {
+                    tp = tp > 0.0 ? 0.95*tp + 0.05*dt : dt;
+                } else if (tp > 0.0) {
+                    double & ts = common_speculative_impl::row_t_switch();
+                    ts = 0.8*ts + 0.2*std::max(0.0, dt - tp);
+                }
+            } else if (sane && spec->rc_impl != nullptr) {
+                const size_t k = std::min<size_t>(spec->rc_rows, 32);
+                spec->rc_impl->row_t[k] = spec->rc_impl->row_n[k] > 0 ? 0.8*spec->rc_impl->row_t[k] + 0.2*dt : dt;
+                spec->rc_impl->row_n[k]++;
+            }
+        }
+        rc_rows_prev = spec->rc_rows;
+        rc_t = trace_now;
+        // the rows of this call's round are set at its end
+        spec->rc_rows = 0;
+        spec->rc_impl = nullptr;
+    }
     if (trace) {
         if (!spec->n_draft_last.empty() && spec->n_draft_last[0] == 0 && trace_rows > 0) {
             trace_acc = spec->trace_acc;
@@ -3994,7 +4049,8 @@ void common_speculative_draft(common_speculative * spec) {
         }
         if (ended || n_ok == spec->shadow.size()) {
             if (n_hist >= spec->shadow_start) {
-                common_speculative_impl::row_update(spec->shadow_impl->row_state(), spec->shadow.size(), n_ok, spec->shadow_impl->row_fixed());
+                common_speculative_impl::row_update(spec->shadow_impl->row_state(), spec->shadow.size(), n_ok, spec->shadow_impl->row_fixed(),
+                        spec->shadow_impl->row_measured(spec->shadow.size()));
             }
             spec->shadow_impl = nullptr;
         }
@@ -4110,6 +4166,12 @@ void common_speculative_draft(common_speculative * spec) {
         trace_t = trace_now;
     }
 
+    // the rows of this round, for its cost (measured at the next call)
+    if (!spec->n_draft_last.empty()) {
+        spec->rc_rows = spec->n_draft_last[0];
+        spec->rc_impl = spec->rc_rows > 0 ? spec->impl_last[0] : nullptr;
+    }
+
     // these sequences failed to generate a draft
     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
         auto & dp = dparams[seq_id];
@@ -4161,7 +4223,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         spec->n_draft_last[seq_id] = 0;
         spec->trace_acc = n_accepted;
         if (!impl->chooses_rows()) {
-            common_speculative_impl::row_update(impl->row_state(), n_drafted, n_accepted, impl->row_fixed());
+            common_speculative_impl::row_update(impl->row_state(), n_drafted, n_accepted, impl->row_fixed(), impl->row_measured(n_drafted));
         }
         impl->observe_round(seq_id, n_drafted, n_accepted);
     }
