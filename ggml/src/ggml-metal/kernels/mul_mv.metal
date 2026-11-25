@@ -3786,3 +3786,121 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
 template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
+
+
+// the Q8_0 mat-vec of one token with the short convolution of its output in the epilogue (kernel_short_conv_f32: per
+// channel, so the threadgroup that makes a row also convolves it): dst = the raw rows (for any other reader), cdst =
+// s*(x + conv) + b (+ res), cell <- the window. one step instead of two
+[[host_name("kernel_mul_mv_q8_0_f32_conv")]]
+kernel void kernel_mul_mv_q8_0_f32_conv(
+        constant ggml_metal_kargs_mul_mv     & args,
+        device const char  * src0,
+        device const char  * src1,
+        device       char  * dst,
+        constant ggml_metal_kargs_short_conv & ca,
+        device const char  * past,
+        device const float * w,
+        device       char  * cell,
+        device       float * cdst,
+        device const float * res,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = N_R0_Q8_0;
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+
+    device const float * y = (device const float *) src1;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + (uint64_t) (r0 + row)*args.nb01);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[NQ];
+
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+
+        yb += NSG*NQ*QK8_0;
+    }
+
+    threadgroup float * sh = (threadgroup float *) shmem;
+
+    if (sgitg == 0) {
+        for (short row = 0; row < NR0; ++row) {
+            sh[NW*row + tiisg] = 0.0f;
+        }
+    }
+    for (short row = 0; row < NR0; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        for (short row = 0; row < NR0; ++row) {
+            sh[NW*row + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        const float x = simd_sum(sh[NW*row + tiisg]);
+        const int   c = r0 + row;
+        if (sgitg == 0 && tiisg == row && c < args.ne01 && ca.nc == 0) {
+            ((device float *) dst)[c] = x;
+        } else if (sgitg == 0 && tiisg == row && c < args.ne01) {
+            const int nh = ca.nc - 1;
+            float h[8];
+            device const float * pp = (device const float *) past + c*nh;
+            for (int j = 0; j < nh; ++j) {
+                h[j] = pp[j];
+            }
+            device const float * wc = w + c*ca.nc;
+            float acc = 0.0f;
+            for (int j = 0; j < nh; ++j) {
+                acc += h[j]*wc[j];
+            }
+            acc += x*wc[nh];
+            const float r = ca.has_res ? res[c] : 0.0f;
+            ((device float *) dst)[c] = x;
+            cdst[c] = ca.s*(x + acc) + ca.b + r;
+            device float * q = (device float *) cell + c*nh;
+            for (int j = 0; j < nh - 1; ++j) {
+                q[j] = h[j + 1];
+            }
+            q[nh - 1] = x;
+        }
+    }
+}

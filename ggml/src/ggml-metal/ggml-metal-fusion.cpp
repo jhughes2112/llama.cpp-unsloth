@@ -2947,6 +2947,24 @@ void ggml_metal_fusion_add_alloc_deps(
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
             if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {
                 ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, &fusion, i);
+
+                // a short conv whose input is a mat-vec: the encoder may run the conv in the epilogue of that mat-vec
+                // (kernel_mul_mv_q8_0_f32_conv), so the inputs of the mat-vec stay until the conv is done (its output
+                // could otherwise take the memory of the vector the other threadgroups are still reading)
+                if (fusion.id == GGML_METAL_FUSION_SHORT_CONV) {
+                    const int last = i + (int) fusion.ops_all.size() - 1;
+                    for (int j = i; j <= last; ++j) {
+                        const ggml_tensor * nd = gf->nodes[j];
+                        if (nd->op == GGML_OP_ADD && nd->src[0] && nd->src[0]->op == GGML_OP_MUL_MAT) {
+                            for (int s = 0; s < 2; ++s) {
+                                for (ggml_tensor * t = nd->src[0]->src[s]; t != nullptr; t = t->view_src) {
+                                    add_alloc_dep(user_data, t, gf->nodes[last]);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
