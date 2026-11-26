@@ -106,7 +106,7 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_TANH) {
-            dst_ptr[i0] = ggml_metal_unary_cast<T>(precise::tanh(x));
+            dst_ptr[i0] = ggml_metal_unary_cast<T>(fast::tanh(x));
         }
 
         if (FC_OP == OP_UNARY_NUM_RELU) {
@@ -118,7 +118,7 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU) {
-            dst_ptr[i0] = ggml_metal_unary_cast<T>(0.5*x*(1 + precise::tanh(SQRT_2_OVER_PI*x*(1 + GELU_COEF_A*x*x))));
+            dst_ptr[i0] = ggml_metal_unary_cast<T>(0.5*x*(1 + fast::tanh(SQRT_2_OVER_PI*x*(1 + GELU_COEF_A*x*x))));
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU_ERF) {
@@ -274,7 +274,7 @@ kernel void kernel_geglu(
         const float x0 = src0_row[i0];
         const float x1 = src1_row[i0];
 
-        const float gelu = 0.5f*x0*(1.0f + precise::tanh(SQRT_2_OVER_PI*x0*(1.0f + GELU_COEF_A*x0*x0)));
+        const float gelu = 0.5f*x0*(1.0f + fast::tanh(SQRT_2_OVER_PI*x0*(1.0f + GELU_COEF_A*x0*x0)));
 
         dst_row[i0] = (T)(gelu*x1);
     }

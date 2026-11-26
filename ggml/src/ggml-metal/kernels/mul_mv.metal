@@ -3727,9 +3727,9 @@ static inline void kernel_mul_mv_id_nvfp4_situ_impl(
             const float g = c*tot[k];
             const float u = c*tot[k + 2];
 
-            const float a = (args.gb*precise::tanh(args.ga*g))*(1/(1 + exp(-g)));
+            const float a = (args.gb*fast::tanh(args.ga*g))*(1/(1 + exp(-g)));
 
-            act_cur[ch + k] = a*(args.ub*precise::tanh(args.ua*u));
+            act_cur[ch + k] = a*(args.ub*fast::tanh(args.ua*u));
         }
     }
 }
@@ -4365,7 +4365,7 @@ static inline void kernel_mul_mv_id_q5_K_situ_impl(
     if (tiisg == 0) {
         dst_cur[args.goff + ch] = g;
         dst_cur[args.uoff + ch] = u;
-        act_cur[ch] = (args.gb*precise::tanh(args.ga*g))*(1/(1 + exp(-g))) * (args.ub*precise::tanh(args.ua*u));
+        act_cur[ch] = (args.gb*fast::tanh(args.ga*g))*(1/(1 + exp(-g))) * (args.ub*fast::tanh(args.ua*u));
     }
 }
 
@@ -4479,7 +4479,7 @@ kernel void kernel_mul_mv_q8_0_f32_softcap(
         const float x = simd_sum(sh[NW*row + tiisg]);
         const int   r = r0 + row;
         if (sgitg == 0 && tiisg == row && r < sa.n) {
-            const float v = sa.b*precise::tanh(sa.a*x);
+            const float v = sa.b*fast::tanh(sa.a*x);
             cdst[r] = v;
             if (sa.has_pad) {
                 pdst[r]        = v;

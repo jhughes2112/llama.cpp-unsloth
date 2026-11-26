@@ -111,7 +111,7 @@ inline void mul_mv_mma_store(
             if (r0 < FC_mul_mv_mma_cap_n && r1 < args.ne11) {
                 const float a = as_type<float>(FC_mul_mv_mma_cap_a);
                 const float b = as_type<float>(FC_mul_mv_mma_cap_b);
-                dst_f32[(uint64_t) r1*FC_mul_mv_mma_cap_n + r0] = b*precise::tanh(a*sum);
+                dst_f32[(uint64_t) r1*FC_mul_mv_mma_cap_n + r0] = b*fast::tanh(a*sum);
             }
         } else if (r0 < args.ne01 && r1 < args.ne11) {
             const uint64_t i = (uint64_t) r1*args.ne0 + r0;

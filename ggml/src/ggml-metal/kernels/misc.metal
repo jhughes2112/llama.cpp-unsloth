@@ -596,9 +596,9 @@ kernel void kernel_situ_f32(
     const float g = *((device const float *) (gate + offs));
     const float u = *((device const float *) (up   + offs));
 
-    const float act = (args.gb*precise::tanh(args.ga*g))*(1/(1 + exp(-g)));
+    const float act = (args.gb*fast::tanh(args.ga*g))*(1/(1 + exp(-g)));
 
-    dst[gid] = act*(args.ub*precise::tanh(args.ua*u));
+    dst[gid] = act*(args.ub*fast::tanh(args.ua*u));
 }
 
 // situ of the gate and up halves of a merged row, each scaled by the scalar of its expert first:
@@ -627,9 +627,9 @@ kernel void kernel_expert_situ_f32(
     const float g = c*((device const float *) row)[i0];
     const float u = c*((device const float *) (row + args.offs_up))[i0];
 
-    const float act = (args.gb*precise::tanh(args.ga*g))*(1/(1 + exp(-g)));
+    const float act = (args.gb*fast::tanh(args.ga*g))*(1/(1 + exp(-g)));
 
-    dst[gid] = act*(args.ub*precise::tanh(args.ua*u));
+    dst[gid] = act*(args.ub*fast::tanh(args.ua*u));
 }
 
 // the weighted sum of the expert outputs, each scaled by the scalar of its expert first:
@@ -670,7 +670,7 @@ kernel void kernel_softcap_f32(
         return;
     }
 
-    dst[(ulong) gid.y*args.ne0 + gid.x] = args.b*precise::tanh(args.a*x[(ulong) gid.y*args.ne0_src + gid.x]);
+    dst[(ulong) gid.y*args.ne0 + gid.x] = args.b*fast::tanh(args.a*x[(ulong) gid.y*args.ne0_src + gid.x]);
 }
 
 // y[i, e, t] = x[i, e, t]*s[ids[e, t]]; dst may be x in place
@@ -934,7 +934,7 @@ kernel void kernel_gated_mix_f32(
         return;
     }
 
-    dst[gid] = (args.s*precise::tanh(f[gid]) + args.b)*x[gid] + precise::tanh(g[gid])*m[gid];
+    dst[gid] = (args.s*fast::tanh(f[gid]) + args.b)*x[gid] + fast::tanh(g[gid])*m[gid];
 }
 // loop controller, the projection to its rank: h[r] = D[r] . [x/rms(x); m/rms(m)], one threadgroup a row and token.
 // every threadgroup sums the squares of x and m again, in the loop of its products
@@ -1074,7 +1074,7 @@ kernel void kernel_ctrl_out_f32(
     g = simd_sum(g);
 
     if (tiisg == 0) {
-        dst[e] = (args.s*precise::tanh(f) + args.b)*x[e] + precise::tanh(g)*m[e];
+        dst[e] = (args.s*fast::tanh(f) + args.b)*x[e] + fast::tanh(g)*m[e];
     }
 }
 // the per-head attention mask with the relative-position bias, one thread per mask element:
