@@ -138,7 +138,7 @@ kernel void kernel_flash_attn_ext_vec(
                 ssq = simd_sum(ssq);
 
                 const float f = clamp(args.qc_c/(args.qc_s*sqrt(ssq) + args.qc_b), args.qc_lo, args.qc_hi);
-                const float t = args.has_qtau ? qtau[iq1_q] : 1.0f;
+                const float t = args.has_qtau ? qtau[iq3*args.ne01 + iq1_q] : 1.0f;
 
                 for (short i = tiisg; i < PK4; i += NW) {
                     if (i < DK4) {
@@ -298,7 +298,8 @@ kernel void kernel_flash_attn_ext_vec(
                 } else if (FC_flash_attn_ext_vec_has_relb) {
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                         if ((iq1*Q + qq) < args.ne01) {
-                            const int   it = iq1*Q + qq;
+                            // the token among all of the batch: the tokens of each sequence one after the other
+                            const int   it = iq3*args.ne01 + iq1*Q + qq;
                             const ulong kv = (ulong) it*args.ne11 + ic + tiisg;
 
                             const float b = reltab[((ulong) it*args.ne02 + iq2)*args.rel_nc1 + relpos[kv]];

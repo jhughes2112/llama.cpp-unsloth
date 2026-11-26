@@ -2367,8 +2367,10 @@ static bool ggml_metal_fusion_check_gather_fa_impl(
 
     const int64_t nc1  = table->ne[0];
     const int64_t H    = table->ne[1];
-    const int64_t T    = table->ne[2];
+    const int64_t T    = table->ne[2];   // tokens of the batch, all sequences
     const int64_t n_kv = mask->ne[0];
+    const int64_t nt   = q->ne[1];       // tokens a sequence
+    const int64_t ns   = q->ne[3];       // sequences (concurrent streams)
 
     for (const ggml_tensor * t : { table, cont1, rows, cont2, add, maskf }) {
         if (t->type != GGML_TYPE_F32) {
@@ -2376,14 +2378,16 @@ static bool ggml_metal_fusion_check_gather_fa_impl(
         }
     }
 
-    // one stream, whole blocks of keys
-    if (!ggml_is_contiguous(table) || table->ne[3] != 1 ||
+    // whole blocks of keys; with several sequences (GGML_METAL_NO_REL_FA_MS=1: one only) the tokens of each sequence
+    // follow each other in the table, the distances and the mask, and the attention has one plane a sequence
+    static const bool one_seq = getenv("GGML_METAL_NO_REL_FA_MS") != nullptr;
+    if ((one_seq && ns != 1) || nt*ns != T || !ggml_is_contiguous(table) || table->ne[3] != 1 ||
         cont1->ne[0] != H || cont1->ne[1] != nc1 || cont1->ne[2] != T || cont1->ne[3] != 1 ||
         pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(pos) || pos->ne[0] != n_kv || pos->ne[1] != T || pos->ne[2] != 1 || pos->ne[3] != 1 ||
-        !ggml_is_contiguous(maskf) || maskf->ne[0] != n_kv || maskf->ne[1] != T || maskf->ne[2] != 1 || maskf->ne[3] != 1 ||
-        mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) || mask->ne[1] != T || mask->ne[2] != H || mask->ne[3] != 1 ||
+        !ggml_is_contiguous(maskf) || maskf->ne[0] != n_kv || maskf->ne[1]*maskf->ne[2]*maskf->ne[3] != T ||
+        mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) || mask->ne[1] != nt || mask->ne[2] != H || mask->ne[3] != ns ||
         !ggml_are_same_shape(cont2, mask) || !ggml_are_same_shape(add, mask) ||
-        q->ne[1] != T || q->ne[2] != H || q->ne[3] != 1 || k->ne[1] != n_kv || k->ne[3] != 1 || n_kv % 32 != 0) {
+        q->ne[2] != H || k->ne[1] != n_kv || (k->ne[3] != 1 && k->ne[3] != ns) || n_kv % 32 != 0) {
         return false;
     }
 
@@ -2496,6 +2500,7 @@ static bool ggml_metal_fusion_check_qclip_gather_fa(
     if (in->ne[3] != 1 || w->ne[0] != in->ne[0] || w->ne[1] != in->ne[1] || w->ne[2] != 1 || w->ne[3] != 1 || in->ne[0] % 4 != 0) {
         return false;
     }
+    // (several sequences: the attention's query is [D, tokens a sequence, heads, sequences] over the [D, heads, tokens] rows)
 
     if (o) {
         const ggml_tensor * tmul = qn[9];
@@ -2507,7 +2512,7 @@ static bool ggml_metal_fusion_check_qclip_gather_fa(
     }
 
     // the attention reads the clipped query, through a view made in the run
-    if (q->view_src != qcur || q->ne[0] != in->ne[0] || q->ne[2] != in->ne[1] || q->ne[1] != in->ne[2] || q->ne[3] != 1) {
+    if (q->view_src != qcur || q->ne[0] != in->ne[0] || q->ne[2] != in->ne[1] || q->ne[1]*q->ne[3] != in->ne[2]) {
         return false;
     }
 
