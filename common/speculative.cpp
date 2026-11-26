@@ -248,8 +248,28 @@ struct common_speculative_impl {
 
     row_switch row_state() { return { row_on, row_tokens, row_bad, row_probes, row_idle }; }
 
+    // probing (default; LLAMA_SPEC_PROBE_OLD=1: the spaced shadows below): off, the drafter does not run at all for a
+    // period of rounds (64 at first), then drafts in the shadow every round until 4 shadow drafts are scored; it turns
+    // on if they would have paid, else it stays off for twice the period (up to 256)
+    static bool row_probe_mode() {
+        static const bool old = getenv("LLAMA_SPEC_PROBE_OLD") != nullptr;
+        return !old;
+    }
+    static size_t & row_period(const bool * key) {
+        static std::unordered_map<const bool *, size_t> period;
+        auto it = period.find(key);
+        if (it == period.end()) {
+            it = period.emplace(key, (size_t) 64).first;
+        }
+        return it->second;
+    }
+
     // off: true when a shadow draft is due (every fourth round at first, rarer the longer it stays off)
     static bool row_shadow_due(row_switch st) {
+        if (row_probe_mode()) {
+            ++st.idle;
+            return st.idle > row_period(&st.on);
+        }
         ++st.idle;
         // a shadow draft costs the pass of the drafter (~3.4 ms on Inkling 2 against ~7.6 for a plain round): the
         // longer it stays off, the rarer the shadows (LLAMA_SPEC_SHADOW_FIXED=1: every eighth after the first 16)
@@ -278,6 +298,27 @@ struct common_speculative_impl {
                 st.idle   = 0;
                 st.bad    = 0;
                 st.tokens = 0.0;
+            }
+        } else if (row_probe_mode()) {
+            // a burst of shadow drafts: their plain mean. a shadow is right only where the target drew the same token,
+            // fewer than a verify by rejection accepts, so the threshold forgives (LLAMA_SPEC_PROBE_MARGIN, -0.25)
+            static const double margin = getenv("LLAMA_SPEC_PROBE_MARGIN") ? atof(getenv("LLAMA_SPEC_PROBE_MARGIN")) : -0.25;
+            st.tokens = st.probes > 0 ? (st.tokens*st.probes + tok)/(st.probes + 1) : tok;
+            st.probes++;
+            if (st.probes >= 4) {
+                const double sw = measured > 0.0 && row_t_plain() > 0.0 ? row_t_switch()/row_t_plain() : 0.0;
+                size_t & per = row_period(&st.on);
+                if (st.tokens >= cost + sw + margin) {
+                    st.on     = true;
+                    st.tokens = cost + 1.0;
+                    st.bad    = 0;
+                    per       = 64;
+                } else {
+                    per       = std::min<size_t>(per*2, 256);
+                    st.tokens = 0.0;
+                }
+                st.probes = 0;
+                st.idle   = 0;
             }
         } else {
             // shadow drafts: their mean, and on after at least two of them
