@@ -248,10 +248,14 @@ struct common_speculative_impl {
 
     row_switch row_state() { return { row_on, row_tokens, row_bad, row_probes, row_idle }; }
 
-    // off: true when a shadow draft is due (every eighth round, every fourth for the first few after it went off)
+    // off: true when a shadow draft is due (every fourth round at first, rarer the longer it stays off)
     static bool row_shadow_due(row_switch st) {
         ++st.idle;
-        return st.idle % (st.idle <= 16 ? 4 : 8) == 0;
+        // a shadow draft costs the pass of the drafter (~3.4 ms on Inkling 2 against ~7.6 for a plain round): the
+        // longer it stays off, the rarer the shadows (LLAMA_SPEC_SHADOW_FIXED=1: every eighth after the first 16)
+        static const bool fixed = getenv("LLAMA_SPEC_SHADOW_FIXED") != nullptr;
+        const size_t every = st.idle <= 16 ? 4 : (fixed || st.idle <= 64) ? 8 : st.idle <= 256 ? 16 : 32;
+        return st.idle % every == 0;
     }
 
     // the accepted rows of a round vary a lot around their mean (0 to 7 around 3.5 on code), so both directions go by
