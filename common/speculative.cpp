@@ -1,8 +1,3 @@
-#include <atomic>
-#include <deque>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
 #include "speculative.h"
 
 #include "common.h"
@@ -3307,10 +3302,6 @@ struct common_speculative {
     size_t                    rc_rows = 0;
     common_speculative_impl * rc_impl = nullptr;
 
-    // the judge (LLAMA_SPEC_JUDGE=<draft gguf>, see common_spec_judge): a copy of the model drafter on the CPU that
-    // tells whether drafting would pay while the GPU drafter is off
-    std::unique_ptr<struct common_spec_judge> judge;
-
     std::vector<double> synth_probs;
 
     // --spec-rows adaptive, and the rows of the draft in flight
@@ -3781,385 +3772,6 @@ common_speculative_output_limits common_speculative_get_output_limits(
 
 // initialization of the speculative decoding system
 //
-
-// ---------------------------------------------------------------------------------------------------------------------
-// the judge: a DFlash2 drafter on the CPU (Q8_0, made from the draft model, see common_spec_judge_path;
-// LLAMA_SPEC_JUDGE_THREADS, default 10) on a
-// thread of its own. it gets the features and the tokens the target decoded (accepted tokens only), keeps its own KV,
-// and while the GPU drafter is off it drafts 3 tokens from the newest token and scores the drafts against the tokens
-// that followed (exact matches of a greedy draft). the decayed tokens a draft would give, 1 + matches, decide when the
-// GPU drafter turns on; while it is on the judge only queues the features and injects them when it resumes.
-//   LLAMA_SPEC_JUDGE_EVERY=k    a draft every k tokens (default 4)
-//   LLAMA_SPEC_JUDGE_ALPHA=a    the decay of the score (default 0.15)
-//   LLAMA_SPEC_JUDGE_MIN=n      drafts scored before a decision (default 6)
-//   LLAMA_SPEC_JUDGE_WAIT=n     tokens without drafts after the GPU drafter turned off (default 0)
-//   LLAMA_SPEC_JUDGE_MARGIN=m   on when the score >= the cost of a round + m (default 0)
-struct common_spec_judge {
-    llama_model_ptr   model;
-    llama_context_ptr ctx;
-    std::unique_ptr<common_speculative_impl> impl;
-    llama_context * ctx_tgt = nullptr;
-    llama_context * ctx_gpu = nullptr; // the context of the GPU drafter
-    int32_t n_feat = 0;
-
-    struct item {
-        llama_pos   pos;
-        llama_token tok;
-        std::vector<float> f;
-    };
-
-    // main thread side
-    std::vector<item> staged;   // rows of the last target batch that may be accepted
-    bool staged_verify = false;
-
-    // while the GPU drafter is off its feature inject is skipped (LLAMA_SPEC_JUDGE_GPU_LAZY=0: injected every round);
-    // the features wait here and go in as one batch when it turns on
-    std::vector<item> gpu_backlog;
-    bool gpu_skipping = false;
-
-    bool gpu_flush() {
-        if (gpu_backlog.empty()) {
-            return true;
-        }
-        // the backlog must start right after what the GPU drafter has
-        const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx_gpu), 0);
-        if (pmax + 1 != gpu_backlog.front().pos) {
-            gpu_backlog.clear();
-            return false;
-        }
-        const int32_t n_ub = (int32_t) llama_n_ubatch(ctx_gpu);
-        size_t i = 0;
-        while (i < gpu_backlog.size()) {
-            const size_t m = std::min<size_t>(gpu_backlog.size() - i, (size_t) n_ub);
-            common_batch b(ctx_gpu);
-            for (size_t k = 0; k < m; ++k) {
-                const llama_pos pp = gpu_backlog[i + k].pos;
-                const llama_pos pos_arr[4] = { pp, pp, pp, 0 };
-                b.add_embd({ gpu_backlog[i + k].f.data(), 1, (size_t) n_feat }, pos_arr, 0, false);
-            }
-            if (llama_process(ctx_gpu, LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) {
-                LOG_ERR("%s: the backlog of the GPU drafter failed (%zu rows)\n", __func__, m);
-                gpu_backlog.clear();
-                return false;
-            }
-            i += m;
-        }
-        gpu_backlog.clear();
-        return true;
-    }
-
-    // shared
-    std::mutex mu;
-    std::condition_variable cv;
-    std::deque<item> q;
-    bool stop  = false;
-    bool reset = false;
-    std::atomic<bool>   active{true};
-    std::atomic<double> score{0.0};
-    std::atomic<int>    n_scored{0};
-    std::atomic<int>    wait_left{0};
-
-    // judge thread side
-    std::thread th;
-    llama_pos   next_pos = 0;     // the position the KV expects next
-    llama_tokens hist;            // tokens from hist_pos0
-    llama_pos   hist_pos0 = 0;
-    std::vector<item> held;       // decoded tokens not yet injected (the newest is the anchor of a draft)
-    struct probe { llama_pos start; llama_tokens draft; };
-    std::deque<probe> probes;
-    int since_draft = 0;
-
-    int    every  = 1;
-    double alpha  = 0.15;
-
-    ~common_spec_judge() {
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            stop = true;
-        }
-        cv.notify_all();
-        if (th.joinable()) {
-            th.join();
-        }
-        impl.reset();
-    }
-
-    void push(std::vector<item> && v) {
-        if (v.empty()) {
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            for (auto & it : v) {
-                q.push_back(std::move(it));
-            }
-        }
-        cv.notify_one();
-    }
-
-    void set_active(bool a) {
-        active = a;
-        if (a) {
-            score    = 0.0;
-            n_scored = 0;
-            static const int wait = getenv("LLAMA_SPEC_JUDGE_WAIT") ? atoi(getenv("LLAMA_SPEC_JUDGE_WAIT")) : 0;
-            wait_left = wait;
-        }
-        cv.notify_one();
-    }
-
-    void kv_reset(llama_pos pos) {
-        llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1);
-        next_pos  = pos;
-        hist.clear();
-        hist_pos0 = pos;
-        held.clear();
-        probes.clear();
-    }
-
-    bool inject(std::vector<item> & v, size_t n) {
-        if (n == 0) {
-            return true;
-        }
-        const int32_t n_ub = (int32_t) llama_n_ubatch(ctx.get());
-        size_t i = 0;
-        while (i < n) {
-            const size_t m = std::min<size_t>(n - i, (size_t) n_ub);
-            common_batch b(ctx.get());
-            for (size_t k = 0; k < m; ++k) {
-                const llama_pos p = v[i + k].pos;
-                const llama_pos pos_arr[4] = { p, p, p, 0 };
-                b.add_embd({ v[i + k].f.data(), 1, (size_t) n_feat }, pos_arr, 0, false);
-            }
-            if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) {
-                return false;
-            }
-            i += m;
-        }
-        next_pos = v[n - 1].pos + 1;
-        return true;
-    }
-
-    void run() {
-        static const int every_env = getenv("LLAMA_SPEC_JUDGE_EVERY") ? atoi(getenv("LLAMA_SPEC_JUDGE_EVERY")) : 4;
-        static const double alpha_env = getenv("LLAMA_SPEC_JUDGE_ALPHA") ? atof(getenv("LLAMA_SPEC_JUDGE_ALPHA")) : 0.15;
-        every = std::max(1, every_env);
-        alpha = alpha_env;
-        while (true) {
-            std::vector<item> got;
-            bool do_reset = false;
-            {
-                std::unique_lock<std::mutex> lk(mu);
-                static const bool cmp_on = getenv("LLAMA_SPEC_JUDGE_COMPARE") != nullptr;
-                cv.wait(lk, [&] { return stop || reset || (!q.empty() && (active.load() || cmp_on)); });
-                if (stop) {
-                    return;
-                }
-                do_reset = reset;
-                reset = false;
-                while (!q.empty()) {
-                    got.push_back(std::move(q.front()));
-                    q.pop_front();
-                }
-            }
-            if (do_reset) {
-                kv_reset(got.empty() ? 0 : got.front().pos);
-            }
-            for (auto & it : got) {
-                // positions must follow each other in the KV: a step back rewinds, a gap starts over
-                const llama_pos expect = held.empty() ? next_pos : held.back().pos + 1;
-                if (it.pos != expect) {
-                    if (it.pos < expect && it.pos >= hist_pos0) {
-                        llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, it.pos, -1);
-                        hist.resize((size_t) (it.pos - hist_pos0));
-                        held.clear();
-                        probes.clear();
-                        next_pos = it.pos;
-                    } else {
-                        kv_reset(it.pos);
-                    }
-                }
-                hist.push_back(it.tok);
-                held.push_back(std::move(it));
-            }
-
-            // score the drafts whose tokens are all known
-            while (!probes.empty()) {
-                const probe & pr = probes.front();
-                const llama_pos end = pr.start + (llama_pos) pr.draft.size();
-                if (hist_pos0 + (llama_pos) hist.size() < end) {
-                    break;
-                }
-                int n_ok = 0;
-                for (size_t j = 0; j < pr.draft.size(); ++j) {
-                    if (hist[(size_t) (pr.start - hist_pos0) + j] != pr.draft[j]) {
-                        break;
-                    }
-                    n_ok++;
-                }
-                if (getenv("LLAMA_SPEC_JUDGE_DEBUG") && atoi(getenv("LLAMA_SPEC_JUDGE_DEBUG")) >= 2) {
-                    static int nd = 0;
-                    if (nd++ < 12) {
-                        fprintf(stderr, "judge-probe: start %d hist_pos0 %d hist %zu next_pos %d draft", (int) pr.start, (int) hist_pos0, hist.size(), (int) next_pos);
-                        for (auto t : pr.draft) fprintf(stderr, " %d", t);
-                        fprintf(stderr, " actual");
-                        for (size_t j = 0; j < pr.draft.size(); ++j) fprintf(stderr, " %d", hist[(size_t) (pr.start - hist_pos0) + j]);
-                        fprintf(stderr, "\n");
-                    }
-                }
-                const double tok = 1.0 + n_ok;
-                const int    ns  = n_scored.load();
-                score    = ns == 0 ? tok : (1.0 - alpha)*score.load() + alpha*tok;
-                n_scored = ns + 1;
-                probes.pop_front();
-            }
-
-            if (held.size() < 2) {
-                continue;
-            }
-            // inject all but the newest decoded token, which anchors the draft
-            if (!inject(held, held.size() - 1)) {
-                kv_reset(held.back().pos);
-                continue;
-            }
-            item anchor = std::move(held.back());
-            held.clear();
-            held.push_back(std::move(anchor));
-
-            static FILE * cmpf = getenv("LLAMA_SPEC_JUDGE_COMPARE") ? fopen(getenv("LLAMA_SPEC_JUDGE_COMPARE"), "w") : nullptr;
-            if (!active.load() && cmpf == nullptr) {
-                continue;
-            }
-            if (wait_left.load() > 0) {
-                wait_left = wait_left.load() - 1;
-                continue;
-            }
-            if (++since_draft < every && cmpf == nullptr) {
-                continue;
-            }
-            since_draft = 0;
-
-            // a greedy draft of 3 from the anchor
-            llama_tokens result;
-            common_speculative_draft_params_vec dps(1);
-            auto & dp = dps[0];
-            dp.drafting = true;
-            dp.n_max    = 3;
-            dp.pos0     = held.back().pos;
-            dp.id_last  = held.back().tok;
-            dp.prompt   = &hist;
-            dp.result   = &result;
-            dp.result_q = nullptr;
-            impl->draft(dps);
-            // the draft block is not context
-            llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, dp.pos0, -1);
-            if (!result.empty()) {
-                probes.push_back({ dp.pos0 + 1, result });
-            }
-            if (cmpf) {
-                fprintf(cmpf, "J %d", (int) dp.pos0);
-                for (auto t : result) fprintf(cmpf, " %d", t);
-                fprintf(cmpf, "\n");
-                fflush(cmpf);
-            }
-        }
-    }
-};
-
-// the judge file: LLAMA_SPEC_JUDGE=<gguf>, else the draft model's file with BF16 (or the extension) replaced by
-// Q8_0-CPU, quantized from the draft model the first time. LLAMA_SPEC_JUDGE=0: no judge
-static std::string common_spec_judge_path(const common_params_speculative & params_main) {
-    const char * env = getenv("LLAMA_SPEC_JUDGE");
-    if (env != nullptr) {
-        return strcmp(env, "0") == 0 ? std::string() : std::string(env);
-    }
-    const std::string src = params_main.draft.mparams.path;
-    if (src.empty()) {
-        return std::string();
-    }
-    std::string dst = src;
-    const size_t at = dst.rfind("BF16");
-    if (at != std::string::npos) {
-        dst.replace(at, 4, "Q8_0-CPU");
-    } else {
-        const size_t dot = dst.rfind(".gguf");
-        dst = (dot == std::string::npos ? dst : dst.substr(0, dot)) + "-Q8_0-CPU.gguf";
-    }
-    if (FILE * f = fopen(dst.c_str(), "rb")) {
-        fclose(f);
-        return dst;
-    }
-    LOG_INF("%s: making the CPU judge %s from %s (Q8_0, once)\n", __func__, dst.c_str(), src.c_str());
-    llama_model_quantize_params qp = llama_model_quantize_default_params();
-    qp.ftype   = LLAMA_FTYPE_MOSTLY_Q8_0;
-    qp.nthread = 8;
-    if (llama_model_quantize(src.c_str(), dst.c_str(), &qp) != 0) {
-        LOG_WRN("%s: could not write %s: no judge\n", __func__, dst.c_str());
-        remove(dst.c_str());
-        return std::string();
-    }
-    return dst;
-}
-
-static std::unique_ptr<common_spec_judge> common_spec_judge_init(const common_params_speculative & params_main, llama_context * ctx_tgt) {
-    if (ctx_tgt == nullptr || params_main.draft.ctx_dft == nullptr || (!params_main.rows_adaptive && getenv("LLAMA_SPEC_JUDGE_COMPARE") == nullptr) ||
-        llama_model_dflash_variant(llama_get_model(params_main.draft.ctx_dft)) != LLAMA_DFLASH_VARIANT_DFLASH2) {
-        return nullptr;
-    }
-    const std::string path_s = common_spec_judge_path(params_main);
-    if (path_s.empty()) {
-        return nullptr;
-    }
-    const char * path = path_s.c_str();
-    auto j = std::make_unique<common_spec_judge>();
-    j->ctx_tgt = ctx_tgt;
-    j->ctx_gpu = params_main.draft.ctx_dft;
-
-    llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
-    j->model.reset(llama_model_load_from_file(path, mp));
-    if (!j->model) {
-        LOG_ERR("%s: failed to load the judge '%s'\n", __func__, path);
-        return nullptr;
-    }
-    const int nt = getenv("LLAMA_SPEC_JUDGE_THREADS") ? atoi(getenv("LLAMA_SPEC_JUDGE_THREADS")) : 10;
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx           = llama_n_ctx(ctx_tgt);
-    cp.n_batch         = 512;
-    cp.n_ubatch        = 512;
-    cp.n_seq_max       = 1;
-    cp.n_threads       = nt;
-    cp.n_threads_batch = nt;
-    cp.op_offload      = false;
-    cp.ctx_other       = ctx_tgt;
-    j->ctx.reset(llama_init_from_model(j->model.get(), cp));
-    if (!j->ctx) {
-        LOG_ERR("%s: failed to create the judge context\n", __func__);
-        return nullptr;
-    }
-    j->n_feat = llama_copy_embeddings_layer_inp_dev(ctx_tgt, 0, 1, nullptr);
-    if (j->n_feat <= 0) {
-        LOG_ERR("%s: the judge needs the target features in the device buffer\n", __func__);
-        return nullptr;
-    }
-
-    // the drafter of the judge: the main drafter's settings with the judge context, greedy, 3 rows. its constructor
-    // sets the feature path of the target again: the main drafter's choice is put back
-    const bool dev_main = llama_supports_embd_row(params_main.draft.ctx_dft);
-    common_params_speculative pj = params_main;
-    pj.draft.ctx_dft       = j->ctx.get();
-    pj.draft.n_max         = 3;
-    pj.draft.n_min         = 0;
-    pj.draft.probabilistic = false;
-    pj.draft.p_min         = 0.0f;
-    j->impl = std::make_unique<common_speculative_impl_draft_dflash2>(pj, 1);
-    llama_set_embeddings_layer_inp_dev(ctx_tgt, dev_main);
-
-    j->th = std::thread([p = j.get()] { p->run(); });
-    LOG_INF("%s: judge '%s' on the CPU, %d threads, %d features a token\n", __func__, path, nt, j->n_feat);
-    return j;
-}
-
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
@@ -4341,9 +3953,6 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     });
     result->rows_adaptive = params.rows_adaptive;
     result->n_draft_last.assign(n_seq, 0);
-    if (n_seq == 1) {
-        result->judge = common_spec_judge_init(params, params.draft.ctx_tgt);
-    }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
@@ -4409,62 +4018,7 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
         return result;
     }
 
-    // the judge: the features and tokens of the batch, committed now (prefill, a plain token) or at accept (a verify)
-    if (spec->judge && batch.size() > 0 && batch.has_token()) {
-        auto & J = *spec->judge;
-        const int32_t n = batch.size();
-        // a long prefill: the judge takes only its last LLAMA_SPEC_JUDGE_CTX rows (default 4096), enough to tell whether
-        // drafts match, and its KV starts over there (the whole prompt was seconds of CPU injects and bandwidth)
-        static const int32_t jctx = getenv("LLAMA_SPEC_JUDGE_CTX") ? atoi(getenv("LLAMA_SPEC_JUDGE_CTX")) : 4096;
-        const int32_t i0 = n > jctx ? n - jctx : 0;
-        std::vector<float> rows((size_t) (n - i0)*J.n_feat);
-        if (llama_copy_embeddings_layer_inp_dev(J.ctx_tgt, i0, n - i0, rows.data()) == J.n_feat) {
-            J.staged.clear();
-            for (int32_t i = i0; i < n; ++i) {
-                common_spec_judge::item it;
-                it.pos = batch.tokens[i].pos[0];
-                it.tok = batch.tokens[i].id;
-                it.f.assign(rows.begin() + (size_t) (i - i0)*J.n_feat, rows.begin() + (size_t) (i - i0 + 1)*J.n_feat);
-                J.staged.push_back(std::move(it));
-            }
-            J.staged_verify = !spec->n_draft_last.empty() && spec->n_draft_last[0] > 0 && n > 1;
-            static const bool gpu_lazy = getenv("LLAMA_SPEC_JUDGE_GPU_LAZY") == nullptr || atoi(getenv("LLAMA_SPEC_JUDGE_GPU_LAZY")) != 0;
-            J.gpu_skipping = false;
-            if (gpu_lazy && !J.staged_verify && spec->rows_adaptive && n == 1) {
-                for (auto & impl : spec->impls) {
-                    if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 && !impl->row_on) {
-                        J.gpu_skipping = true;
-                    }
-                }
-            }
-            if (J.gpu_skipping) {
-                for (const auto & it : J.staged) {
-                    J.gpu_backlog.push_back(it);
-                }
-            }
-            if (!J.staged_verify) {
-                J.push(std::move(J.staged));
-                J.staged.clear();
-            }
-        }
-    }
-
     for (auto & impl : spec->impls) {
-        // the GPU drafter is off: its inject waits in the backlog of the judge. a batch it does take (a prefill, a verify)
-        // comes after the backlog if that ends right before it, else the backlog is stale (another sequence) and dropped
-        if (spec->judge && impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2) {
-            auto & J = *spec->judge;
-            if (J.gpu_skipping) {
-                continue;
-            }
-            if (!J.gpu_backlog.empty() && batch.size() > 0) {
-                if (J.gpu_backlog.back().pos + 1 == batch.tokens[0].pos[0]) {
-                    J.gpu_flush();
-                } else {
-                    J.gpu_backlog.clear();
-                }
-            }
-        }
         result = result && impl->process(batch);
     }
 
@@ -4592,46 +4146,11 @@ void common_speculative_draft(common_speculative * spec) {
         // an implementation whose drafts have not been paying sits rounds out (see row_on), but for a shadow draft
         const bool row_select = spec->rows_adaptive && !impl->chooses_rows();
         bool row_shadow = false;
-        // the GPU drafter went off again: the judge resumes, with a fresh score
-        if (spec->judge && row_select && !impl->row_on && impl->type != COMMON_SPECULATIVE_TYPE_NGRAM_STAT && !spec->judge->active.load()) {
-            spec->judge->set_active(true);
-        }
-        if (row_select && !impl->row_on && spec->judge && impl->type != COMMON_SPECULATIVE_TYPE_NGRAM_STAT) {
-            // the judge says whether a round would pay (cost of a round of 3 rows, measured or the formula)
-            auto & J = *spec->judge;
-            static const int    jmin    = getenv("LLAMA_SPEC_JUDGE_MIN") ? atoi(getenv("LLAMA_SPEC_JUDGE_MIN")) : 6;
-            static const double jmargin = getenv("LLAMA_SPEC_JUDGE_MARGIN") ? atof(getenv("LLAMA_SPEC_JUDGE_MARGIN")) : 0.0;
-            const double cost = impl->row_measured(3) > 0.0 ? impl->row_measured(3) : common_speculative_impl::row_breakeven(3, impl->row_fixed());
-            if (getenv("LLAMA_SPEC_JUDGE_DEBUG")) {
-                static int nd = 0;
-                if (++nd % 50 == 0) {
-                    fprintf(stderr, "judge: score %.2f over %d drafts, cost %.2f, active %d, queue %zu\n", J.score.load(), J.n_scored.load(), cost, (int) J.active.load(), J.q.size());
-                }
-            }
-            if (J.n_scored.load() >= jmin && J.score.load() >= cost + jmargin) {
-                // the GPU drafter catches up on the tokens it skipped (if it cannot, it stays off)
-                if (!J.gpu_flush()) {
-                    J.set_active(true);
-                    continue;
-                }
-                impl->row_on     = true;
-                impl->row_tokens = cost + 1.0;
-                impl->row_bad    = 0;
-                J.set_active(false);
-                if (getenv("LLAMA_SPEC_JUDGE_DEBUG")) {
-                    fprintf(stderr, "judge: on (score %.2f over %d drafts, cost %.2f)\n", J.score.load(), J.n_scored.load(), cost);
-                }
-            } else {
-                continue;
-            }
-        } else if (row_select && !impl->row_on) {
+        if (row_select && !impl->row_on) {
             if (spec->shadow_impl != nullptr || !common_speculative_impl::row_shadow_due(impl->row_state())) {
                 continue;
             }
             row_shadow = true;
-        }
-        if (spec->judge && row_select && impl->row_on && impl->type != COMMON_SPECULATIVE_TYPE_NGRAM_STAT && spec->judge->active.load()) {
-            spec->judge->set_active(false);
         }
         // a shadow draft is the argmax of the drafter: it is held against tokens the target sampled without it, and a
         // sampled draft would agree with those less often than a verify by rejection accepts it
@@ -4657,14 +4176,6 @@ void common_speculative_draft(common_speculative * spec) {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
-        }
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 && getenv("LLAMA_SPEC_GPU_COMPARE") && !dparams.empty() &&
-            dparams[0].result && !dparams[0].result->empty()) {
-            static FILE * gf = fopen(getenv("LLAMA_SPEC_GPU_COMPARE"), "w");
-            fprintf(gf, "G %d", (int) dparams[0].pos0);
-            for (size_t k = 0; k < dparams[0].result->size() && k < 3; ++k) fprintf(gf, " %d", (*dparams[0].result)[k]);
-            fprintf(gf, "\n");
-            fflush(gf);
         }
         for (size_t i = 0; i < q_saved.size(); ++i) {
             dparams[i].result_q = q_saved[i];
@@ -4815,15 +4326,6 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
-    if (spec->judge && spec->judge->staged_verify && seq_id == 0) {
-        auto & J = *spec->judge;
-        if (J.staged.size() > (size_t) n_accepted + 1) {
-            J.staged.resize((size_t) n_accepted + 1);
-        }
-        J.push(std::move(J.staged));
-        J.staged.clear();
-        J.staged_verify = false;
-    }
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {

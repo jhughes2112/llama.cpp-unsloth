@@ -1538,18 +1538,6 @@ ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
     return nullptr;
 }
 
-int32_t llama_copy_embeddings_layer_inp_dev(llama_context * ctx, int32_t i0, int32_t n, float * dst) {
-    const ggml_tensor * t = ctx->get_layer_inp_dev();
-    if (t == nullptr || i0 < 0 || n <= 0 || i0 + n > t->ne[1]) {
-        return 0;
-    }
-    ctx->synchronize();
-    if (dst != nullptr) {
-        ggml_backend_tensor_get(t, dst, (size_t) i0*t->nb[1], (size_t) n*t->nb[1]);
-    }
-    return (int32_t) t->ne[0];
-}
-
 void llama_context::layer_inp_dev_alloc() {
     synchronize();
 
