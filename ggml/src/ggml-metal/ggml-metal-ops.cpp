@@ -6972,7 +6972,9 @@ int ggml_metal_op_kv_conv_store(ggml_metal_op_t ctx, int idx, int n) {
     ggml_tensor *       set   = ctx->node(idx + n - 1);
 
     const ggml_tensor * past = cat->src[0];
-    const ggml_tensor * cell = cpy->src[1];
+    // rollback slots: the state store is a SET_ROWS of the windows into the slot view, by the slot order
+    const bool rs = cpy->op == GGML_OP_SET_ROWS;
+    const ggml_tensor * cell = rs ? cpy : cpy->src[1];
     const ggml_tensor * w    = conv->src[1];
     const ggml_tensor * cur  = add->src[0];
 
@@ -7000,6 +7002,11 @@ int ggml_metal_op_kv_conv_store(ggml_metal_op_t ctx, int idx, int n) {
         /*.cc       =*/ is_k ? ggml_get_op_params_f32(ctx->node(idx + 9),  0) : 0.0f,
         /*.lo       =*/ is_k ? ggml_get_op_params_f32(ctx->node(idx + 11), 0) : 0.0f,
         /*.hi       =*/ is_k ? ggml_get_op_params_f32(ctx->node(idx + 11), 1) : 0.0f,
+        /*.Kw       =*/ rs ? (int32_t) cpy->src[0]->ne[1] : 0,
+        /*.pad2     =*/ 0,
+        /*.nb_slot1 =*/ rs ? cpy->nb[1] : 0,
+        /*.nb_slot2 =*/ rs ? cpy->nb[2] : 0,
+        /*.nb_slot3 =*/ rs ? cpy->nb[3] : 0,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -7010,6 +7017,7 @@ int ggml_metal_op_kv_conv_store(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell),        4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(set->src[1]), 5);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(set),         6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rs ? cpy->src[1] : set), 7);
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float), 0);
 

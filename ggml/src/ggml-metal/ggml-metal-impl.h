@@ -915,6 +915,11 @@ typedef struct {
     float    cc;
     float    lo;
     float    hi;
+    int32_t  Kw;       // > 0: a state with rollback slots, the windows of the last Kw tokens go to slot order[...]
+    int32_t  pad2;
+    uint64_t nb_slot1; // slot, channel and sequence strides of the state
+    uint64_t nb_slot2;
+    uint64_t nb_slot3;
 } ggml_metal_kargs_kv_conv_store;
 
 typedef struct {

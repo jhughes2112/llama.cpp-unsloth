@@ -2072,8 +2072,15 @@ static bool ggml_metal_fusion_check_kv_conv_store(
         }
     }
 
+    // rollback slots: the state store is a SET_ROWS (one more view in front of it)
+    const int  sh = fusion->ops_all[4] == GGML_OP_SET_ROWS ? 1 : 0;
+    static const bool no_rs = getenv("GGML_METAL_NO_KV_CONV_STORE_RS") != nullptr;
+    if (sh && no_rs) {
+        return false;
+    }
+
     // the convolution, as a short conv of its own
-    const ggml_metal_fusion * conv_f = ggml_metal_fusion_find(GGML_METAL_FUSION_SHORT_CONV, 5);
+    const ggml_metal_fusion * conv_f = ggml_metal_fusion_find(sh ? GGML_METAL_FUSION_SHORT_CONV_RS : GGML_METAL_FUSION_SHORT_CONV, 5);
     if (conv_f == nullptr || !conv_f->check(conv_f, nodes, gf, node_idxs, idx, mode)) {
         return false;
     }
@@ -2081,7 +2088,7 @@ static bool ggml_metal_fusion_check_kv_conv_store(
     const bool is_k = n == 14; // conv (5) + clip (8) + store, or conv (5) + norm + store
 
     const ggml_tensor * scale = nodes[4];
-    const ggml_tensor * resh  = gf->nodes[raw0 + 8];
+    const ggml_tensor * resh  = gf->nodes[raw0 + 8 + sh];
     const ggml_tensor * head  = nodes[n - 2]; // the clipped or normalized heads
     const ggml_tensor * view  = gf->nodes[raw0 + n_raw - 2];
     const ggml_tensor * set   = nodes[n - 1];
@@ -2119,9 +2126,10 @@ static bool ggml_metal_fusion_check_kv_conv_store(
     }
 
     // outputs: the store in the cache, the state store of the convolution and its cell view
-    const int outputs[3] = { raw0 + n_raw - 1, raw0 + 3, raw0 + 2 };
+    // (with rollback slots also the view of the slot order)
+    const int outputs[4] = { raw0 + n_raw - 1, raw0 + 3 + sh, raw0 + 2 + sh, raw0 + 2 };
 
-    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 3);
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 3 + sh);
 }
 
 // EXPERT_REDUCE [VIEW RESHAPE TRANSPOSE] SHORT_CONV + residual ADD: the weighted sum of the expert outputs, the short
@@ -2688,6 +2696,16 @@ static const std::vector<ggml_op> ops_v_conv_store = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
     GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS
 };
+// the same with rollback slots: the state store is a SET_ROWS over the slots
+static const std::vector<ggml_op> ops_k_conv_store_rs = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
+    GGML_OP_RESHAPE, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_SET_ROWS
+};
+static const std::vector<ggml_op> ops_v_conv_store_rs = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
+    GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS
+};
 static const std::vector<ggml_op> ops_reduce_conv = {
     GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL,
     GGML_OP_MUL,
@@ -2819,6 +2837,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_REDUCE_CONV, ops_reduce_conv, {12}, true, ggml_metal_fusion_check_reduce_conv },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_v_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
+    { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store_rs, {1}, true, ggml_metal_fusion_check_kv_conv_store },
+    { GGML_METAL_FUSION_KV_CONV_STORE, ops_v_conv_store_rs, {1}, true, ggml_metal_fusion_check_kv_conv_store },
 
     { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(0), {}, true, ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_DEPTH_MIX_NORM, ggml_metal_fusion_ops_depth_mix_norm(1), {}, true, ggml_metal_fusion_check_depth_mix },

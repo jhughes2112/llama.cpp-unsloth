@@ -1245,6 +1245,7 @@ kernel void kernel_kv_conv_store_f32(
         device       char  * cell,
         device const long  * idxs,
         device       char  * dst,
+        device const int   * order,
         threadgroup  float * shmem [[threadgroup(0)]],
         uint3   tgpig [[threadgroup_position_in_grid]],
         ushort3 tpitg [[thread_position_in_threadgroup]],
@@ -1283,6 +1284,17 @@ kernel void kernel_kv_conv_store_f32(
             h[j] = h[j + 1];
         }
         h[nh - 1] = xt;
+
+        // rollback slots: the window after each of the last Kw tokens
+        if (args.Kw > 0) {
+            const int iw = t - (args.n_t - args.Kw);
+            if (iw >= 0) {
+                device float * q = (device float *) (cell + is*args.nb_slot3 + c*args.nb_slot2 + order[iw]*args.nb_slot1);
+                for (int j = 0; j < nh; ++j) {
+                    q[j] = h[j];
+                }
+            }
+        }
 
         // the sum of squares of the head
         float ss = simd_sum(y*y);
@@ -1333,9 +1345,11 @@ kernel void kernel_kv_conv_store_f32(
         }
     }
 
-    device float * q = (device float *) (cell + is*args.nb_cell1) + c*nh;
-    for (int j = 0; j < nh; ++j) {
-        q[j] = h[j];
+    if (args.Kw == 0) {
+        device float * q = (device float *) (cell + is*args.nb_cell1) + c*nh;
+        for (int j = 0; j < nh; ++j) {
+            q[j] = h[j];
+        }
     }
 }
 // kernel_short_conv_f32 with per-head, input-dependent taps on top of the weights:
