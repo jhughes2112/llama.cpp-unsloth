@@ -3996,6 +3996,16 @@ struct common_spec_judge {
                     }
                     n_ok++;
                 }
+                if (getenv("LLAMA_SPEC_JUDGE_DEBUG") && atoi(getenv("LLAMA_SPEC_JUDGE_DEBUG")) >= 2) {
+                    static int nd = 0;
+                    if (nd++ < 12) {
+                        fprintf(stderr, "judge-probe: start %d hist_pos0 %d hist %zu next_pos %d draft", (int) pr.start, (int) hist_pos0, hist.size(), (int) next_pos);
+                        for (auto t : pr.draft) fprintf(stderr, " %d", t);
+                        fprintf(stderr, " actual");
+                        for (size_t j = 0; j < pr.draft.size(); ++j) fprintf(stderr, " %d", hist[(size_t) (pr.start - hist_pos0) + j]);
+                        fprintf(stderr, "\n");
+                    }
+                }
                 const double tok = 1.0 + n_ok;
                 const int    ns  = n_scored.load();
                 score    = ns == 0 ? tok : (1.0 - alpha)*score.load() + alpha*tok;
@@ -4395,14 +4405,18 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     if (spec->judge && batch.size() > 0 && batch.has_token()) {
         auto & J = *spec->judge;
         const int32_t n = batch.size();
-        std::vector<float> rows((size_t) n*J.n_feat);
-        if (llama_copy_embeddings_layer_inp_dev(J.ctx_tgt, 0, n, rows.data()) == J.n_feat) {
+        // a long prefill: the judge takes only its last LLAMA_SPEC_JUDGE_CTX rows (default 512), enough to tell whether
+        // drafts match, and its KV starts over there (the whole prompt was seconds of CPU injects and bandwidth)
+        static const int32_t jctx = getenv("LLAMA_SPEC_JUDGE_CTX") ? atoi(getenv("LLAMA_SPEC_JUDGE_CTX")) : 512;
+        const int32_t i0 = n > jctx ? n - jctx : 0;
+        std::vector<float> rows((size_t) (n - i0)*J.n_feat);
+        if (llama_copy_embeddings_layer_inp_dev(J.ctx_tgt, i0, n - i0, rows.data()) == J.n_feat) {
             J.staged.clear();
-            for (int32_t i = 0; i < n; ++i) {
+            for (int32_t i = i0; i < n; ++i) {
                 common_spec_judge::item it;
                 it.pos = batch.tokens[i].pos[0];
                 it.tok = batch.tokens[i].id;
-                it.f.assign(rows.begin() + (size_t) i*J.n_feat, rows.begin() + (size_t) (i + 1)*J.n_feat);
+                it.f.assign(rows.begin() + (size_t) (i - i0)*J.n_feat, rows.begin() + (size_t) (i - i0 + 1)*J.n_feat);
                 J.staged.push_back(std::move(it));
             }
             J.staged_verify = !spec->n_draft_last.empty() && spec->n_draft_last[0] > 0 && n > 1;
@@ -4580,6 +4594,12 @@ void common_speculative_draft(common_speculative * spec) {
             static const int    jmin    = getenv("LLAMA_SPEC_JUDGE_MIN") ? atoi(getenv("LLAMA_SPEC_JUDGE_MIN")) : 6;
             static const double jmargin = getenv("LLAMA_SPEC_JUDGE_MARGIN") ? atof(getenv("LLAMA_SPEC_JUDGE_MARGIN")) : 0.0;
             const double cost = impl->row_measured(3) > 0.0 ? impl->row_measured(3) : common_speculative_impl::row_breakeven(3, impl->row_fixed());
+            if (getenv("LLAMA_SPEC_JUDGE_DEBUG")) {
+                static int nd = 0;
+                if (++nd % 50 == 0) {
+                    fprintf(stderr, "judge: score %.2f over %d drafts, cost %.2f, active %d, queue %zu\n", J.score.load(), J.n_scored.load(), cost, (int) J.active.load(), J.q.size());
+                }
+            }
             if (J.n_scored.load() >= jmin && J.score.load() >= cost + jmargin) {
                 // the GPU drafter catches up on the tokens it skipped (if it cannot, it stays off)
                 if (!J.gpu_flush()) {
