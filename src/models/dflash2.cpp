@@ -81,15 +81,35 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
             coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
 
-    ggml_tensor * coeff_all = ggml_cont(ctx0, coeffs_side);
-    coeff_all = ggml_reshape_4d(ctx0, coeff_all, 1, n_groups, kernel_size, n_tokens);
-    coeff_all = ggml_repeat_4d(ctx0, coeff_all, group_size, n_groups, kernel_size, n_tokens);
+    // the weights with the tap outermost, [group, n_groups, n_tokens, kernel]: the weights of a tap are then one
+    // contiguous slice (with the tap inside, each tap took a copy of its strided view, two copies a conv)
+    // LLAMA_DFLASH2_CONV_OLD=1: the old layout
+    static const bool conv_old = getenv("LLAMA_DFLASH2_CONV_OLD") != nullptr;
 
-    ggml_tensor * base_side = ggml_reshape_4d(ctx0,
-            ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]),
-            group_size, n_groups, kernel_size, 1);
+    ggml_tensor * weight_all = nullptr;
+    if (conv_old) {
+        ggml_tensor * coeff_all = ggml_cont(ctx0, coeffs_side);
+        coeff_all = ggml_reshape_4d(ctx0, coeff_all, 1, n_groups, kernel_size, n_tokens);
+        coeff_all = ggml_repeat_4d(ctx0, coeff_all, group_size, n_groups, kernel_size, n_tokens);
 
-    ggml_tensor * weight_all = ggml_add(ctx0, coeff_all, base_side);
+        ggml_tensor * base_side = ggml_reshape_4d(ctx0,
+                ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]),
+                group_size, n_groups, kernel_size, 1);
+
+        weight_all = ggml_add(ctx0, coeff_all, base_side);
+    } else {
+        // [n_groups, kernel, n_tokens] -> [n_groups, n_tokens, kernel]
+        ggml_tensor * coeff_all = ggml_cont(ctx0, ggml_permute(ctx0, coeffs_side, 0, 2, 1, 3));
+        coeff_all = ggml_reshape_4d(ctx0, coeff_all, 1, n_groups, n_tokens, kernel_size);
+        coeff_all = ggml_repeat_4d(ctx0, coeff_all, group_size, n_groups, n_tokens, kernel_size);
+
+        // the base is [group, n_groups, kernel] in memory: the same for every token
+        ggml_tensor * base_side = ggml_reshape_4d(ctx0,
+                ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]),
+                group_size, n_groups, 1, kernel_size);
+
+        weight_all = ggml_add(ctx0, coeff_all, base_side);
+    }
 
     // taps at or past block_size only read the left padding and add nothing
     const int64_t n_taps = std::min(kernel_size, block_size);
@@ -104,10 +124,12 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
         }
         values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
 
-        ggml_tensor * weight = ggml_reshape_2d(ctx0,
+        ggml_tensor * weight = conv_old ?
+            ggml_reshape_2d(ctx0,
                 ggml_cont(ctx0, ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
                         weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2])),
-                hidden_size, n_tokens);
+                hidden_size, n_tokens) :
+            ggml_view_2d(ctx0, weight_all, hidden_size, n_tokens, weight_all->nb[2], tap * weight_all->nb[3]);
 
         ggml_tensor * term = ggml_mul(ctx0, weight, values);
         result = result ? ggml_add(ctx0, result, term) : term;

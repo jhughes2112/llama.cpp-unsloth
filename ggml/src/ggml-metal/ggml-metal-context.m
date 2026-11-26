@@ -1099,7 +1099,8 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
             dump = getenv("GGML_METAL_DUMP_RAW");
             dump_init = true;
         }
-        if (dump) {
+        // GGML_METAL_DUMP_RAW_N=n: only a graph of n nodes
+        if (dump && (getenv("GGML_METAL_DUMP_RAW_N") == NULL || gf->n_nodes == atoi(getenv("GGML_METAL_DUMP_RAW_N")))) {
             FILE * f = fopen(dump, "w");
             if (f) {
                 for (int i = 0; i < gf->n_nodes; ++i) {
@@ -1113,6 +1114,8 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
                         }
                         fprintf(f, " <%d:%s", k, t->src[j]->name);
                     }
+                    if (t->op == GGML_OP_VIEW) fprintf(f, " offs=%zu nb1=%zu nb2=%zu", t->view_offs, t->nb[1], t->nb[2]);
+                    if (t->op == GGML_OP_PAD) fprintf(f, " pad=%d,%d,%d,%d,%d,%d", ggml_get_op_params_i32(t,0), ggml_get_op_params_i32(t,1), ggml_get_op_params_i32(t,2), ggml_get_op_params_i32(t,3), ggml_get_op_params_i32(t,4), ggml_get_op_params_i32(t,5));
                     fprintf(f, "\n");
                 }
                 fclose(f);
