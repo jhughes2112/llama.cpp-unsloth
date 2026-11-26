@@ -1,37 +1,42 @@
-# Inkling 2 Mini on a Mac: 37 → 112 tok/sec, about 125 on code with a draft model
+# Inkling 2 Mini on a Mac: 37 → 137 tok/sec on one stream (M5 Ultra)
 
 ![Inkling 2 Mini on a Mac, decode speed commit by commit](media/inkling2-mac.gif)
 
-This branch (`metal-inkling2-fuse`) is Unsloth's llama.cpp release `b12588-mix-c0c3de8` with the Metal backend reworked
-for [Inkling 2 Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF). On an M5 Ultra, one stream of `UD-Q4_K_M`
-decodes at 112 tok/sec, where the release it started from does 37. The model's output is unchanged within rounding
-(KL divergence 0.0009 against the untouched build, the same as that build against itself with fusion off).
+This branch is Unsloth's llama.cpp release `b12588-mix-c0c3de8` with the Metal backend reworked for
+[Inkling 2 Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF). **All numbers on this page are one stream on an
+Apple M5 Ultra**, `llama-server`, at the model's own sampling settings (temperature 1.0; nothing was measured greedy).
+Smaller Apple chips will be slower.
 
-With Inco AI's DFlash2 draft model on top, at the model's own sampling settings (temperature 1.0):
+The model's output is unchanged within rounding: KL divergence 0.0008 against the untouched build at batch 1, and 0.0019
+at the default batch (the untouched build against itself with fusion off: 0.0008 and 0.0016).
 
-| one request, mean of three seeds (range) | no draft | DFlash2 draft |
-|---|---|---|
-| writing code, 550 tokens | 110 | 125 (102 to 145) |
-| rewriting a file it was given, 1,200 tokens | 106 | 165 (144 to 198) |
-| prose, 550 tokens | 110 | 95 (94 to 98) |
+### Speed, one stream, M5 Ultra
 
-Image input works with and without the draft. The numbers are from `llama-server`; nothing here was measured greedy.
-How much the draft gives depends on the text: the same prompt with another seed lands anywhere in the range.
+Decode tok/sec by how much context comes before the reply (a real C++ or Markdown context of that many tokens, then a
+code or prose task, 300 tokens generated, mean of three seeds):
 
-Where the speed came from: the model's small ops are fused into single Metal kernels (7,177 → 1,466 kernels a token),
-the graph is ordered by depth so independent branches run side by side, memory barriers are only placed where ranges
-really overlap, and the command buffer for the next token is encoded while the GPU runs the current one. The draft
-model proposes seven tokens a round and the model checks them in one pass; a round is all or nothing, switched off as
-soon as the text stops being predictable and back on only after the draft has proved itself again.
+| context | code, no draft | code, with draft | prose, no draft | prose, with draft |
+|---|---|---|---|---|
+| short prompt | 137 | 159 | 136 | 128 |
+| 1K tokens | 128 | 134 | 128 | 121 |
+| 4K tokens | 126 | 126 | 127 | 125 |
+| 8K tokens | 124 | 124 | 124 | 119 |
+| 32K tokens | 110 | 111 | 110 | 108 |
 
-### Credits
+The short-prompt row is 24 seeds with the draft (its speed varies from seed to seed) and three without (it does not); the
+other rows are three seeds each, so treat differences under about 5% as noise. **Without the draft model the speed is
+the same for every kind of text.** The draft model helps code with a short
+context, is about even with long contexts, and costs prose a few percent: load it only for coding work.
 
-- [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) for Inkling 2 Mini.
-- [Unsloth](https://github.com/unslothai/llama.cpp) for the llama.cpp release this branch is built on, its Inkling 2
-  and draft-model support, and the `UD-Q4_K_M` quant.
-- [Inco AI](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) for the DFlash2 draft model, and for
-  [Splash](https://github.com/incoai/splash), whose documentation of how the draft is fed made it work here.
-- The llama.cpp and ggml authors.
+The untouched Unsloth release decodes 37 tok/sec on the same machine.
+
+### What you need
+
+- macOS on Apple Silicon, Xcode command line tools, CMake, Python 3 with `huggingface_hub`.
+- The model: Unsloth's **`UD-Q4_K_M`** GGUF from the **`Old_Support`** folder (16.6 GB) and its image projector
+  `mmproj-BF16.gguf` (0.6 GB). The files in the root of that repo have a newer layout and will not load here.
+- Optional, for the draft: Inco AI's **DFlash2** draft model (safetensors), converted once to a **BF16** GGUF (1 GB). The
+  server then makes a Q8_0 copy of it for the CPU by itself (`...-Q8_0-CPU.gguf`, 0.5 GB, next to the BF16 file).
 
 ### Build
 
@@ -42,10 +47,9 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Needs macOS on Apple Silicon, Xcode command line tools and CMake. Do not clone under `/tmp`: the web UI packaging step
-of the server build fails there.
+Do not clone under `/tmp`: the web UI packaging step of the server build fails there.
 
-### Get the model
+### Get the model (exactly these two files)
 
 ```bash
 pip install -U huggingface_hub
@@ -55,27 +59,23 @@ mv models/Old_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file models/Inkling-2-Mini-U
 mv models/Old_Support/mmproj-BF16.gguf_file models/mmproj-BF16.gguf
 ```
 
-16.6 GB of weights plus the 0.6 GB image projector (`UD-Q4_K_XL`, a gigabyte more, runs at the same speed; the
-history in the chart was measured on it). This release reads the GGUF layout Unsloth first published, which
-now lives in the `Old_Support` folder of their repo (the root files have a newer layout and will not load here).
-
-### Run
+### Run without a draft model (the default; same speed on any text)
 
 ```bash
+# OpenAI-compatible server with image input, at http://127.0.0.1:8080
+build/bin/llama-server -m models/Inkling-2-Mini-UD-Q4_K_M.gguf --mmproj models/mmproj-BF16.gguf \
+    -c 32768 -ngl 99 -fa on --jinja -t 2 -ot "token_embd\.weight=MTL0" --backend-sampling
+
 # measure decode speed
 build/bin/llama-bench -m models/Inkling-2-Mini-UD-Q4_K_M.gguf -p 0 -n 400 -r 3
-
-# chat in the terminal
-build/bin/llama-cli -m models/Inkling-2-Mini-UD-Q4_K_M.gguf -ngl 99 -fa on --jinja
-
-# OpenAI-compatible server with image input, at http://127.0.0.1:8080
-GGML_METAL_N_CB=6 build/bin/llama-server -m models/Inkling-2-Mini-UD-Q4_K_M.gguf \
-    --mmproj models/mmproj-BF16.gguf -c 32768 -ngl 99 -fa on --jinja
 ```
 
-### Run with the draft model
+- `--backend-sampling` draws the next token on the GPU, so nothing of the 200K-token vocabulary goes back to the CPU.
+- `-ot "token_embd\.weight=MTL0"` keeps the token embeddings on the GPU, `-t 2` is enough CPU threads for what is left.
 
-The draft is published as safetensors; convert it once (1 GB):
+### Run with the draft model (for coding work)
+
+Get and convert the draft once (from Inco AI's repo, plus the config and tokenizer files of the original model):
 
 ```bash
 pip install -r requirements/requirements-convert_hf_to_gguf.txt
@@ -87,32 +87,44 @@ python convert_hf_to_gguf.py models/dflash2 --target-model-dir models/inkling2-c
 ```
 
 ```bash
-GGML_METAL_N_CB=6 build/bin/llama-server -m models/Inkling-2-Mini-UD-Q4_K_M.gguf \
-    --mmproj models/mmproj-BF16.gguf -c 32768 -ngl 99 -fa on --jinja \
+build/bin/llama-server -m models/Inkling-2-Mini-UD-Q4_K_M.gguf --mmproj models/mmproj-BF16.gguf \
+    -c 32768 -ngl 99 -fa on --jinja -t 2 -ot "token_embd\.weight=MTL0" \
     -md models/dflash2-Inkling-2-Mini-BF16.gguf -ngld 99 --spec-type ngram-stat,draft-dflash2 \
     --spec-draft-n-max 7 --spec-draft-sampling probabilistic --spec-rows adaptive
 ```
 
-- `--spec-draft-sampling probabilistic` verifies drafts by rejection sampling, which keeps the model's own sampling
-  distribution and accepts more drafts than matching tokens does.
-- `--spec-rows adaptive` is the on/off switch described above. Without it every round verifies all seven drafts, which
-  costs prose a quarter of its speed.
-- `ngram-stat` proposes text that already occurred in the conversation, by the same on/off rule. It is what
-  lifts the file rewrite; on new text it stays out of the way.
+On the first start the server writes `models/dflash2-Inkling-2-Mini-Q8_0-CPU.gguf` (half a second) and loads it on 10 CPU
+threads. How the draft is used:
+
+- The BF16 draft runs on the GPU and proposes up to seven tokens a round; the model checks them in one pass
+  (`--spec-draft-sampling probabilistic`: rejection sampling, so the output keeps the model's own distribution).
+- `--spec-rows adaptive` drafts only while it pays: off as soon as rounds cost more than they give, and the length of a
+  draft follows how many of its tokens get accepted.
+- While the GPU draft is off, the Q8_0 copy on the CPU keeps drafting in the background (6.5 ms a draft, every fourth
+  token) and checks its drafts against what the model actually wrote; when they match well enough, the GPU draft comes
+  back on. This costs the GPU nothing. `LLAMA_SPEC_JUDGE=0` turns this off.
+- `ngram-stat` proposes text that already occurred in the conversation, by the same on/off rule (rewriting a file).
+
+### Credits
+
+- [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) for Inkling 2 Mini.
+- [Unsloth](https://github.com/unslothai/llama.cpp) for the llama.cpp release this branch is built on, its Inkling 2
+  and draft-model support, and the `UD-Q4_K_M` quant.
+- [Inco AI](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) for the DFlash2 draft model, and for
+  [Splash](https://github.com/incoai/splash), whose documentation of how the draft is fed made it work here.
+- The llama.cpp and ggml authors.
 
 ### Good to know
 
-- 112 tok/sec is an M5 Ultra at an empty context; it is 106 at 4K tokens of context and 93 at 32K. Smaller Apple
-  chips will be slower. Prompt reading is about 1,900 tok/sec.
-- With the draft model loaded, prose is 10 to 15% slower than without it: the model keeps the state that lets a
-  rejected draft be undone, and that path costs a token 9.9 ms against 9.1. Load the draft for coding work.
+- Where the speed came from: the model's small ops are fused into single Metal kernels (541 dependent GPU steps a token,
+  from 920), per-channel work runs in the epilogues of the mat-vecs, the token is drawn on the GPU, the CPU waits by
+  polling, and the command buffer for the next token is encoded while the GPU runs the current one.
 - Only the Metal backend changed. CUDA, Vulkan and CPU run as in the Unsloth release.
-- Leave the K/V cache at its default (F16). `-ctk q8_0 -ctv q8_0` halves cache memory at long contexts but needs
-  `LLAMA_ATTN_ROT_DISABLE=1` to stay on the fast path and costs a little quality.
+- Leave the K/V cache at its default (F16).
 - `GGML_METAL_PROFILE=1` prints GPU time, kernels and serial steps a token. `GGML_METAL_FUSION_DISABLE=1` runs
   without the fused kernels, for comparison.
 - The base is a frozen release, so this branch does not follow upstream llama.cpp.
-- `media/make_inkling2_gif.py` draws the chart above.
+- `media/make_inkling2_gif.py` draws the chart above (its history ends before the latest work).
 
 ---
 
