@@ -3783,12 +3783,13 @@ common_speculative_output_limits common_speculative_get_output_limits(
 //
 
 // ---------------------------------------------------------------------------------------------------------------------
-// the judge: a DFlash2 drafter on the CPU (quantized, LLAMA_SPEC_JUDGE=<gguf>, LLAMA_SPEC_JUDGE_THREADS, default 10) on a
+// the judge: a DFlash2 drafter on the CPU (Q8_0, made from the draft model, see common_spec_judge_path;
+// LLAMA_SPEC_JUDGE_THREADS, default 10) on a
 // thread of its own. it gets the features and the tokens the target decoded (accepted tokens only), keeps its own KV,
 // and while the GPU drafter is off it drafts 3 tokens from the newest token and scores the drafts against the tokens
 // that followed (exact matches of a greedy draft). the decayed tokens a draft would give, 1 + matches, decide when the
 // GPU drafter turns on; while it is on the judge only queues the features and injects them when it resumes.
-//   LLAMA_SPEC_JUDGE_EVERY=k    a draft every k tokens (default 1)
+//   LLAMA_SPEC_JUDGE_EVERY=k    a draft every k tokens (default 4)
 //   LLAMA_SPEC_JUDGE_ALPHA=a    the decay of the score (default 0.15)
 //   LLAMA_SPEC_JUDGE_MIN=n      drafts scored before a decision (default 6)
 //   LLAMA_SPEC_JUDGE_WAIT=n     tokens without drafts after the GPU drafter turned off (default 0)
@@ -3940,7 +3941,7 @@ struct common_spec_judge {
     }
 
     void run() {
-        static const int every_env = getenv("LLAMA_SPEC_JUDGE_EVERY") ? atoi(getenv("LLAMA_SPEC_JUDGE_EVERY")) : 1;
+        static const int every_env = getenv("LLAMA_SPEC_JUDGE_EVERY") ? atoi(getenv("LLAMA_SPEC_JUDGE_EVERY")) : 4;
         static const double alpha_env = getenv("LLAMA_SPEC_JUDGE_ALPHA") ? atof(getenv("LLAMA_SPEC_JUDGE_ALPHA")) : 0.15;
         every = std::max(1, every_env);
         alpha = alpha_env;
@@ -4047,11 +4048,51 @@ struct common_spec_judge {
     }
 };
 
+// the judge file: LLAMA_SPEC_JUDGE=<gguf>, else the draft model's file with BF16 (or the extension) replaced by
+// Q8_0-CPU, quantized from the draft model the first time. LLAMA_SPEC_JUDGE=0: no judge
+static std::string common_spec_judge_path(const common_params_speculative & params_main) {
+    const char * env = getenv("LLAMA_SPEC_JUDGE");
+    if (env != nullptr) {
+        return strcmp(env, "0") == 0 ? std::string() : std::string(env);
+    }
+    const std::string src = params_main.draft.mparams.path;
+    if (src.empty()) {
+        return std::string();
+    }
+    std::string dst = src;
+    const size_t at = dst.rfind("BF16");
+    if (at != std::string::npos) {
+        dst.replace(at, 4, "Q8_0-CPU");
+    } else {
+        const size_t dot = dst.rfind(".gguf");
+        dst = (dot == std::string::npos ? dst : dst.substr(0, dot)) + "-Q8_0-CPU.gguf";
+    }
+    if (FILE * f = fopen(dst.c_str(), "rb")) {
+        fclose(f);
+        return dst;
+    }
+    LOG_INF("%s: making the CPU judge %s from %s (Q8_0, once)\n", __func__, dst.c_str(), src.c_str());
+    llama_model_quantize_params qp = llama_model_quantize_default_params();
+    qp.ftype   = LLAMA_FTYPE_MOSTLY_Q8_0;
+    qp.nthread = 8;
+    if (llama_model_quantize(src.c_str(), dst.c_str(), &qp) != 0) {
+        LOG_WRN("%s: could not write %s: no judge\n", __func__, dst.c_str());
+        remove(dst.c_str());
+        return std::string();
+    }
+    return dst;
+}
+
 static std::unique_ptr<common_spec_judge> common_spec_judge_init(const common_params_speculative & params_main, llama_context * ctx_tgt) {
-    const char * path = getenv("LLAMA_SPEC_JUDGE");
-    if (path == nullptr || ctx_tgt == nullptr || params_main.draft.ctx_dft == nullptr) {
+    if (ctx_tgt == nullptr || params_main.draft.ctx_dft == nullptr || !params_main.rows_adaptive ||
+        llama_model_dflash_variant(llama_get_model(params_main.draft.ctx_dft)) != LLAMA_DFLASH_VARIANT_DFLASH2) {
         return nullptr;
     }
+    const std::string path_s = common_spec_judge_path(params_main);
+    if (path_s.empty()) {
+        return nullptr;
+    }
+    const char * path = path_s.c_str();
     auto j = std::make_unique<common_spec_judge>();
     j->ctx_tgt = ctx_tgt;
     j->ctx_gpu = params_main.draft.ctx_dft;
