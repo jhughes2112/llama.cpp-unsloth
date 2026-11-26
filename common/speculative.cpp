@@ -3267,6 +3267,19 @@ struct common_speculative {
     bool                rows_adaptive = false;
     std::vector<size_t> n_draft_last;
 
+    // the length of a model draft (one sequence, --spec-rows adaptive): drafts are verified up to len_cur rows, the one
+    // that gives the most tokens a millisecond by the acceptance of each position (decayed) and the measured cost of
+    // a round. the rows cut off are still measured: when all rows of a round are accepted, the cut rows are held
+    // against the tokens the target produces next (as a shadow draft). LLAMA_SPEC_LEN_FIXED=1: the full n_max
+    int                       len_cur  = 0;
+    double                    len_att[33] = { 0.0 };
+    double                    len_acc[33] = { 0.0 };
+    llama_tokens              len_tail;
+    size_t                    len_tail_start = 0;
+    bool                      len_tail_live  = false;
+    size_t                    len_cut0       = 0; // the verified rows of the draft whose tail is held
+    common_speculative_impl * len_impl = nullptr;
+
     // the shadow draft in flight (see row_on): its tokens, where they begin in the history of its sequence
     common_speculative_impl * shadow_impl  = nullptr;
     llama_seq_id              shadow_seq   = -1;
@@ -4036,6 +4049,34 @@ void common_speculative_draft(common_speculative * spec) {
         trace_acc  = 0;
     }
 
+    // the cut rows of the last model draft (see len_cur), once all its verified rows were accepted
+    if (spec->len_tail_live && !dparams.empty() && dparams[0].drafting) {
+        const auto & dp = dparams[0];
+        const size_t n_hist = dp.prompt->size() + 1;
+        size_t n_ok  = 0;
+        bool   ended = n_hist < spec->len_tail_start;
+        while (!ended && n_ok < spec->len_tail.size() && spec->len_tail_start + n_ok < n_hist) {
+            const size_t i = spec->len_tail_start + n_ok;
+            if ((i < dp.prompt->size() ? (*dp.prompt)[i] : dp.id_last) != spec->len_tail[n_ok]) {
+                ended = true;
+            } else {
+                n_ok++;
+            }
+        }
+        if (ended || n_ok == spec->len_tail.size()) {
+            if (n_hist >= spec->len_tail_start) {
+                // positions len_cur + 1 ... : reached (all before accepted), accepted while they agree
+                for (size_t j = 0; j < spec->len_tail.size() && j <= n_ok; ++j) {
+                    const size_t k = std::min<size_t>(spec->len_cut0 + 1 + j, 32);
+                    spec->len_att[k] = 0.97*spec->len_att[k] + 1.0;
+                    spec->len_acc[k] = 0.97*spec->len_acc[k] + (j < n_ok ? 1.0 : 0.0);
+                }
+            }
+            spec->len_tail_live = false;
+            spec->len_tail.clear();
+        }
+    }
+
     // the shadow draft against what the target produced since: the rows that agree from its start are the rows a
     // verify would have accepted (a little fewer than a sampled verify, which accepts by min(1, p/q))
     if (spec->shadow_impl != nullptr && (size_t) spec->shadow_seq < dparams.size() && dparams[spec->shadow_seq].drafting) {
@@ -4121,6 +4162,63 @@ void common_speculative_draft(common_speculative * spec) {
                 result.clear();
                 if (dp.result_q) {
                     dp.result_q->clear();
+                }
+            }
+
+            // the adaptive length of a model draft (see len_cur)
+            static const bool len_fixed = getenv("LLAMA_SPEC_LEN_FIXED") != nullptr;
+            if (!len_fixed && spec->rows_adaptive && !row_shadow && !impl->chooses_rows() && seq_id == 0 && dparams.size() == 1 &&
+                dp.drafting && !result.empty() && impl->type != COMMON_SPECULATIVE_TYPE_NGRAM_STAT) {
+                const int n_full = std::min<int>((int) result.size(), dp.n_max > 0 ? dp.n_max : (int) result.size());
+                if (spec->len_cur <= 0 || spec->len_cur > n_full || spec->len_impl != impl.get()) {
+                    spec->len_cur  = n_full;
+                    spec->len_impl = impl.get();
+                }
+                // tokens a round over its ms: E(N) = 1 + sum_k<=N P(k), C(N) = c0 + slope*N, with c0 from the measured
+                // rounds of the current length (the formula of row_breakeven until there are some)
+                static const double slope = getenv("LLAMA_SPEC_ROW_MS") ? atof(getenv("LLAMA_SPEC_ROW_MS")) : 2.0;
+                const double tp  = common_speculative_impl::row_t_plain();
+                const size_t kc  = std::min<size_t>(spec->len_cur, 32);
+                const double tcur = impl->row_n[kc] >= 2 ? impl->row_t[kc] : (tp > 0.0 ? tp*(1.5 + 0.28*spec->len_cur) : 0.0);
+                if (tcur > 0.0 && spec->len_att[1] >= 8.0) {
+                    const double c0 = tcur - slope*spec->len_cur;
+                    double e = 1.0, run = 1.0, best_r = 0.0, cur_r = 0.0;
+                    int best_n = spec->len_cur;
+                    for (int k = 1; k <= n_full; ++k) {
+                        // len_acc/len_att is P(k right | k - 1 right): the chance of all k right is their product
+                        run *= spec->len_att[k] > 0.5 ? spec->len_acc[k]/spec->len_att[k] : 0.0;
+                        e += run;
+                        const double r = e/(c0 + slope*k);
+                        if (r > best_r) {
+                            best_r = r;
+                            best_n = k;
+                        }
+                        if (k == spec->len_cur) {
+                            cur_r = r;
+                        }
+                    }
+                    // a change of length is a graph of another size: only for a clear gain
+                    if (best_n != spec->len_cur && best_r > 1.03*cur_r) {
+                        spec->len_cur = best_n;
+                    }
+                }
+                if ((int) result.size() > spec->len_cur) {
+                    spec->len_tail.assign(result.begin() + spec->len_cur, result.begin() + n_full);
+                    spec->len_tail_start = dp.prompt->size() + 1 + spec->len_cur;
+                    result.resize(spec->len_cur);
+                    if (dp.result_q && dp.result_q->size() > (size_t) spec->len_cur) {
+                        dp.result_q->resize(spec->len_cur);
+                    }
+                } else {
+                    spec->len_tail.clear();
+                }
+                spec->len_tail_live = false;
+                if (getenv("LLAMA_SPEC_LEN_DEBUG")) {
+                    fprintf(stderr, "spec-len: %d (P:", spec->len_cur);
+                    for (int k = 1; k <= n_full; ++k) {
+                        fprintf(stderr, " %.2f", spec->len_att[k] > 0.5 ? spec->len_acc[k]/spec->len_att[k] : 0.0);
+                    }
+                    fprintf(stderr, ")\n");
                 }
             }
 
@@ -4223,6 +4321,22 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
     // the rows that were right, for the rows of the next rounds
     const size_t n_drafted = (size_t) seq_id < spec->n_draft_last.size() ? spec->n_draft_last[seq_id] : 0;
+    if (n_drafted > 0 && seq_id == 0 && impl == spec->len_impl) {
+        for (size_t k = 1; k <= n_drafted && k <= 32; ++k) {
+            spec->len_att[k] = 0.97*spec->len_att[k] + 1.0;
+            spec->len_acc[k] = 0.97*spec->len_acc[k] + (n_accepted >= k ? 1.0 : 0.0);
+            if (n_accepted < k) {
+                break; // a position after the first rejection was not tried
+            }
+        }
+        // all verified rows right: the cut rows are tried against the next tokens
+        if (n_accepted >= n_drafted && !spec->len_tail.empty()) {
+            spec->len_tail_live = true;
+            spec->len_cut0      = n_drafted;
+        } else {
+            spec->len_tail.clear();
+        }
+    }
     if (n_drafted > 0) {
         spec->n_draft_last[seq_id] = 0;
         spec->trace_acc = n_accepted;
