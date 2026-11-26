@@ -880,6 +880,10 @@ typedef struct {
     uint64_t nb01;
     uint64_t nb02;
     uint64_t nb11;  // from one expert slot of the input to the next
+    uint64_t nb12;   // the token stride of the input (several tokens: kernel_mul_mv_id_nvfp4_reduce_conv_mt)
+    uint64_t nbi1;   // the token stride of the ids
+    int32_t  n_t;    // tokens
+    int32_t  pad3;
 } ggml_metal_kargs_mul_mv_id_rc;
 
 typedef struct {

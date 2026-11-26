@@ -3709,9 +3709,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // this output): the reduce and the conv in its epilogue (kernel_mul_mv_id_nvfp4_reduce_conv), one step.
         // GGML_METAL_NO_DOWN_RC=1 turns it off
         static const bool no_down_rc = getenv("GGML_METAL_NO_DOWN_RC") != nullptr;
+        static const bool no_down_rc_mt = getenv("GGML_METAL_NO_DOWN_RC_MT") != nullptr;
         if (!no_down_rc && ctx->use_fusion() && op->src[0]->type == GGML_TYPE_NVFP4 && op->src[1]->type == GGML_TYPE_F32 &&
-            ne00 % 64 == 0 && ne21 == 1 && ne20 <= 8 && ne1 == ne20 && op->ne[2] == 1 && ggml_is_contiguous(op) &&
-            idx + 1 < ctx->n_nodes()) {
+            ne00 % 64 == 0 && (ne21 == 1 || (!no_down_rc_mt && ne21 == 2 && ne20*ne21 <= 32)) && ne20 <= 8 && ne1 == ne20 &&
+            op->ne[2] == ne21 && ggml_is_contiguous(op) && idx + 1 < ctx->n_nodes()) {
             int n2 = 0;
             const ggml_metal_fusion * fusion = ctx->can_fuse(idx + 1, GGML_METAL_FUSION_FULL, &n2);
             if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_REDUCE_CONV) {
@@ -3726,9 +3727,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ggml_tensor *       rdst  = ctx->node(idx + 1 + n2 - 1);
                 const ggml_tensor * res   = rdst->src[0] == scale ? rdst->src[1] : rdst->src[0];
                 const ggml_tensor * w     = conv->src[1];
-                if (mul->src[0] == op && rows->src[1] == op->src[2] && conv->ne[1] == 1 && conv->ne[2] == 1 &&
+                if (mul->src[0] == op && rows->src[1] == op->src[2] && conv->ne[1] == ne21 && conv->ne[2] == 1 &&
                     w->ne[1] == ne0 && w->ne[0] <= 9 && ne0 % 4 == 0 && ggml_is_contiguous(rdst) && ggml_is_contiguous(res) &&
-                    ggml_is_contiguous(mulw->src[1]) && ggml_is_contiguous(op->src[2])) {
+                    ggml_is_contiguous(mulw->src[1]) && (ne21 == 1 || op->src[2]->nb[0] == sizeof(int32_t)) &&
+                    (ne21 > 1 || ggml_is_contiguous(op->src[2]))) {
                     ctx->count_fusions(fusion);
                     ggml_metal_op_fused_concurrency(ctx, idx, 1 + n2);
 
@@ -3741,11 +3743,15 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                         /*.nb01 =*/ nb01,
                         /*.nb02 =*/ nb02,
                         /*.nb11 =*/ nb11,
+                        /*.nb12 =*/ nb12,
+                        /*.nbi1 =*/ op->src[2]->nb[1],
+                        /*.n_t  =*/ (int32_t) ne21,
+                        /*.pad3 =*/ 0,
                     };
                     ggml_metal_kargs_reduce_conv cargs = {
                         /*.nc       =*/ (int32_t) w->ne[0],
                         /*.C        =*/ (int32_t) w->ne[1],
-                        /*.n_t      =*/ 1,
+                        /*.n_t      =*/ (int32_t) ne21,
                         /*.n_s      =*/ 1,
                         /*.ne1      =*/ (int32_t) ne20,
                         /*.pad      =*/ 0,
@@ -3756,7 +3762,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                         /*.b        =*/ ggml_get_op_params_f32(scale, 1),
                     };
 
-                    auto pipeline = ggml_metal_library_get_pipeline_named(lib, "kernel_mul_mv_id_nvfp4_reduce_conv");
+                    auto pipeline = ggml_metal_library_get_pipeline_named(lib, ne21 > 1 ? "kernel_mul_mv_id_nvfp4_reduce_conv_mt" : "kernel_mul_mv_id_nvfp4_reduce_conv");
 
                     ggml_metal_encoder_set_pipeline(enc, pipeline);
                     ggml_metal_encoder_set_bytes   (enc, &args,  sizeof(args),  0);
@@ -3772,7 +3778,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cpy->src[1]),  10);
                     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res),          11);
                     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rdst),         12);
-                    ggml_metal_encoder_set_threadgroup_memory_size(enc, 1024 + 4*8*sizeof(float), 0);
+                    ggml_metal_encoder_set_threadgroup_memory_size(enc, 1024 + 4*8*4*sizeof(float), 0);
                     static const bool chk = getenv("GGML_METAL_DOWN_RC_CHECK") != nullptr;
                     if (chk) {
                         cargs.nc = 0; // raw rows only
@@ -3780,7 +3786,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                         ggml_metal_encoder_set_bytes(enc, &args,  sizeof(args),  0);
                         ggml_metal_encoder_set_bytes(enc, &cargs, sizeof(cargs), 5);
                     }
-                    ggml_metal_encoder_dispatch_threadgroups(enc, ne0/4, 1, 1, 32, ne20, 1);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, ne0/4, 1, 1, 32, ne20*ne21, 1);
 
                     if (chk) {
                         return 1;
