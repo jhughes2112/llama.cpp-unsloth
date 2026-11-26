@@ -2977,7 +2977,41 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
         res = dst->src[0] == op ? dst->src[1] : dst->src[0];
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_mma_auto(lib, op, fuse_add);
+    // the soft cap of the logits right behind (and the copy without the padding rows): in the store of this kernel,
+    // the raw logits are not written (their only reader is the cap). GGML_METAL_NO_MMA_SOFTCAP=1 turns it off
+    int   cap_n = 0;
+    float cap_a = 0.0f, cap_b = 0.0f;
+    int   n_cap = 0;
+    static const bool no_mma_cap = getenv("GGML_METAL_NO_MMA_SOFTCAP") != nullptr;
+    if (!no_mma_cap && !fuse_add && ctx->use_fusion() && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
+        ggml_is_contiguous(op) && idx + 1 < ctx->n_nodes()) {
+        int n2 = 0;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx + 1, GGML_METAL_FUSION_FULL, &n2);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SOFTCAP) {
+            const ggml_tensor * s1   = ctx->node(idx + 1);
+            const ggml_tensor * s2   = ctx->node(idx + 1 + 2);
+            const ggml_tensor * cdst = ctx->node(idx + n2);
+            bool ok = s1->src[0] == op && cdst->ne[1] == ne11 && cdst->ne[2] == 1 && ggml_is_contiguous(cdst) && cdst->ne[0] <= ne01;
+            for (int j = idx + 1 + n2; ok && j < ctx->n_nodes(); ++j) {
+                const ggml_tensor * t = ctx->node(j);
+                for (int k = 0; ok && k < GGML_MAX_SRC; ++k) {
+                    ok = !(t->src[k] && ggml_metal_op_root(t->src[k]) == op);
+                }
+            }
+            if (ok) {
+                ctx->count_fusions(fusion);
+                ggml_metal_op_fused_concurrency(ctx, idx, 1 + n2);
+                cap_n = (int) cdst->ne[0];
+                cap_a = ggml_get_op_params_f32(s1, 0);
+                cap_b = ggml_get_op_params_f32(s2, 0);
+                n_cap = n2;
+                dst   = cdst;
+                res   = cdst;
+            }
+        }
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_mma_auto(lib, op, fuse_add, cap_n, cap_a, cap_b);
 
     ggml_metal_kargs_mul_mv_ext args = {
         /*.ne00  =*/ ne00,
@@ -3014,7 +3048,7 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + rows0 - 1)/rows0, (ne11 + rows1 - 1)/rows1, ne12*ne13, 32, pipeline.nsg, 1);
 
-    return n_fuse;
+    return n_cap > 0 ? 1 + n_cap : n_fuse;
 }
 
 // the generic mat-vec kernel, or its 2-row Q4_0 variant if nc

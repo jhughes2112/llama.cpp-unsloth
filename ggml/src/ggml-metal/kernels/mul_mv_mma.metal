@@ -7,6 +7,11 @@ constant short FC_mul_mv_mma_r2   [[function_constant(FC_MUL_MV_MMA + 2)]];
 constant short FC_mul_mv_mma_r3   [[function_constant(FC_MUL_MV_MMA + 3)]];
 constant int   FC_mul_mv_mma_ne00 [[function_constant(FC_MUL_MV_MMA + 4)]];
 constant bool  FC_mul_mv_mma_add  [[function_constant(FC_MUL_MV_MMA + 5)]];
+// the soft cap of the logits in the store: rows < cap_n of each column get b*tanh(a*x), written to dst as a matrix of
+// cap_n rows (the padding rows dropped); a and b as the bits of floats. cap_n 0: no cap
+constant int   FC_mul_mv_mma_cap_n [[function_constant(FC_MUL_MV_MMA + 6)]];
+constant int   FC_mul_mv_mma_cap_a [[function_constant(FC_MUL_MV_MMA + 7)]];
+constant int   FC_mul_mv_mma_cap_b [[function_constant(FC_MUL_MV_MMA + 8)]];
 
 // a lane of a few-row MMA tile: A fragment row fm, B fragment columns fn and fn + 1
 struct mul_mv_mma_tile {
@@ -102,7 +107,13 @@ inline void mul_mv_mma_store(
         const int r0 = tile.i01 + 8*t  + mul_mv_mma_lane_fm(l);
         const int r1 = tile.i11 + 8*rt + mul_mv_mma_lane_fn(l) + e;
 
-        if (r0 < args.ne01 && r1 < args.ne11) {
+        if (FC_mul_mv_mma_cap_n > 0) {
+            if (r0 < FC_mul_mv_mma_cap_n && r1 < args.ne11) {
+                const float a = as_type<float>(FC_mul_mv_mma_cap_a);
+                const float b = as_type<float>(FC_mul_mv_mma_cap_b);
+                dst_f32[(uint64_t) r1*FC_mul_mv_mma_cap_n + r0] = b*precise::tanh(a*sum);
+            }
+        } else if (r0 < args.ne01 && r1 < args.ne11) {
             const uint64_t i = (uint64_t) r1*args.ne0 + r0;
             dst_f32[i] = FC_mul_mv_mma_add ? sum + res_f32[i] : sum;
         }
