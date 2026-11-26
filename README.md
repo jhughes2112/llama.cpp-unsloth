@@ -3,12 +3,40 @@
 ![Inkling 2 Mini on a Mac, decode speed commit by commit](media/inkling2-mac.gif)
 
 This branch is Unsloth's llama.cpp release `b12588-mix-c0c3de8` with the Metal backend reworked for
-[Inkling 2 Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF). **All numbers on this page are one stream on an
-Apple M5 Ultra**, `llama-server`, at the model's own sampling settings (temperature 1.0; nothing was measured greedy).
-Smaller Apple chips will be slower.
+[Inkling 2 Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF). **All numbers on this page were measured on an
+Apple M5 Ultra** with `llama-server`, at the model's own sampling settings (temperature 1.0; no speed was measured
+greedy). Smaller Apple chips will be slower.
 
-The model's output is unchanged within rounding: KL divergence 0.0008 against the untouched build at batch 1, and 0.0019
-at the default batch (the untouched build against itself with fusion off: 0.0008 and 0.0016).
+### It answers like the original
+
+Faster kernels are only worth having if the model still says the same thing. Both tests below compare this branch with
+the untouched Unsloth release, built from the same source (commit `1b9ac5cd2`) and run on the same model file.
+
+**The same words, token for token.** 16 prompts (code, math, prose, facts, a translation), greedy decoding, 256 tokens
+each:
+
+| | identical over all 256 tokens | text before the first difference |
+|---|---|---|
+| this branch against the original | 10 of 16 | 78% |
+| the original against itself, its own fused kernels switched off | 7 of 16 | 64% |
+| either build against itself, run again | 16 of 16 | 100% |
+
+Both builds are deterministic. Where two outputs part, it is at a near tie between two equally likely words ("Two-pointer
+merge" or "Classic two-pointer merge", "Plot:" or "Shakespeare's play:"), and the answers stay the same. The last bits
+of a floating-point sum depend on the order of the additions, so no fused kernel is bit-identical to an unfused one:
+switching off the original's own fusion moves its output more than this whole branch does.
+
+**The same probabilities.** KL divergence of each next-token distribution from the original's, over three 512-token
+windows of text, one token at a time:
+
+| | mean KLD | 99.9th percentile | same top token |
+|---|---|---|---|
+| this branch | 0.00077 | 0.030 | 99.1% |
+| the original, its own fusion off | 0.00082 | 0.042 | 99.3% |
+
+For scale: choosing the 4-bit `UD-Q4_K_M` file over the 8-bit `UD-Q8_K_XL` moves the distribution by 0.0031 (97.7% same
+top token), four times what everything in this branch moves it. At the default batch size the KLD is 0.0019, against
+0.0016 for the original with its fusion off.
 
 ### Speed, one stream, M5 Ultra
 
@@ -26,6 +54,44 @@ code or prose task, 300 tokens generated, mean of three seeds):
 The speed is the same for every kind of text; the rows are three seeds each.
 
 The untouched Unsloth release decodes 37 tok/sec on the same machine.
+
+### Several streams at once
+
+![Inkling 2 Mini, total decode speed with 1, 2, 4 and 8 concurrent streams at 512, 4K and 32K tokens of context](media/inkling2-streams.gif)
+
+`llama-server --parallel N` decodes all its streams together: each step runs one token of every stream through the
+same fused kernels. Total tok/sec, with each stream's own speed in brackets (each stream its own real C++ or Markdown
+context of that size, 256 tokens generated, temperature 1.0, two seeds):
+
+| context | 1 stream | 2 streams | 4 streams | 8 streams |
+|---|---|---|---|---|
+| 512 tokens | 132 | 151 (75 each) | 207 (52 each) | 253 (31 each) |
+| 4K tokens | 126 | 145 (72 each) | 198 (49 each) | 241 (30 each) |
+| 32K tokens | 109 | 125 (62 each) | 165 (41 each) | 195 (24 each) |
+
+Eight streams give about twice the total of one. Context costs more as streams are added, because attention reads
+every stream's own cache: from 512 to 32K tokens one stream loses 17%, eight lose 23%. `-c` must hold every stream
+(`-c 262144 --parallel 8` for eight 32K contexts).
+
+### Why there is no draft model
+
+Speculative decoding, where a small model drafts a few tokens and the large one checks them all in one pass, is the
+usual way to speed up decode. Every drafter we could find for Inkling 2 Mini was tested on this branch, and none of them
+pays on this machine, so it runs without one.
+
+- **DSpark**, the multi-token-prediction head Thinking Machines ships with the model (also tested as community 4-bit
+  versions, which behaved the same): 75% of single drafts accepted on code and 51% on prose, fewer as the drafts get
+  longer (55% and 26% at three). At every length from one draft to five it was slower than plain decode: 99 to 113
+  tok/sec on code and 52 to 93 on prose, against 137.
+- **DFlash2** (Inco AI), the strongest we found: a real gain on short coding prompts (159 tok/sec against 133 at the
+  time), but drafter and model agree less as the context grows. With 1K tokens of context the gain was 5%; from 4K
+  on there was none (126 against 126 at 4K, 111 against 110 at 32K). Drafting every token at temperature 1.0 made
+  prose slower (75 against 110 at the time).
+
+The reason is the price of checking a draft. Each extra token in a verify pass reads its own experts, about 2 to 2.5
+ms here, where a whole plain token takes about 7 ms, so a draft has to be accepted most of the time just to break even,
+and the faster plain decode gets, the higher that bar. These drafters are good work, and on slower engines they help;
+on a decoder this optimized they make it slower, and the GPU and memory bandwidth are better spent on the model itself.
 
 ### What you need
 
@@ -82,10 +148,11 @@ build/bin/llama-bench -m models/Inkling-2-Mini-UD-Q4_K_M.gguf -p 0 -n 400 -r 3
   polling, and the command buffer for the next token is encoded while the GPU runs the current one.
 - Only the Metal backend changed. CUDA, Vulkan and CPU run as in the Unsloth release.
 - Leave the K/V cache at its default (F16).
+- Several streams (`--parallel N`) take the same fused paths as one; the numbers above are from this build.
 - `GGML_METAL_PROFILE=1` prints GPU time, kernels and serial steps a token. `GGML_METAL_FUSION_DISABLE=1` runs
   without the fused kernels, for comparison.
 - The base is a frozen release, so this branch does not follow upstream llama.cpp.
-- `media/make_inkling2_gif.py` draws the chart above (its history ends before the latest work).
+- `media/make_inkling2_gif.py` and `media/make_streams_gif.py` draw the two charts.
 
 ---
 
