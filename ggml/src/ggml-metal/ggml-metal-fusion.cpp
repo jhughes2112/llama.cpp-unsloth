@@ -2915,6 +2915,31 @@ static bool ggml_metal_fusion_gather_fa_follows(const ggml_cgraph * gf, const gg
 
 // ---- alloc deps -----------------------------------------------------------
 
+// the patterns by their first op (of ops_all: raw = true, of ops: raw = false), in the order of the table: a node is
+// only tried against the patterns that can start at it (the passes over a 12K-node graph tried all ~80 at each node)
+static const std::vector<const ggml_metal_fusion *> & ggml_metal_fusions_starting(ggml_op op, bool raw) {
+    static std::vector<std::vector<const ggml_metal_fusion *>> by_raw, by_ops;
+    static bool init = false;
+    if (!init) {
+        by_raw.assign(GGML_OP_COUNT, {});
+        by_ops.assign(GGML_OP_COUNT, {});
+        for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            if (!fusion.ops_all.empty()) {
+                by_raw[fusion.ops_all[0]].push_back(&fusion);
+            }
+            if (!fusion.ops.empty()) {
+                by_ops[fusion.ops[0]].push_back(&fusion);
+            }
+        }
+        init = true;
+    }
+    static const std::vector<const ggml_metal_fusion *> none;
+    if ((int) op < 0 || (int) op >= GGML_OP_COUNT) {
+        return none;
+    }
+    return raw ? by_raw[op] : by_ops[op];
+}
+
 static bool ggml_metal_fusion_match_raw_pattern(
         const ggml_cgraph * gf, int node_idx, const std::vector<ggml_op> & ops) {
     if (node_idx < 0 || node_idx + (int) ops.size() > gf->n_nodes) {
@@ -2964,7 +2989,8 @@ void ggml_metal_fusion_add_alloc_deps(
     // inside its run. so the inputs are kept for every pattern whose ops match, at every node: taking only the
     // longest and skipping its run left the run of the pattern actually encoded without its inputs
     for (int i = 0; i < gf->n_nodes; ++i) {
-        for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+        for (const ggml_metal_fusion * fusion_p : ggml_metal_fusions_starting(gf->nodes[i]->op, true)) {
+            const ggml_metal_fusion & fusion = *fusion_p;
             if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {
                 ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, &fusion, i);
 
@@ -3310,7 +3336,11 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
     const ggml_metal_fusion * res = nullptr;
     int best = 1;
 
-    for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+    if (idx < 0 || idx >= n_idxs) {
+        return nullptr;
+    }
+    for (const ggml_metal_fusion * fusion_p : ggml_metal_fusions_starting(gf->nodes[node_idxs[idx]]->op, false)) {
+        const ggml_metal_fusion & fusion = *fusion_p;
         const int n_ops = (int) fusion.ops.size();
 
         // only look for a longer match than the current best
