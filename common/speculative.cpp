@@ -3950,7 +3950,8 @@ struct common_spec_judge {
             bool do_reset = false;
             {
                 std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, [&] { return stop || reset || (!q.empty() && active.load()); });
+                static const bool cmp_on = getenv("LLAMA_SPEC_JUDGE_COMPARE") != nullptr;
+                cv.wait(lk, [&] { return stop || reset || (!q.empty() && (active.load() || cmp_on)); });
                 if (stop) {
                     return;
                 }
@@ -4025,14 +4026,15 @@ struct common_spec_judge {
             held.clear();
             held.push_back(std::move(anchor));
 
-            if (!active.load()) {
+            static FILE * cmpf = getenv("LLAMA_SPEC_JUDGE_COMPARE") ? fopen(getenv("LLAMA_SPEC_JUDGE_COMPARE"), "w") : nullptr;
+            if (!active.load() && cmpf == nullptr) {
                 continue;
             }
             if (wait_left.load() > 0) {
                 wait_left = wait_left.load() - 1;
                 continue;
             }
-            if (++since_draft < every) {
+            if (++since_draft < every && cmpf == nullptr) {
                 continue;
             }
             since_draft = 0;
@@ -4053,6 +4055,12 @@ struct common_spec_judge {
             llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, dp.pos0, -1);
             if (!result.empty()) {
                 probes.push_back({ dp.pos0 + 1, result });
+            }
+            if (cmpf) {
+                fprintf(cmpf, "J %d", (int) dp.pos0);
+                for (auto t : result) fprintf(cmpf, " %d", t);
+                fprintf(cmpf, "\n");
+                fflush(cmpf);
             }
         }
     }
@@ -4094,7 +4102,7 @@ static std::string common_spec_judge_path(const common_params_speculative & para
 }
 
 static std::unique_ptr<common_spec_judge> common_spec_judge_init(const common_params_speculative & params_main, llama_context * ctx_tgt) {
-    if (ctx_tgt == nullptr || params_main.draft.ctx_dft == nullptr || !params_main.rows_adaptive ||
+    if (ctx_tgt == nullptr || params_main.draft.ctx_dft == nullptr || (!params_main.rows_adaptive && getenv("LLAMA_SPEC_JUDGE_COMPARE") == nullptr) ||
         llama_model_dflash_variant(llama_get_model(params_main.draft.ctx_dft)) != LLAMA_DFLASH_VARIANT_DFLASH2) {
         return nullptr;
     }
@@ -4405,9 +4413,9 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     if (spec->judge && batch.size() > 0 && batch.has_token()) {
         auto & J = *spec->judge;
         const int32_t n = batch.size();
-        // a long prefill: the judge takes only its last LLAMA_SPEC_JUDGE_CTX rows (default 512), enough to tell whether
+        // a long prefill: the judge takes only its last LLAMA_SPEC_JUDGE_CTX rows (default 4096), enough to tell whether
         // drafts match, and its KV starts over there (the whole prompt was seconds of CPU injects and bandwidth)
-        static const int32_t jctx = getenv("LLAMA_SPEC_JUDGE_CTX") ? atoi(getenv("LLAMA_SPEC_JUDGE_CTX")) : 512;
+        static const int32_t jctx = getenv("LLAMA_SPEC_JUDGE_CTX") ? atoi(getenv("LLAMA_SPEC_JUDGE_CTX")) : 4096;
         const int32_t i0 = n > jctx ? n - jctx : 0;
         std::vector<float> rows((size_t) (n - i0)*J.n_feat);
         if (llama_copy_embeddings_layer_inp_dev(J.ctx_tgt, i0, n - i0, rows.data()) == J.n_feat) {
@@ -4649,6 +4657,14 @@ void common_speculative_draft(common_speculative * spec) {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
+        }
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 && getenv("LLAMA_SPEC_GPU_COMPARE") && !dparams.empty() &&
+            dparams[0].result && !dparams[0].result->empty()) {
+            static FILE * gf = fopen(getenv("LLAMA_SPEC_GPU_COMPARE"), "w");
+            fprintf(gf, "G %d", (int) dparams[0].pos0);
+            for (size_t k = 0; k < dparams[0].result->size() && k < 3; ++k) fprintf(gf, " %d", (*dparams[0].result)[k]);
+            fprintf(gf, "\n");
+            fflush(gf);
         }
         for (size_t i = 0; i < q_saved.size(); ++i) {
             dparams[i].result_q = q_saved[i];
