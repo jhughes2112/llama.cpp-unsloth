@@ -96,8 +96,9 @@ on a decoder this optimized they make it slower, and the GPU and memory bandwidt
 ### What you need
 
 - macOS on Apple Silicon, Xcode command line tools, CMake, Python 3 with `huggingface_hub`.
-- The model: Unsloth's **`UD-Q4_K_M`** GGUF from the **`Old_Support`** folder (16.6 GB) and its image projector
-  `mmproj-BF16.gguf` (0.6 GB). The files in the root of that repo have a newer layout and will not load here.
+- The model: Unsloth's **`UD-Q4_K_M`** GGUF (16.6 GB) and its image projector `mmproj-BF16.gguf` (0.6 GB), both from
+  the root of the repo: the mainline layout (`inkling2_loop`) that upstream llama.cpp reads too. The older files in
+  `Old_Support` still load here and give identical output.
 
 ### Build
 
@@ -114,10 +115,7 @@ Do not clone under `/tmp`: the web UI packaging step of the server build fails t
 
 ```bash
 pip install -U huggingface_hub
-hf download unsloth/Inkling-2-Mini-GGUF Old_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file \
-    Old_Support/mmproj-BF16.gguf_file --local-dir models
-mv models/Old_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file models/Inkling-2-Mini-UD-Q4_K_M.gguf
-mv models/Old_Support/mmproj-BF16.gguf_file models/mmproj-BF16.gguf
+hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-Q4_K_M.gguf mmproj-BF16.gguf --local-dir models
 ```
 
 ### Run
@@ -148,6 +146,8 @@ build/bin/llama-bench -m models/Inkling-2-Mini-UD-Q4_K_M.gguf -p 0 -n 400 -r 3
   polling, and the command buffer for the next token is encoded while the GPU runs the current one.
 - Only the Metal backend changed. CUDA, Vulkan and CPU run as in the Unsloth release.
 - Leave the K/V cache at its default (F16).
+- Both GGUF layouts of Inkling 2 Mini load: the mainline one (`inkling2_loop`, 24 layers and the loop in its keys) and
+  the older Unsloth one (`inkling2`, one block per layer visit). The same weights give the same tokens either way.
 - Several streams (`--parallel N`) take the same fused paths as one; the numbers above are from this build.
 - `GGML_METAL_PROFILE=1` prints GPU time, kernels and serial steps a token. `GGML_METAL_FUSION_DISABLE=1` runs
   without the fused kernels, for comparison.

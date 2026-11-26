@@ -77,6 +77,47 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     hparams.rope_pattern.fill(false);
 
     // the convolution state keeps K, V, the attention output and the FFN output of the widest layer
+    // inkling2_loop (the mainline GGUF layout, the same model): the file has the 24 physical layers and the loop as keys.
+    // This graph is built for one layer per visit (llama_hparams::loop_layer), so the per-layer settings are expanded
+    if (arch == LLM_ARCH_INKLING2_LOOP) {
+        bool varying = false;
+        ml.get_key(LLM_KV_LOOP_START,     hparams.loop_core_start);
+        ml.get_key(LLM_KV_LOOP_END,       hparams.loop_core_end);
+        ml.get_key(LLM_KV_LOOP_COUNT,     hparams.loop_n_pass);
+        ml.get_key(LLM_KV_LOOP_GATE_RANK, hparams.loop_gate_rank);
+        ml.get_key(LLM_KV_LOOP_VARYING,   varying, false);
+
+        const uint32_t n_phys = hparams.n_layer();
+        if (varying || hparams.loop_n_pass < 2 || !hparams.loop_core_start || hparams.loop_core_start >= hparams.loop_core_end ||
+            hparams.loop_core_end > n_phys || !hparams.loop_gate_rank || hparams.loop_core_start % hparams.attn_res_block_size ||
+            (hparams.loop_core_end - hparams.loop_core_start) % hparams.attn_res_block_size) {
+            throw std::runtime_error(format("inkling2_loop: unsupported loop: core [%u, %u) x %u passes%s, gate rank %u, %u layers",
+                hparams.loop_core_start, hparams.loop_core_end, hparams.loop_n_pass, varying ? " (variable)" : "",
+                hparams.loop_gate_rank, n_phys));
+        }
+        const uint32_t n_all = n_phys + hparams.loop_n_extra();
+        if (n_all > LLAMA_MAX_LAYERS) {
+            throw std::runtime_error(format("inkling2_loop: %u layer visits exceed the maximum of %d", n_all, LLAMA_MAX_LAYERS));
+        }
+        const auto expand = [&](auto & arr) {
+            const auto src = arr;
+            for (uint32_t il = 0; il < n_all; ++il) {
+                arr[il] = src[hparams.loop_layer(il)];
+            }
+        };
+        expand(hparams.n_head_arr);
+        expand(hparams.n_head_kv_arr);
+        expand(hparams.n_ff_arr);
+        expand(hparams.n_ff_exp_arr);
+        expand(hparams.n_expert_used_arr);
+        expand(hparams.is_swa_impl);
+        expand(hparams.is_recr_impl);
+        expand(hparams.swiglu_clamp_exp);
+        expand(hparams.swiglu_clamp_shexp);
+        expand(hparams.swiglu_clamp);
+        hparams.n_layer_all = n_all;
+    }
+
     uint64_t n_channels_max = 0;
 
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
@@ -181,17 +222,27 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
             static const llm_tensor gain[4]   = {LLM_TENSOR_LOOP_ATTN_GAIN,   LLM_TENSOR_LOOP_K_GAIN,   LLM_TENSOR_LOOP_V_GAIN,   LLM_TENSOR_LOOP_MLP_GAIN};
             static const llm_tensor forget[4] = {LLM_TENSOR_LOOP_ATTN_FORGET, LLM_TENSOR_LOOP_K_FORGET, LLM_TENSOR_LOOP_V_FORGET, LLM_TENSOR_LOOP_MLP_FORGET};
 
+            // the mainline layout: the same controllers as (q, k, v, ffn), and the message queries per layer
+            static const llm_tensor down_ml[4]   = {LLM_TENSOR_LOOP_Q_CTRL_DOWN,   LLM_TENSOR_LOOP_K_CTRL_DOWN,   LLM_TENSOR_LOOP_V_CTRL_DOWN,   LLM_TENSOR_LOOP_FFN_CTRL_DOWN};
+            static const llm_tensor gain_ml[4]   = {LLM_TENSOR_LOOP_Q_CTRL_GAIN,   LLM_TENSOR_LOOP_K_CTRL_GAIN,   LLM_TENSOR_LOOP_V_CTRL_GAIN,   LLM_TENSOR_LOOP_FFN_CTRL_GAIN};
+            static const llm_tensor forget_ml[4] = {LLM_TENSOR_LOOP_Q_CTRL_FORGET, LLM_TENSOR_LOOP_K_CTRL_FORGET, LLM_TENSOR_LOOP_V_CTRL_FORGET, LLM_TENSOR_LOOP_FFN_CTRL_FORGET};
+            const bool mainline = arch == LLM_ARCH_INKLING2_LOOP;
+
             const int64_t n_rank = hparams.loop_gate_rank;
 
             for (int m = 0; m < 4; ++m) {
-                layer.loop_down[m]   = create_tensor(tn(down[m],   "weight", i), {2*n_embd, n_rank}, 0);
-                layer.loop_gain[m]   = create_tensor(tn(gain[m],   "weight", i), {n_rank, n_embd}, 0);
-                layer.loop_forget[m] = create_tensor(tn(forget[m], "weight", i), {n_rank, n_embd}, 0);
+                layer.loop_down[m]   = create_tensor(tn(mainline ? down_ml[m]   : down[m],   "weight", i), {2*n_embd, n_rank}, 0);
+                layer.loop_gain[m]   = create_tensor(tn(mainline ? gain_ml[m]   : gain[m],   "weight", i), {n_rank, n_embd}, 0);
+                layer.loop_forget[m] = create_tensor(tn(mainline ? forget_ml[m] : forget[m], "weight", i), {n_rank, n_embd}, 0);
+            }
+            if (mainline) {
+                layer.loop_msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", i), {n_embd, 4}, 0);
             }
         }
     }
 
-    if (loop) {
+    // the mainline layout has no global queries: load_tensors_post gathers them from the per-layer ones
+    if (loop && arch != LLM_ARCH_INKLING2_LOOP) {
         const int64_t n_query = 2*(hparams.loop_core_end - hparams.loop_core_start);
 
         loop_res_query    = create_tensor(tn(LLM_TENSOR_LOOP_RES_QUERY,    "weight"), {n_embd, n_query}, 0);
@@ -231,6 +282,64 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
     return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+}
+
+// inkling2_loop: loop_res_query holds (q, ffn) and loop_kv_res_query (k, v) of each core layer, two columns a layer,
+// copied from the layer's message queries [n_embd, 4] = (q, k, v, ffn)
+void llama_model_inkling2::load_tensors_post(bool no_alloc) {
+    if (arch != LLM_ARCH_INKLING2_LOOP || hparams.loop_n_pass < 2) {
+        return;
+    }
+    const int64_t n_embd = hparams.n_embd;
+    const int64_t n_core = hparams.loop_core_end - hparams.loop_core_start;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ctx_loop_query.reset(ggml_init(params));
+    if (!ctx_loop_query) {
+        throw std::runtime_error("inkling2_loop: failed to create the query context");
+    }
+    loop_res_query    = ggml_new_tensor_2d(ctx_loop_query.get(), GGML_TYPE_F32, n_embd, 2*n_core);
+    loop_kv_res_query = ggml_new_tensor_2d(ctx_loop_query.get(), GGML_TYPE_F32, n_embd, 2*n_core);
+    ggml_set_name(loop_res_query,    "loop_res_query.weight");
+    ggml_set_name(loop_kv_res_query, "loop_kv_res_query.weight");
+    if (no_alloc) {
+        return;
+    }
+
+    const ggml_tensor * first = layers[hparams.loop_core_start].loop_msg_query;
+    if (!first || !first->buffer) {
+        throw std::runtime_error("inkling2_loop: the message queries are not loaded");
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(first->buffer);
+    if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            buft = ggml_backend_dev_buffer_type(dev);
+        }
+    }
+    buf_loop_query.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_loop_query.get(), buft));
+    if (!buf_loop_query) {
+        throw std::runtime_error("inkling2_loop: unable to allocate the query buffer");
+    }
+    ggml_backend_buffer_set_usage(buf_loop_query.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<float> msg(4*n_embd), res(2*n_core*n_embd), kv(2*n_core*n_embd);
+    for (int64_t k = 0; k < n_core; ++k) {
+        const ggml_tensor * t = layers[hparams.loop_core_start + k].loop_msg_query;
+        if (t->type != GGML_TYPE_F32 || t->ne[0] != n_embd || t->ne[1] != 4 || !ggml_is_contiguous(t)) {
+            throw std::runtime_error("inkling2_loop: the message queries must be F32 [n_embd, 4]");
+        }
+        ggml_backend_tensor_get(t, msg.data(), 0, msg.size()*sizeof(float));
+        std::copy_n(msg.begin() + 0*n_embd, n_embd, res.begin() + (2*k + 0)*n_embd); // q
+        std::copy_n(msg.begin() + 3*n_embd, n_embd, res.begin() + (2*k + 1)*n_embd); // ffn
+        std::copy_n(msg.begin() + 1*n_embd, n_embd, kv.begin()  + (2*k + 0)*n_embd); // k
+        std::copy_n(msg.begin() + 2*n_embd, n_embd, kv.begin()  + (2*k + 1)*n_embd); // v
+    }
+    ggml_backend_tensor_set(loop_res_query,    res.data(), 0, res.size()*sizeof(float));
+    ggml_backend_tensor_set(loop_kv_res_query, kv.data(),  0, kv.size()*sizeof(float));
 }
 
 // loop message controller: (1 - tanh(F h))*cur + tanh(G h)*message, h = D [rms(cur); rms(message)]; module: q, k, v, mlp

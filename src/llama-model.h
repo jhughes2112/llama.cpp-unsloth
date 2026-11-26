@@ -705,6 +705,7 @@ struct llama_layer {
     struct ggml_tensor * loop_down[4]     = {};
     struct ggml_tensor * loop_gain[4]     = {};
     struct ggml_tensor * loop_forget[4]   = {};
+    struct ggml_tensor * loop_msg_query   = nullptr; // inkling2_loop: the q, k, v, ffn message queries
     struct ggml_tensor * attn_q_inp_norm  = nullptr;
     struct ggml_tensor * attn_k_inp_norm  = nullptr;
     struct ggml_tensor * attn_v_inp_norm  = nullptr;
@@ -1171,6 +1172,8 @@ struct llama_model_base : public llama_model {
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;
     void load_arch_tensors(llama_model_loader & ml) override = 0;
+    // after the weights are loaded (no_alloc: tensors without data): weights a model derives from the loaded ones
+    virtual void load_tensors_post(bool no_alloc) { GGML_UNUSED(no_alloc); }
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override = 0;
 };
 

@@ -2558,6 +2558,12 @@ struct llama_model_inkling2 : public llama_model_base {
     llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void load_tensors_post(bool no_alloc) override;
+
+    // inkling2_loop: the cross-pass queries this graph reads, gathered from the per-layer message queries
+    ggml_context_ptr        ctx_loop_query;
+    ggml_backend_buffer_ptr buf_loop_query;
+
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
     struct graph : public llm_graph_context {
