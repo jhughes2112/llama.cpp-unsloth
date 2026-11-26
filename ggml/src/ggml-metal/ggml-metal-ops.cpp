@@ -3291,9 +3291,13 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // GGML_METAL_MV_EXT_MIN: the fewest src1 rows for the small-batch kernels (9 and more: never)
     static const int mv_ext_min = getenv("GGML_METAL_MV_EXT_MIN") ? atoi(getenv("GGML_METAL_MV_EXT_MIN")) : 2;
 
+    // a matrix of few rows (a router, a sink projection) gets one or two threadgroups in the small-batch kernel, each
+    // walking the whole row with few threads: the generic mat-vec spreads it wider (GGML_METAL_MV_EXT_MIN_ROWS, 512)
+    static const int mv_ext_min_rows = getenv("GGML_METAL_MV_EXT_MIN_ROWS") ? atoi(getenv("GGML_METAL_MV_EXT_MIN_ROWS")) : 512;
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
-    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) && ne01 >= mv_ext_min_rows &&
         (
          (
           (
