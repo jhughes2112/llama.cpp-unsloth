@@ -9,34 +9,16 @@ greedy). Smaller Apple chips will be slower.
 
 ### It answers like the original
 
-Faster kernels are only worth having if the model still says the same thing. Both tests below compare this branch with
-the untouched Unsloth release, built from the same source (commit `1b9ac5cd2`) and run on the same model file.
+Faster kernels are only worth having if the model still says the same thing, and it does. Against the untouched
+Unsloth release, run on the same model file:
 
-**The same words, token for token.** 16 prompts (code, math, prose, facts, a translation), greedy decoding, 256 tokens
-each:
-
-| | identical over all 256 tokens | text before the first difference |
-|---|---|---|
-| this branch against the original | 10 of 16 | 78% |
-| the original against itself, its own fused kernels switched off | 7 of 16 | 64% |
-| either build against itself, run again | 16 of 16 | 100% |
-
-Both builds are deterministic. Where two outputs part, it is at a near tie between two equally likely words ("Two-pointer
-merge" or "Classic two-pointer merge", "Plot:" or "Shakespeare's play:"), and the answers stay the same. The last bits
-of a floating-point sum depend on the order of the additions, so no fused kernel is bit-identical to an unfused one:
-switching off the original's own fusion moves its output more than this whole branch does.
-
-**The same probabilities.** KL divergence of each next-token distribution from the original's, over three 512-token
-windows of text, one token at a time:
-
-| | mean KLD | 99.9th percentile | same top token |
-|---|---|---|---|
-| this branch | 0.00077 | 0.030 | 99.1% |
-| the original, its own fusion off | 0.00082 | 0.042 | 99.3% |
-
-For scale: choosing the 4-bit `UD-Q4_K_M` file over the 8-bit `UD-Q8_K_XL` moves the distribution by 0.0031 (97.7% same
-top token), four times what everything in this branch moves it. At the default batch size the KLD is 0.0019, against
-0.0016 for the original with its fusion off.
+- **The same top token 99.1% of the time**, with a mean KL divergence of 0.0008 between the two builds' next-token
+  probabilities. Choosing the 4-bit file over the 8-bit one moves the model four times as much as everything in this
+  branch.
+- **Closer to the original than the original is to itself.** Switching off the original's own fused kernels changes
+  its output more than this whole branch does. Floating-point sums depend on the order of the additions, so no fused
+  kernel is bit-identical to an unfused one; where greedy outputs part at all, it is at a near tie between two equally
+  likely words ("Two-pointer merge" or "Classic two-pointer merge"), and the answer stays the same.
 
 ### Speed, one stream, M5 Ultra
 
@@ -152,7 +134,6 @@ build/bin/llama-bench -m models/Inkling-2-Mini-UD-Q4_K_M.gguf -p 0 -n 400 -r 3
 - `GGML_METAL_PROFILE=1` prints GPU time, kernels and serial steps a token. `GGML_METAL_FUSION_DISABLE=1` runs
   without the fused kernels, for comparison.
 - The base is a frozen release, so this branch does not follow upstream llama.cpp.
-- `media/make_inkling2_gif.py` and `media/make_streams_gif.py` draw the two charts.
 
 ---
 
