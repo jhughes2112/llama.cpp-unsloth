@@ -2090,8 +2090,8 @@ static bool ggml_metal_fusion_check_kv_conv_store(
     const ggml_tensor * scale = nodes[4];
     const ggml_tensor * resh  = gf->nodes[raw0 + 8 + sh];
     const ggml_tensor * head  = nodes[n - 2]; // the clipped or normalized heads
-    const ggml_tensor * view  = gf->nodes[raw0 + n_raw - 2];
     const ggml_tensor * set   = nodes[n - 1];
+    const ggml_tensor * view  = set->src[0];
     const ggml_tensor * idxs  = set->src[1];
 
     if (is_k) {
@@ -2126,10 +2126,19 @@ static bool ggml_metal_fusion_check_kv_conv_store(
     }
 
     // outputs: the store in the cache, the state store of the convolution and its cell view
-    // (with rollback slots also the view of the slot order)
-    const int outputs[4] = { raw0 + n_raw - 1, raw0 + 3 + sh, raw0 + 2 + sh, raw0 + 2 };
+    // (with rollback slots also the view of the slot order; with several sequences also the reshape of the cache, which
+    // the attention views too)
+    const bool ms = fusion->ops_all[n_raw - 2] == GGML_OP_RESHAPE;
+    int outputs[5] = { raw0 + n_raw - 1, raw0 + 3 + sh, raw0 + 2 + sh, 0, 0 };
+    int n_out = 3;
+    if (sh) {
+        outputs[n_out++] = raw0 + 2;
+    }
+    if (ms) {
+        outputs[n_out++] = raw0 + n_raw - 2;
+    }
 
-    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, 3 + sh);
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, fusion->ops_all.data(), outputs, n_out);
 }
 
 // EXPERT_REDUCE [VIEW RESHAPE TRANSPOSE] SHORT_CONV + residual ADD: the weighted sum of the expert outputs, the short
@@ -2702,6 +2711,16 @@ static const std::vector<ggml_op> ops_k_conv_store_rs = {
     GGML_OP_RESHAPE, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
     GGML_OP_VIEW, GGML_OP_SET_ROWS
 };
+// several sequences: the cache is reshaped before its store
+static const std::vector<ggml_op> ops_k_conv_store_ms = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
+    GGML_OP_RESHAPE, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_SET_ROWS
+};
+static const std::vector<ggml_op> ops_v_conv_store_ms = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
+    GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_SET_ROWS
+};
 static const std::vector<ggml_op> ops_v_conv_store_rs = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE,
     GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS
@@ -2837,6 +2856,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_REDUCE_CONV, ops_reduce_conv, {12}, true, ggml_metal_fusion_check_reduce_conv },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_v_conv_store, {1}, true, ggml_metal_fusion_check_kv_conv_store },
+    { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store_ms, {1}, true, ggml_metal_fusion_check_kv_conv_store },
+    { GGML_METAL_FUSION_KV_CONV_STORE, ops_v_conv_store_ms, {1}, true, ggml_metal_fusion_check_kv_conv_store },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_k_conv_store_rs, {1}, true, ggml_metal_fusion_check_kv_conv_store },
     { GGML_METAL_FUSION_KV_CONV_STORE, ops_v_conv_store_rs, {1}, true, ggml_metal_fusion_check_kv_conv_store },
 
