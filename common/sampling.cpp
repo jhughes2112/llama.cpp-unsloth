@@ -11,6 +11,9 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#endif
 #include <cstring>
 #include <random>
 #include <unordered_map>
@@ -814,6 +817,125 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     // draws come from the sampler's own stream, so they stay independent of what was drafted
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+
+    // pure temperature, no grammar: a draft row needs only the max and the sum of exp((l - max)/T) of its logits, all
+    // rows at once on a few threads (the generic path built the candidates of 200K tokens a row, one row after the
+    // other: 1.6 ms a round of 7 rows); the residual of a rejection walks the vocabulary once. the token the sampler
+    // would have drawn for a row is not drawn (it was only a fallback), so the text of a seed differs, the
+    // distribution does not. LLAMA_REJ_SLOW=1: the generic path
+    static const bool rej_slow = getenv("LLAMA_REJ_SLOW") != nullptr;
+    if (!rej_slow && !grammar_first && !gsmpl->grmr && common_sampler_pure_temp(gsmpl) && !draft.empty()) {
+        llama_synchronize(ctx);
+        const float T  = gsmpl->params.temp;
+        const float iT = 1.0f/T;
+        const int   nv = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        const int   nr = (int) draft.size();
+        std::vector<const float *> L(nr);
+        for (int r = 0; r < nr; ++r) {
+            L[r] = llama_get_logits_ith(ctx, idxs[r]);
+        }
+        const int NC = 4;
+        std::vector<float> cm(nr*NC), cs(nr*NC);
+        auto work = [&](size_t t) {
+            const int r = (int) t/NC, c = (int) t%NC;
+            const int a = (int) ((int64_t) nv*c/NC), b = (int) ((int64_t) nv*(c + 1)/NC);
+            const float * l = L[r];
+            float m = -INFINITY;
+            for (int k = a; k < b; ++k) {
+                m = std::max(m, l[k]);
+            }
+            float sum = 0.0f;
+            for (int k = a; k < b; ++k) {
+                sum += expf((l[k] - m)*iT);
+            }
+            cm[t] = m;
+            cs[t] = sum;
+        };
+#if defined(__APPLE__)
+        dispatch_apply((size_t) nr*NC, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t t) { work(t); });
+#else
+        for (size_t t = 0; t < (size_t) nr*NC; ++t) {
+            work(t);
+        }
+#endif
+        for (int i = 0; i < nr; ++i) {
+            float M = -INFINITY;
+            for (int c = 0; c < NC; ++c) {
+                M = std::max(M, cm[i*NC + c]);
+            }
+            float S = 0.0f;
+            for (int c = 0; c < NC; ++c) {
+                S += cs[i*NC + c]*expf((cm[i*NC + c] - M)*iT);
+            }
+            const float * l   = L[i];
+            const auto  & q   = draft_q[i];
+            const float q_x = prob_of(q.data(), q.size(), draft[i]);
+            const float p_x = draft[i] >= 0 && draft[i] < nv ? expf((l[draft[i]] - M)*iT)/S : 0.0f;
+            if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+                common_sampler_accept(gsmpl, draft[i], true);
+                result.push_back(draft[i]);
+                continue;
+            }
+            // rejected: the residual max(0, p - q), p outside the support of q
+            std::vector<std::pair<llama_token, float>> qs; // the support of q, each id once
+            for (const auto & e : q) {
+                if (e.id < 0 || e.id >= nv || e.p <= 0.0f) {
+                    continue;
+                }
+                bool seen = false;
+                for (auto & sv : qs) {
+                    if (sv.first == e.id) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    qs.push_back({ e.id, prob_of(q.data(), q.size(), e.id) });
+                }
+            }
+            std::sort(qs.begin(), qs.end());
+            float total = 1.0f;
+            for (const auto & sv : qs) {
+                const float pk = expf((l[sv.first] - M)*iT)/S;
+                total += std::max(0.0f, pk - sv.second) - pk;
+            }
+            llama_token id = draft[i];
+            if (total > 0.0f) {
+                float u = uni(gsmpl->rng)*total;
+                size_t iq = 0;
+                id = -1;
+                llama_token last = -1;
+                for (int k = 0; k < nv; ++k) {
+                    float r = expf((l[k] - M)*iT)/S;
+                    if (iq < qs.size() && qs[iq].first == k) {
+                        r = std::max(0.0f, r - qs[iq].second);
+                        iq++;
+                    }
+                    if (r > 0.0f) {
+                        last = k;
+                        u -= r;
+                        if (u <= 0.0f) {
+                            id = k;
+                            break;
+                        }
+                    }
+                }
+                if (id < 0) {
+                    id = last >= 0 ? last : draft[i];
+                }
+            } else {
+                // p inside the support of q everywhere below q: the target's own draw
+                id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+            }
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
+            return result;
+        }
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[nr], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        return result;
+    }
 
     std::vector<llama_token_data> residual;
 

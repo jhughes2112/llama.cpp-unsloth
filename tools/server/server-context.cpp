@@ -4908,7 +4908,15 @@ private:
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
+                    const int64_t t_acc0 = ggml_time_us();
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    if (getenv("SERVER_SPEC_TIMING")) {
+                        static int64_t s_us = 0; static int n = 0;
+                        s_us += ggml_time_us() - t_acc0;
+                        if (++n % 50 == 0) {
+                            fprintf(stderr, "spec-timing: rejection accept %.3f ms avg over %d rounds (%zu rows)\n", s_us/1000.0/n, n, spec_i_batch.size());
+                        }
+                    }
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
