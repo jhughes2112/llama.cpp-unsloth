@@ -8242,6 +8242,11 @@ static bool ggml_metal_op_situ_fusable(ggml_metal_op_t ctx, int idx) {
         op->ne[1] != ne20 || op->ne[2] != ne21 || (one_only && ne21 != 1)) {
         return false;
     }
+    // only where the encoder takes the mat-vec path (a prefill batch takes the mat-mul, which does not do the top-k:
+    // the ids were never written, garbage from the first long prompt)
+    if (ggml_metal_op_mul_mat_id_use_mm(op, ggml_metal_device_get_props(ctx->dev)->has_simdgroup_mm)) {
+        return false;
+    }
     int n2 = 0;
     const ggml_metal_fusion * fusion = ctx->can_fuse(idx + 1, GGML_METAL_FUSION_FULL, &n2);
     if (!fusion || ggml_metal_fusion_get_id(fusion) != GGML_METAL_FUSION_EXPERT_SITU) {
